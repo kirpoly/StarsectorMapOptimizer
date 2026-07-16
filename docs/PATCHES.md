@@ -1,0 +1,92 @@
+# Карта патчей 0.3.0-exp3
+
+Все target-классы относятся к `starfarer_obf.jar` Starsector 0.98a-RC8 и проверяются по exact SHA-256 до изменения.
+
+| Блок | Target | Vanilla-проблема | Изменение | Совместимость/риск |
+|---|---|---|---|---|
+| `patch.retainAll` | `A.H.renderStuff(FZ)V` | `keySet().retainAll(ArrayList)` даёт `O(K×E)` каждый render | identity fast path; reusable HashSet fallback для custom equality; явный iterator | низкий; сохраняется equals/hashCode-семантика modded keys |
+| `patch.scratchCollections` | `A.H`, `A.A` | hot-path `ArrayList/HashSet/Vector2f` allocations | thread-local scratch | низкий/средний |
+| `patch.labelSpatialCandidates` | `A.H.getTextAlignmentFor` | полный scan icons для каждой новой подписи | spatial buckets, затем оригинальные exact checks | средний, TTL index |
+| `patch.hoverHitTestCache` | `A.A.OO0000(FFF)` | entity + all-system scan на mouse events | short screen-cell/TTL cache; vanilla method на miss | средний, краткая задержка hover |
+| `patch.intelCallbackCache` | `A.A`, `A.Z`, `EventsPanel` | повторные `getMapLocation/getArrowData` callbacks | per-plugin/per-map TTL | средний |
+| `patch.intelEntityIndex` | `A.H.getIntelIconEntity` | scan Intel synthetic entities | identity index | средний, TTL |
+| `patch.intelExistingIconLookup` | `EventsPanel` | scan `icons.values()` при известном ключе | direct lookup + vanilla fallback | низкий |
+| `patch.intelFastContains` | `EventsPanel` | вложенный `ArrayList.contains` | thread-local HashSet | низкий |
+| `patch.arrowVectorPool` | `A.Z` | две temporary vectors на arrow/frame | thread-local ring | низкий |
+| `patch.systemNebulaCache` | `A.H.updateSystemNebulas` | три прохода systems при каждом создании map | metadata cache; fresh synthetic entities сохраняются | средний |
+| `patch.sampleCacheClearThrottle` | `A.H.<init>` | повторный terrain sample-cache clear | min interval | средний |
+| `patch.gridLineCap` | `A.H.null(F)V` | grid lines растут с физическим размером сектора | dynamic spacing/max lines | средний, визуальный LOD |
+| `patch.campaignListenerThrottle` | `CampaignEngine.advance` | каждый кадр O(N) `readdChangeListeners()` | first/change/audit refresh | низкий; public method не меняется |
+| `patch.routeJumpPointIndex` | `A.O0Oo.getNextStep`, `getLastLegDistance` | 3 scans всех hyperspace jump points + 1 scan systems | ordered identity indexes, original selection loop сохраняется | низкий/средний, TTL 250 мс; miss -> full list |
+
+## Новое: campaign listener refresh
+
+Vanilla `CampaignEngine.readdChangeListeners()`:
+
+```text
+hyperspace.getObjects().setListener(engine)
+for each starSystem:
+    starSystem.getObjects().setListener(engine)
+```
+
+`ObjectRepository.setListener()` — простая запись поля. При этом `CampaignEngine.advance()` вызывает метод каждый кадр. Exp3 трансформирует только этот один call site. Методы `createStarSystem`, `removeStarSystem` и публичный `readdChangeListeners` не меняются.
+
+Refresh выполняется при:
+
+- первом вызове;
+- смене identity списка systems или hyperspace;
+- изменении size/first/last system;
+- истечении audit interval.
+
+Audit покрывает неподдерживаемую прямую замену элемента внутри list без изменения размера.
+
+## Новое: route candidate indexes
+
+Патч не заменяет метод маршрутизации целиком. В трёх точках:
+
+```java
+Global.getSector().getHyperspace().getJumpPoints()
+```
+
+подставляется ordered subset jump points, у которых первая destination относится к нужной системе. Далее оригинальный bytecode снова проверяет:
+
+- `isWormhole()`;
+- наличие destinations;
+- identity содержащей location;
+- star destination;
+- расстояние и tie-break.
+
+В одном месте `CampaignEngine.getStarSystems()` подставляется singleton candidate для известного hyperspace anchor. Оригинальный bytecode повторно сравнивает anchor identity, поэтому stale positive безопасно отфильтровывается. Cache miss возвращает полный vanilla list.
+
+## Точные targets
+
+```text
+starfarer_obf.jar
+5dd222b9e266d2ac2d63b3dad4983eb05caaf5a247d7dfb82aaeba47ea774cc8
+
+com.fs.starfarer.coreui.A.H
+3bad0296ca21b7c1de04ec091fa35ba868903d00185501d2d60053182c304d14
+
+com.fs.starfarer.coreui.A.A
+bd9e3fbe425ff18199f5f0c5ec654996c836326224ff6bc2efdfcaf41162cb2f
+
+com.fs.starfarer.coreui.A.Z
+f584eb5cd28216f8be97cf47a2ba9141ad7f0671e9b16c235e5dc8c6787cce98
+
+com.fs.starfarer.campaign.comms.v2.EventsPanel
+3924d42d8e8ceab19a147ed9db03161773333203752f3430518bf87231ff6aa1
+
+com.fs.starfarer.campaign.CampaignEngine
+9888ba1d2493f8d1d41106b57d9843c266f7073355aa9d2c41e73c14c3527cab
+
+com.fs.starfarer.coreui.A.O0Oo
+31ba933e63240f793eb7e40706d0ed155d0e226f80f90c0f4813f46f2d7ac222
+```
+
+## Намеренно не изменено
+
+- Staggered advance всех неактивных systems: удаление scan требует отдельной модели `activeThisFrame` и может ломать моды.
+- Economy, intel manager, listeners, faction and script advances.
+- `Misc.findNearestJumpPointTo()` для выхода из текущей системы.
+- Порядок маршрутизационных candidates и окончательный выбор.
+- Public API и save serialization.
