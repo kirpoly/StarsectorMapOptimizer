@@ -295,7 +295,7 @@ public final class MapOptimizerHooks {
 
         ScratchFrame scratch = SCRATCH.get().scopeFrame();
         IdentityHashMap<Object, Boolean> membership = scratch.identityMembership;
-        membership.clear();
+        clearIdentityMembership(membership);
         boolean customEquality = false;
         if (keep instanceof List list) {
             for (int i = 0, size = list.size(); i < size; i++) {
@@ -353,9 +353,18 @@ public final class MapOptimizerHooks {
             if (removed != 0L) RETAIN_REMOVED.add(removed);
             return changed;
         } finally {
-            membership.clear();
+            clearIdentityMembership(membership);
             if (equalityMembership != null) equalityMembership.clear();
         }
+    }
+
+    /**
+     * IdentityHashMap.clear() scans its full capacity even when size is zero.
+     * Scratch frames use a deliberately large membership table, so an empty clear
+     * at every scope exit is far more expensive than the constant-time size check.
+     */
+    private static void clearIdentityMembership(IdentityHashMap<?, ?> membership) {
+        if (!membership.isEmpty()) membership.clear();
     }
 
     private static final ClassValue<Boolean> CUSTOM_EQUALITY = new ClassValue<>() {
@@ -2038,7 +2047,7 @@ public final class MapOptimizerHooks {
             entityList.clear();
             hitList.clear();
             classSet.clear();
-            identityMembership.clear();
+            clearIdentityMembership(identityMembership);
             equalityMembership.clear();
             containsSet.clear();
             containsSource = null;

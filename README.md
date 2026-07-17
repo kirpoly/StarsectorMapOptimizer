@@ -1,4 +1,4 @@
-# Starsector Map Optimizer 0.4.0-exp6
+# Starsector Map Optimizer 0.4.0-exp7
 
 Runtime-оптимизации sector/hyperspace/Intel map, campaign bookkeeping и route candidate scans
 для очень больших секторов Starsector. Основное исправление карты на реальном сохранении подняло
@@ -105,9 +105,16 @@ Reusable storage живёт в reentrant scratch scope; ссылки на эле
 exceptional exit. Поэтому эти три блока не являются cross-campaign кэшами и не должны удерживать
 entity, location или `CampaignEngine` после завершения вызова.
 
-Эта телеметрия обосновывает выбор targets, но ещё не измеряет эффект exp6. Численное утверждение об
-уменьшении allocations или frame time требует повторного контролируемого A/B-прогона на том же
-сохранении и сценарии.
+Повторный прогон на том же seed, почти идентичном числе entities и том же наборе из 66 модов
+подтвердил, что exp6 убрал целевые snapshots/iterators и снизил steady allocation примерно с
+`4.347` до `2.184 MiB/frame`. Одновременно он выявил CPU-регрессию: каждый
+`BaseCampaignEntity.runScripts()` завершал общий scratch scope безусловным
+`IdentityHashMap.clear()`, который в JDK 17 проходит всю таблицу даже при нулевом размере. На
+проблемном сохранении этот пустой clear занял `64.48%` JFR CPU samples.
+
+Exp7 сохраняет все три allocation-оптимизации и пропускает только физическую очистку уже пустой
+identity-map. Непустой normal/exceptional путь по-прежнему очищает ссылки до выхода из scope.
+Численный frame-time результат exp7 требует отдельного повторного прогона в игре.
 
 ### Campaign при закрытой карте
 

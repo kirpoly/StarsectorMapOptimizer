@@ -1,4 +1,4 @@
-# Карта патчей 0.4.0-exp6
+# Карта патчей 0.4.0-exp7
 
 Каждый блок независимо сопоставляется с фактически загружаемым bytecode по symbolic/data-flow
 контракту. Несовместимый блок пропускается без отмены уже подтверждённых патчей класса.
@@ -27,9 +27,9 @@
 ## Новое в exp6: telemetry-driven campaign allocations
 
 Профиль allocation/CPU на большой modded-кампании указал на оставшийся churn в vanilla
-`BaseLocation.advance`, `BaseCampaignEntity.runScripts` и `Memory.advance`. Это исходная
-телеметрия для выбора targets, а не измерение результата exp6: повторный A/B-прогон после сборки
-ещё требуется.
+`BaseLocation.advance`, `BaseCampaignEntity.runScripts` и `Memory.advance`. Повторный same-save
+прогон подтвердил устранение целевых allocation families и снижение steady allocation примерно
+с `4.347` до `2.184 MiB/frame`.
 
 `patch.campaignSnapshotReuse` заменяет ровно три defensive copies в `BaseLocation.advance` и две
 в `advanceEvenIfPaused`. `patch.entityScriptSnapshotReuse` заменяет одну такую copy в
@@ -51,6 +51,18 @@ Matcher также требует прежний порядок после `Camp
 require scan. При пустом source hook возвращает shared empty iterator; при непустом вызывает
 `source.iterator()`, поэтому remove/iteration семантика рабочего пути остаётся vanilla. При
 отключённой настройке исходный iterator вызывается и для пустого source.
+
+## Исправлено в exp7: пустая очистка scratch identity-map
+
+Exp6 обернул `BaseCampaignEntity.runScripts()` в общий scratch scope. Его завершение безусловно
+вызывало `IdentityHashMap.clear()` для заранее выделенной membership table, хотя entity-script
+snapshot эту карту не использует. JDK 17 при таком вызове сканирует всю таблицу даже при
+`size == 0`; на проблемном сохранении этот путь занял `64.48%` JFR CPU samples.
+
+Exp7 проверяет `isEmpty()` перед тремя точками очистки этой карты: входом/выходом
+`retainAllFast()` и завершением scratch frame. Это не меняет collection semantics и не ослабляет
+очистку ссылок: после частичного заполнения или исключения карта непуста и очищается как прежде.
+Runtime regression отдельно покрывает пустой, normal, exceptional и вложенный scope.
 
 ## Новое: campaign cache lifecycle
 

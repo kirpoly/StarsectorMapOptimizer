@@ -67,7 +67,7 @@ public final class MapOptimizerTransformer implements ClassFileTransformer {
     private static final String HYPERSPACE_DESC = "Lcom/fs/starfarer/campaign/Hyperspace;";
     private static final String PATCH_MARKER_PREFIX = "smo$patched$";
     private static final String PATCH_MARKER_DESC = "Ljava/lang/String;";
-    private static final String PATCH_MARKER_VALUE_PREFIX = "StarsectorMapOptimizer:0.4.0-exp6:";
+    private static final String PATCH_MARKER_VALUE_PREFIX = "StarsectorMapOptimizer:0.4.0-exp7:";
 
     private final OptimizerConfig config;
     private final AtomicInteger patchedClasses = new AtomicInteger();

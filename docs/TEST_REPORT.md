@@ -1,9 +1,9 @@
-# Build and validation report — 0.4.0-exp6
+# Build and validation report — 0.4.0-exp7
 
-Дата exp6 build/structural/runtime regression: 2026-07-17. Structural harness прошёл на двух core
-JAR, lifecycle GC и отдельный exp6 runtime regression — успешно. Графический campaign smoke и
-контролируемый allocation/frame-time A/B для exp6 ещё не перезапускались; последний полный
-campaign smoke относится к exp4 (2026-07-17).
+Дата exp7 build/structural/runtime regression: 2026-07-17. Structural harness прошёл на двух core
+JAR, lifecycle GC и расширенный runtime regression — успешно. Два exp6 campaign-прогона измерили
+allocation-эффект, обнаружили CPU-регрессию пустого `IdentityHashMap.clear()` и дали lifecycle
+evidence между загрузками. После исправления exp7 графический performance-прогон ещё не выполнен.
 
 ## Проверенные входы
 
@@ -15,7 +15,7 @@ campaign smoke относится к exp4 (2026-07-17).
 transformer-ом или installer-ом. Exp6 harness отдельно подтвердил `BaseLocation`,
 `BaseCampaignEntity` и `Memory` на обоих фактически прочитанных JAR.
 
-## Результат exp6 structural/GC/runtime harness
+## Результат exp7 structural/GC/runtime harness
 
 Команда:
 
@@ -33,7 +33,7 @@ OK structural jar=C:\Games\Starsector_test\starsector-core\starfarer_obf.jar cla
 OK negative-tests retainAll missing ambiguous unrelated-call unrelated-change marker-ownership scratch-scope-tamper wrapper-tamper wrapper-metadata idempotency lifecycle-missing-write lifecycle-wrong-source exp6-marker-ownership exp6-scratch-scope-tamper
 SUMMARY jars=2 transformedClasses=18 verifiedMethods=1344
 OK lifecycle-gc exact-caches=8 scratch-remove identity-idempotence two-phase-boundary engine-change reset-null generation-active-state generation-epoch lock-free-detach nebula-slot-detach out-of-order-fail-closed weak-cache-reachability weak-engine-arguments
-OK exp6-runtime snapshot-isolation snapshot-reuse snapshot-reentrancy snapshot-fallback snapshot-no-retention empty-snapshot-singleton exceptional-snapshot-no-retention memory-iterator-empty-singleton memory-iterator-order memory-iterator-remove memory-iterator-no-retention
+OK exp6-runtime snapshot-isolation snapshot-reuse snapshot-reentrancy snapshot-fallback snapshot-no-retention empty-snapshot-singleton exceptional-snapshot-no-retention memory-iterator-empty-singleton memory-iterator-order memory-iterator-remove memory-iterator-no-retention empty-identity-clear-elision retain-empty-clear-elision identity-normal-cleanup identity-exceptional-cleanup identity-nested-cleanup
 ```
 
 Для каждого класса проверено:
@@ -122,43 +122,50 @@ O0Oo:           19,530 -> 19,609 bytes
   view в прежнем порядке после clock conversion.
 - Wrapper originals становятся private synthetic; публичная сигнатура остаётся исходной.
 
-## Exp6 telemetry-driven target selection (A/B pending)
+## Exp6 telemetry result и exp7 CPU-regression fix
 
-Источник: `StarsectorMapTelemetry\telemetry\session-20260717-023929-040`. Записано примерно
-`38.2 s` / `3 084` frames в hyperspace огромного modded-сектора: `2 137` systems,
-`432 809` campaign entities, `17 775` hyperspace entities и `66` mods.
+Источники:
 
-Pre-change allocation telemetry показала `14.209 GB` за `37.725 s`, то есть около
-`376.6 MB/s` и `4.607 MB/frame`. Это общая аллокация наблюдавшегося процесса до exp6, а не
-оценка сэкономленного объёма. В JFR sampled allocation profile после исключения смещённого первого
-sample крупными семействами были:
+- exp5 baseline: `StarsectorMapTelemetry\telemetry\session-20260717-023929-040`;
+- exp6, long-play save: `session-20260717-032507-985`;
+- exp6, проблемный hyperspace сразу после load: `session-20260717-032627-811`.
 
-- MagicPaintjob `HashSet -> List` copies: приблизительно `4.886 GB` / `37%` sampled bytes;
-- `campaign.rules.Memory` iterator churn: приблизительно `4.196 GB` / `32%`;
-- по типам: object arrays около `54%`, `ArrayList` iterators около `18%`,
-  `LinkedHashMap` iterators около `16%`.
+Baseline и проблемный exp6-прогон являются близким controlled comparison: одинаковый seed
+`MN-4664645813837931932`, почти точное число entities (`432 809` против `432 827`), одинаковые
+location/course target и 66 включённых модов тех же версий. После первых 10 секунд:
 
-Raw CPU samples были в основном внутри campaign advance: `CampaignEngine.advance` — `86.6%`
-inclusive, `Hyperspace.advance` — `35.9%`, `StarSystem.advance` — `19.8%`,
-economy/market — `16.2%`, `Memory` — `10.5%` inclusive. `BaseLocation.advance` дал `13.9%`
-leaf samples. Проценты inclusive пересекаются и не должны складываться. Snapshot copies
-`BaseLocation` были крупным allocation stack; `BaseCampaignEntity.runScripts` snapshots также
-присутствовали в sampled stacks для jump points, asteroids и gravity wells. Сам Map Optimizer не
-был верхним CPU hotspot этого профиля.
+| Метрика | exp5 baseline | exp6 | Изменение |
+|---|---:|---:|---:|
+| allocation/frame | `4.347 MiB` | `2.184 MiB` | `-49.8%` |
+| mean frame time | `11.09 ms` | `29.67 ms` | `+167.5%` |
+| FPS | `90.17` | `33.7` | `-62.6%` |
 
-Эти наблюдения мотивировали три включённых по умолчанию exp6-блока:
+JFR allocation samples подтвердили, что exp6 устранил целевые `BaseLocation` и
+`BaseCampaignEntity.runScripts` snapshots, а `Memory` iterators сократил почти до нуля на пустых
+путях. Функциональность трёх allocation-патчей поэтому сохраняется в exp7.
 
-- `patch.campaignSnapshotReuse` — пять `BaseLocation` snapshot-sites;
-- `patch.entityScriptSnapshotReuse` — один `BaseCampaignEntity.runScripts` snapshot-site;
-- `patch.emptyMemoryAdvanceFastPath` — два empty iterator-sites `Memory.advance`.
+CPU-регрессия локализована независимо raw sampler и JFR. В проблемном прогоне
+`IdentityHashMap.clear()` занимал `56.93%` raw и `64.48%` JFR execution samples; в long-play
+прогоне — `39.08%` и `49.19%`. Точный stack:
+`BaseCampaignEntity.runScripts -> MapOptimizerHooks.endScratchScope -> ScratchFrame.clear ->
+IdentityHashMap.clear`. Карта создаётся с expected size `2048`, что в Java 17 даёт таблицу на
+`8192` slots; `clear()` обходит её полностью даже при `size == 0`. Число JFR clear samples/frame
+масштабировалось с общим числом campaign entities с коэффициентом `2.435`, практически совпадая
+с ростом entities `2.433x`.
 
-Structural/negative harness подтвердил все восемь sites на обоих core JAR. Отдельный JVM runtime
-regression подтвердил snapshot isolation/reuse/reentrancy/fallback, normal и exceptional
-no-retention, empty snapshot singleton, а также empty/non-empty `Memory` iterator order/remove и
-no-retention. Это ещё не заменяет графический campaign `APPLIED`/behavior run и off/on A/B.
-Для измерения эффекта нужен одинаковый campaign scenario с новыми toggles off/on и сопоставлением
-allocation rate/types, frame time и call activity. Исходная telemetry подтверждает приоритет
-targets, но не измеренный эффект exp6.
+Exp7 заменяет три безусловных clear этой карты на `isEmpty()`-guard. Normal path после фактического
+заполнения и exceptional path после частичного заполнения по-прежнему очищают все ссылки. Runtime
+regression детерминированно проверяет отсутствие structural clear пустой карты, normal/exceptional
+cleanup и разделение вложенных scratch frames без timing thresholds.
+
+Оба новых exp6-прогона записаны в одной JVM. Перед второй записью lifecycle reset сработал, а между
+сессиями Shenandoah выполнил пять cycles; used heap снизился примерно с `12 272` до `4 880 MiB`,
+несмотря на загрузку значительно большего save. В логах нет `Copies of campaign data in memory`
+или `Memory leak detected`. Это сильное косвенное подтверждение освобождения прежней campaign
+graph, но telemetry не записывает прямое значение `CampaignEngine.getAllInstances()`.
+
+Post-fix exp7 campaign telemetry ещё нужна, чтобы измерить итоговый frame time и подтвердить
+исчезновение `IdentityHashMap.clear` из sampled hot path.
 
 ## Подтверждённые runtime evidence предыдущих версий
 

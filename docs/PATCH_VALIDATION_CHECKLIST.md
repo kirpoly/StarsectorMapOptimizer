@@ -59,7 +59,7 @@
 | `patch.emptyMemoryAdvanceFastPath` | тысячи пустых `Memory` плюс отдельные expire/require entries | JFR `ArrayList$Itr`/`LinkedHashMap$LinkedValueIterator` allocations; counts двух hooks | пустые scans остаются пустыми; expiration, require cleanup/order и iterator remove на непустом пути совпадают с vanilla |
 | `patch.routeJumpPointIndex` | построение маршрутов внутри/между системами, wormholes и одинаковые anchors | `routeJump/SystemIndex Hits/Builds/Fallbacks` | destination, distance и tie-break совпадают с vanilla; miss/malformed/custom getter использует полный список |
 
-## Состояние exp6 allocation follow-up, 2026-07-17
+## Состояние exp7 allocation/CPU follow-up, 2026-07-17
 
 Новые targets выбраны по pre-change profiler/JFR-сессии большой modded-кампании: в ней видны
 defensive snapshot allocations `BaseLocation`/`BaseCampaignEntity` и значительный iterator churn
@@ -68,11 +68,12 @@ defensive snapshot allocations `BaseLocation`/`BaseCampaignEntity` и значи
 подтверждены. Отдельный JVM runtime regression прошёл snapshot isolation/reuse/reentrancy/fallback,
 normal/exceptional no-retention и `Memory` empty/non-empty iterator order/remove/no-retention.
 
-Эти результаты закрывают S+N и отдельную JVM-проверку semantics/reachability. Они не являются
-реальным modded-campaign R/B и performance-доказательством exp6. Для R/B нужен графический запуск
-с `APPLIED` и целевыми сценариями; для P — одинаковые save, duration, game state и profiler
-settings с тремя новыми toggles off/on. Pre-change телеметрия подтверждает только активность и
-приоритет targets, а не измеренный эффект.
+Два графических exp6-прогона подтвердили `APPLIED` и устранение целевых allocation families. На
+same-save сравнении steady allocation снизилась примерно с `4.347` до `2.184 MiB/frame`, но
+`IdentityHashMap.clear()` в конце пустого entity-script scope занял `64.48%` JFR CPU samples и
+увеличил steady frame time примерно с `11.09` до `29.67 ms`. Exp7 пропускает только пустой clear;
+JVM regression покрывает empty/normal/exceptional/nested cleanup. Для закрытия P нужен повторный
+графический прогон exp7 на том же save и profiler/JFR settings.
 
 ## Состояние exp5 lifecycle validation, 2026-07-17
 

@@ -7,17 +7,24 @@ import java.lang.ref.ReferenceQueue;
 import java.lang.ref.WeakReference;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
+import java.lang.reflect.Method;
 import java.util.AbstractCollection;
+import java.util.AbstractList;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.ConcurrentModificationException;
+import java.util.IdentityHashMap;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.NoSuchElementException;
 import java.util.Properties;
+import java.util.Set;
 
-/** Runtime semantics and reachability checks for the allocation patches introduced in exp6. */
+/** Runtime checks for exp6 allocation patches and the exp7 scratch-cleanup regression fix. */
 @SuppressWarnings({"rawtypes", "unchecked"})
 public final class Exp6RuntimeRegressionTest {
     private Exp6RuntimeRegressionTest() {}
@@ -27,6 +34,7 @@ public final class Exp6RuntimeRegressionTest {
         OptimizerConfig enabled = config(true);
         installConfig(enabled);
         try {
+            assertIdentityMembershipCleanup();
             assertSnapshotIsolationAndReuse();
             assertSnapshotReentrancy();
             assertSnapshotFallback();
@@ -44,7 +52,144 @@ public final class Exp6RuntimeRegressionTest {
                 + " snapshot-fallback snapshot-no-retention empty-snapshot-singleton"
                 + " exceptional-snapshot-no-retention"
                 + " memory-iterator-empty-singleton memory-iterator-order"
-                + " memory-iterator-remove memory-iterator-no-retention");
+                + " memory-iterator-remove memory-iterator-no-retention"
+                + " empty-identity-clear-elision retain-empty-clear-elision"
+                + " identity-normal-cleanup identity-exceptional-cleanup"
+                + " identity-nested-cleanup");
+    }
+
+    private static void assertIdentityMembershipCleanup() throws Exception {
+        assertEmptyScopeDoesNotClearIdentityMap();
+        assertEmptyRetainDoesNotClearIdentityMap();
+        assertNormalRetainClearsIdentityMap();
+        assertExceptionalRetainClearsIdentityMap();
+        assertNestedIdentityCleanup();
+    }
+
+    private static void assertEmptyScopeDoesNotClearIdentityMap() throws Exception {
+        Iterator<?> iterator;
+        MapOptimizerHooks.beginScratchScope();
+        try {
+            IdentityHashMap<Object, Boolean> membership = scratchIdentityMembership(0);
+            require(membership.isEmpty(), "identity membership was not empty before empty scope test");
+            iterator = membership.keySet().iterator();
+        } finally {
+            MapOptimizerHooks.endScratchScope();
+        }
+        assertUnmodifiedEmptyIterator(iterator,
+                "empty scratch scope invoked IdentityHashMap.clear()");
+    }
+
+    private static void assertEmptyRetainDoesNotClearIdentityMap() throws Exception {
+        Iterator<?> iterator;
+        Set<Object> target = new LinkedHashSet<>(List.of(new Object(), new Object()));
+        MapOptimizerHooks.beginScratchScope();
+        try {
+            IdentityHashMap<Object, Boolean> membership = scratchIdentityMembership(0);
+            require(membership.isEmpty(), "identity membership was not empty before empty retain test");
+            iterator = membership.keySet().iterator();
+            require(MapOptimizerHooks.retainAllFast(target, List.of(), null),
+                    "empty retain did not report removal of target values");
+            require(target.isEmpty(), "empty retain left target values behind");
+        } finally {
+            MapOptimizerHooks.endScratchScope();
+        }
+        assertUnmodifiedEmptyIterator(iterator,
+                "empty retain path invoked IdentityHashMap.clear()");
+    }
+
+    private static void assertNormalRetainClearsIdentityMap() throws Exception {
+        Object kept = new Object();
+        Object removed = new Object();
+        Set<Object> target = new LinkedHashSet<>(List.of(kept, removed));
+
+        MapOptimizerHooks.beginScratchScope();
+        try {
+            IdentityHashMap<Object, Boolean> membership = scratchIdentityMembership(0);
+            require(MapOptimizerHooks.retainAllFast(target, List.of(kept), null),
+                    "normal retain did not report removal");
+            require(target.equals(Set.of(kept)), "normal retain changed collection semantics");
+            require(membership.isEmpty(),
+                    "normal retain left campaign values in identity membership");
+        } finally {
+            MapOptimizerHooks.endScratchScope();
+        }
+    }
+
+    private static void assertExceptionalRetainClearsIdentityMap() throws Exception {
+        Object value = new Object();
+        IdentityHashMap<Object, Boolean> membership;
+
+        MapOptimizerHooks.beginScratchScope();
+        try {
+            membership = scratchIdentityMembership(0);
+            try {
+                MapOptimizerHooks.retainAllFast(new LinkedHashSet<>(),
+                        new PartiallyReadableList(value), null);
+                throw new AssertionError("partially readable keep list did not throw");
+            } catch (RetainProbeFailure expected) {
+                require(membership.containsKey(value),
+                        "exceptional retain did not populate the identity map before failing");
+            }
+        } finally {
+            MapOptimizerHooks.endScratchScope();
+        }
+        require(membership.isEmpty(),
+                "exceptional retain scope retained a campaign value");
+    }
+
+    private static void assertNestedIdentityCleanup() throws Exception {
+        Object outerValue = new Object();
+        IdentityHashMap<Object, Boolean> outer;
+        Iterator<?> innerIterator;
+
+        MapOptimizerHooks.beginScratchScope();
+        try {
+            outer = scratchIdentityMembership(0);
+            outer.put(outerValue, Boolean.TRUE);
+            MapOptimizerHooks.beginScratchScope();
+            try {
+                IdentityHashMap<Object, Boolean> inner = scratchIdentityMembership(1);
+                require(inner.isEmpty(), "nested identity frame started populated");
+                innerIterator = inner.keySet().iterator();
+            } finally {
+                MapOptimizerHooks.endScratchScope();
+            }
+            assertUnmodifiedEmptyIterator(innerIterator,
+                    "empty nested scope invoked IdentityHashMap.clear()");
+            require(outer.containsKey(outerValue),
+                    "nested scope cleared the active outer identity frame");
+        } finally {
+            MapOptimizerHooks.endScratchScope();
+        }
+        require(outer.isEmpty(), "outer identity frame was not cleared on exit");
+    }
+
+    @SuppressWarnings("unchecked")
+    private static IdentityHashMap<Object, Boolean> scratchIdentityMembership(int frameIndex)
+            throws Exception {
+        Field scratchField = MapOptimizerHooks.class.getDeclaredField("SCRATCH");
+        scratchField.setAccessible(true);
+        ThreadLocal<?> threadLocal = (ThreadLocal<?>) scratchField.get(null);
+        Object scratch = threadLocal.get();
+        Method frameAt = scratch.getClass().getDeclaredMethod("frameAt", int.class);
+        frameAt.setAccessible(true);
+        Object frame = frameAt.invoke(scratch, frameIndex);
+        Field membership = frame.getClass().getDeclaredField("identityMembership");
+        membership.setAccessible(true);
+        return (IdentityHashMap<Object, Boolean>) membership.get(frame);
+    }
+
+    private static void assertUnmodifiedEmptyIterator(Iterator<?> iterator, String message) {
+        try {
+            iterator.next();
+            throw new AssertionError("empty identity iterator unexpectedly returned a value");
+        } catch (NoSuchElementException expected) {
+            // IdentityHashMap.clear() increments modCount even when already empty.
+            // NoSuchElementException proves that no such structural clear occurred.
+        } catch (ConcurrentModificationException ex) {
+            throw new AssertionError(message, ex);
+        }
     }
 
     private static void assertSnapshotIsolationAndReuse() {
@@ -367,4 +512,25 @@ public final class Exp6RuntimeRegressionTest {
     }
 
     private static final class SnapshotCopyFailure extends RuntimeException {}
+
+    private static final class PartiallyReadableList extends AbstractList<Object> {
+        private final Object first;
+
+        private PartiallyReadableList(Object first) {
+            this.first = first;
+        }
+
+        @Override
+        public Object get(int index) {
+            if (index == 0) return first;
+            throw new RetainProbeFailure();
+        }
+
+        @Override
+        public int size() {
+            return 2;
+        }
+    }
+
+    private static final class RetainProbeFailure extends RuntimeException {}
 }
