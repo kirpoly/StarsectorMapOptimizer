@@ -4,7 +4,7 @@
   "author": "kirpoly",
   "version": {
     "major": "0",
-    "minor": "8",
+    "minor": "9",
     "patch": "0"
   },
   "description": "Compatibility-first pre-load patches for Starsector internals, with a future API for capabilities not exposed by the game.",

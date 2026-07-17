@@ -16,6 +16,10 @@
 
 ## [Unreleased]
 
+Пока нет пользовательских изменений после `0.9.0`.
+
+## [0.9.0] - 2026-07-18
+
 ### Добавлено
 
 - Installer получил явный `-Target Vanilla|FasterRendering|Both`: он поддерживает как root
@@ -44,6 +48,8 @@
   классов, декомпозиция patch/runtime-кода, formatter, Linux Tier 1 и macOS best effort.
 - Описаны classloader topology Faster Rendering, остаточная зависимость payload от FR fallback в
   `JavaAgentLoader`, installer targets и обязательная real-launch матрица до выпуска.
+
+Подробности: [отчёт о выпуске 0.9.0](docs/releases/0.9.0.md).
 
 ## [0.8.0] - 2026-07-17
 
