@@ -21,10 +21,34 @@ $agentManifest = Join-Path $build 'agent.mf'
 $bootstrapManifest = Join-Path $build 'bootstrap.mf'
 [IO.File]::WriteAllText($agentManifest, "Manifest-Version: 1.0`nImplementation-Title: StarsectorPrepatcher Agent`nImplementation-Version: 0.8.0`nPremain-Class: com.starsector.prepatcher.agent.PrepatcherAgent`nCan-Redefine-Classes: false`nCan-Retransform-Classes: false`n`n", $utf8)
 [IO.File]::WriteAllText($bootstrapManifest, "Manifest-Version: 1.0`nImplementation-Title: StarsectorPrepatcher Bootstrap`nImplementation-Version: 0.8.0`n`n", $utf8)
-& jar cfm (Join-Path $modRoot 'agent\StarsectorPrepatcherAgent.jar') $agentManifest -C $agentClasses .
+$agentJar = Join-Path $modRoot 'agent\StarsectorPrepatcherAgent.jar'
+& jar cfm $agentJar $agentManifest -C $agentClasses .
 if ($LASTEXITCODE -ne 0) { throw 'Agent JAR creation failed.' }
 & jar cfm (Join-Path $modRoot 'jars\StarsectorPrepatcherBootstrap.jar') $bootstrapManifest -C $bootstrapClasses .
 if ($LASTEXITCODE -ne 0) { throw 'Bootstrap JAR creation failed.' }
+
+# RuntimeInstaller reads these classfiles as bytes from the agent JAR and
+# defines them in the target game loader. Keep them as normal class entries,
+# but never link to them from the agent control-loader classes.
+$requiredRuntimePayload = @(
+    'com/fs/starfarer/api/StarsectorPrepatcherHooks.class',
+    'com/fs/starfarer/api/StarsectorPrepatcherHyperspaceHooks.class',
+    'com/fs/starfarer/api/StarsectorPrepatcherRuntimeBridge.class'
+)
+$agentEntries = @(& jar tf $agentJar)
+if ($LASTEXITCODE -ne 0) { throw 'Could not inspect the agent JAR.' }
+foreach ($entry in $requiredRuntimePayload) {
+    if ($agentEntries -cnotcontains $entry) {
+        throw "Required target-loader runtime payload is missing from the agent JAR: $entry"
+    }
+}
+$expectedRuntimePayloadCount = 48
+$runtimePayloadEntries = @($agentEntries | Where-Object {
+    $_ -cmatch '^com/fs/starfarer/api/StarsectorPrepatcher[^/]*\.class$'
+})
+if ($runtimePayloadEntries.Count -ne $expectedRuntimePayloadCount) {
+    throw "Target-loader runtime payload inventory changed: expected $expectedRuntimePayloadCount class entries, found $($runtimePayloadEntries.Count)."
+}
 
 # Keep the release manifest synchronized with the exact tree produced by this build.
 # Runtime logs, build intermediates and SHA256SUMS.txt itself are intentionally excluded.

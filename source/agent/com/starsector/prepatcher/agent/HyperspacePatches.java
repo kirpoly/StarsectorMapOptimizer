@@ -7,7 +7,8 @@ import jdk.internal.org.objectweb.asm.tree.*;
 
 /** Structural patch routines for the hyperspace/terrain target classes. */
 final class HyperspacePatches {
-    static final String HOOK="com/starsector/prepatcher/hyperspace/HyperspaceHooks";
+    static final String HOOK=
+            "com/fs/starfarer/api/StarsectorPrepatcherHyperspaceHooks";
     static final String AUTO_SPARE="smo$automatonSpare";
     static final String AUTO_EXPOSED="smo$automatonCellsExposed";
     static final String AUTO_MARKER="smo$automatonBufferInstrumented";

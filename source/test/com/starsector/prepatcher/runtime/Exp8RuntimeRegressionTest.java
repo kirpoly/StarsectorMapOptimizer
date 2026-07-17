@@ -1,5 +1,6 @@
 package com.starsector.prepatcher.runtime;
 
+import com.fs.starfarer.api.StarsectorPrepatcherHooks;
 import com.fs.starfarer.api.campaign.LocationAPI;
 import com.fs.starfarer.api.campaign.StarSystemAPI;
 import com.fs.starfarer.api.campaign.econ.MarketAPI;
@@ -60,55 +61,55 @@ public final class Exp8RuntimeRegressionTest {
         HashSet firstSet;
         HashSet secondSet;
 
-        PrepatcherHooks.beginScratchScope();
+        StarsectorPrepatcherHooks.beginScratchScope();
         try {
-            first = PrepatcherHooks.borrowShipList();
-            second = PrepatcherHooks.borrowShipList();
+            first = StarsectorPrepatcherHooks.borrowShipList();
+            second = StarsectorPrepatcherHooks.borrowShipList();
             require(first.getClass() == ArrayList.class && second.getClass() == ArrayList.class,
                     "ship list scratch changed the concrete ArrayList type");
             require(first != second, "simultaneously live ship list slots aliased");
             first.add(a);
             second.add(b);
 
-            ArrayList snapshot = PrepatcherHooks.borrowShipListSnapshot(source);
+            ArrayList snapshot = StarsectorPrepatcherHooks.borrowShipListSnapshot(source);
             require(snapshot.getClass() == ArrayList.class && snapshot.equals(List.of(a, b)),
                     "ship command snapshot changed type, order, or contents");
             source.clear();
             require(snapshot.equals(List.of(a, b)),
                     "ship command snapshot was not eager/isolated");
 
-            firstSet = PrepatcherHooks.borrowShipSet();
-            secondSet = PrepatcherHooks.borrowShipSet();
+            firstSet = StarsectorPrepatcherHooks.borrowShipSet();
+            secondSet = StarsectorPrepatcherHooks.borrowShipSet();
             require(firstSet.getClass() == HashSet.class && secondSet.getClass() == HashSet.class,
                     "ship set scratch changed the concrete HashSet type");
             require(firstSet != secondSet, "simultaneously live ship set slots aliased");
             firstSet.add(a);
             secondSet.add(b);
 
-            PrepatcherHooks.beginScratchScope();
+            StarsectorPrepatcherHooks.beginScratchScope();
             try {
-                ArrayList nested = PrepatcherHooks.borrowShipList();
+                ArrayList nested = StarsectorPrepatcherHooks.borrowShipList();
                 require(nested != first && nested != second,
                         "nested ship scratch scope aliased its active outer frame");
                 nested.add(new Object());
             } finally {
-                PrepatcherHooks.endScratchScope();
+                StarsectorPrepatcherHooks.endScratchScope();
             }
             require(first.equals(List.of(a)) && second.equals(List.of(b)),
                     "nested ship scratch scope corrupted outer state");
         } finally {
-            PrepatcherHooks.endScratchScope();
+            StarsectorPrepatcherHooks.endScratchScope();
         }
         require(first.isEmpty() && second.isEmpty() && firstSet.isEmpty() && secondSet.isEmpty(),
                 "ship scratch retained frame objects after scope exit");
 
-        PrepatcherHooks.beginScratchScope();
+        StarsectorPrepatcherHooks.beginScratchScope();
         try {
-            ArrayList reused = PrepatcherHooks.borrowShipList();
+            ArrayList reused = StarsectorPrepatcherHooks.borrowShipList();
             require(reused == first && reused.isEmpty(),
                     "ship scratch was not reused and cleared on the next frame");
         } finally {
-            PrepatcherHooks.endScratchScope();
+            StarsectorPrepatcherHooks.endScratchScope();
         }
     }
 
@@ -121,17 +122,17 @@ public final class Exp8RuntimeRegressionTest {
         LinkedList<Object> patched = new LinkedList<>(values);
         boolean vanillaChanged = vanilla.removeAll(expired);
 
-        PrepatcherHooks.beginScratchScope();
+        StarsectorPrepatcherHooks.beginScratchScope();
         try {
-            ArrayList pooled = PrepatcherHooks.borrowParticleRemovalList();
+            ArrayList pooled = StarsectorPrepatcherHooks.borrowParticleRemovalList();
             require(pooled.getClass() == ArrayList.class,
                     "particle expiry scratch changed concrete ArrayList type");
             pooled.addAll(expired);
-            boolean patchedChanged = PrepatcherHooks.removeExpiredParticles(patched, pooled);
+            boolean patchedChanged = StarsectorPrepatcherHooks.removeExpiredParticles(patched, pooled);
             require(patchedChanged == vanillaChanged && patched.equals(vanilla),
                     "identity particle cleanup changed survivors, order, or boolean result");
         } finally {
-            PrepatcherHooks.endScratchScope();
+            StarsectorPrepatcherHooks.endScratchScope();
         }
 
         ArrayList<EqualValue> equalValues = new ArrayList<>();
@@ -141,14 +142,14 @@ public final class Exp8RuntimeRegressionTest {
         LinkedList<EqualValue> equalityVanilla = new LinkedList<>(equalValues);
         LinkedList<EqualValue> equalityPatched = new LinkedList<>(equalValues);
         boolean equalityChanged = equalityVanilla.removeAll(equalExpired);
-        PrepatcherHooks.beginScratchScope();
+        StarsectorPrepatcherHooks.beginScratchScope();
         try {
-            boolean patchedChanged = PrepatcherHooks.removeExpiredParticles(
+            boolean patchedChanged = StarsectorPrepatcherHooks.removeExpiredParticles(
                     equalityPatched, equalExpired);
             require(patchedChanged == equalityChanged && equalityPatched.equals(equalityVanilla),
                     "custom-equality particle fallback diverged from LinkedList.removeAll");
         } finally {
-            PrepatcherHooks.endScratchScope();
+            StarsectorPrepatcherHooks.endScratchScope();
         }
     }
 
@@ -165,15 +166,15 @@ public final class Exp8RuntimeRegressionTest {
         } catch (ParticleMutationFailure expected) {
             vanillaThrew = true;
         }
-        PrepatcherHooks.beginScratchScope();
+        StarsectorPrepatcherHooks.beginScratchScope();
         try {
             try {
-                PrepatcherHooks.removeExpiredParticles(patched, expired);
+                StarsectorPrepatcherHooks.removeExpiredParticles(patched, expired);
             } catch (ParticleMutationFailure expected) {
                 patchedThrew = true;
             }
         } finally {
-            PrepatcherHooks.endScratchScope();
+            StarsectorPrepatcherHooks.endScratchScope();
         }
         require(vanillaThrew && patchedThrew,
                 "particle cleanup did not preserve mutation exception propagation");
@@ -189,7 +190,7 @@ public final class Exp8RuntimeRegressionTest {
         ArrayList<MarketAPI> markets = new ArrayList<>(List.of(first.proxy, second.proxy));
 
         Class<?> stateClass = Class.forName(
-                "com.starsector.prepatcher.runtime.PrepatcherHooks$EconomyLocationState");
+                "com.fs.starfarer.api.StarsectorPrepatcherHooks$EconomyLocationState");
         Method capture = stateClass.getDeclaredMethod("capture", List.class);
         Method matches = stateClass.getDeclaredMethod("matches", List.class);
         capture.setAccessible(true);
@@ -246,8 +247,8 @@ public final class Exp8RuntimeRegressionTest {
         Object oldEngine = new Object();
         activateEconomyOwner(oldEngine, oldEconomy);
 
-        PrepatcherHooks.updateEconomyLocationMapIfNeeded(oldEconomy);
-        PrepatcherHooks.updateEconomyLocationMapIfNeeded(oldEconomy);
+        StarsectorPrepatcherHooks.updateEconomyLocationMapIfNeeded(oldEconomy);
+        StarsectorPrepatcherHooks.updateEconomyLocationMapIfNeeded(oldEconomy);
         require(oldEconomy.dirtyCalls == 1 && oldEconomy.updateCalls == 2,
                 "active economy fingerprint did not skip only the redundant dirty mark");
         require(economyStates().containsKey(oldEconomy),
@@ -257,17 +258,17 @@ public final class Exp8RuntimeRegressionTest {
         activateEconomyOwner(newEngine, newEconomy);
         require(economyStates().isEmpty(),
                 "economy cache was not detached at the generation boundary");
-        PrepatcherHooks.updateEconomyLocationMapIfNeeded(oldEconomy);
+        StarsectorPrepatcherHooks.updateEconomyLocationMapIfNeeded(oldEconomy);
         require(oldEconomy.dirtyCalls == 2 && oldEconomy.updateCalls == 3,
                 "stale ReachEconomy did not take the exact vanilla fallback");
         require(!economyStates().containsKey(oldEconomy),
                 "stale ReachEconomy published into the new campaign generation");
 
-        PrepatcherHooks.updateEconomyLocationMapIfNeeded(newEconomy);
+        StarsectorPrepatcherHooks.updateEconomyLocationMapIfNeeded(newEconomy);
         require(economyStates().containsKey(newEconomy),
                 "current ReachEconomy was rejected after an engine switch");
-        long reset = PrepatcherHooks.beginCampaignEngineChange(null);
-        PrepatcherHooks.completeCampaignEngineChange(null, reset);
+        long reset = StarsectorPrepatcherHooks.beginCampaignEngineChange(null);
+        StarsectorPrepatcherHooks.completeCampaignEngineChange(null, reset);
     }
 
     private static void assertCommRelaySpatialIndex() throws Exception {
@@ -280,7 +281,7 @@ public final class Exp8RuntimeRegressionTest {
         }
 
         Class<?> indexClass = Class.forName(
-                "com.starsector.prepatcher.runtime.PrepatcherHooks$CommRelaySystemIndex");
+                "com.fs.starfarer.api.StarsectorPrepatcherHooks$CommRelaySystemIndex");
         Method build = indexClass.getDeclaredMethod("build", List.class, long.class, float.class);
         Method collect = indexClass.getDeclaredMethod(
                 "collect", float.class, float.class, float.class, List.class);
@@ -309,7 +310,7 @@ public final class Exp8RuntimeRegressionTest {
         ArrayList<Object> movedEntries = new ArrayList<>();
         collect.invoke(movedIndex, 250f, 0f, radius, movedEntries);
         Field movedSystem = Class.forName(
-                "com.starsector.prepatcher.runtime.PrepatcherHooks$CommRelaySystemEntry")
+                "com.fs.starfarer.api.StarsectorPrepatcherHooks$CommRelaySystemEntry")
                 .getDeclaredField("system");
         movedSystem.setAccessible(true);
         boolean movedFound = false;
@@ -322,11 +323,11 @@ public final class Exp8RuntimeRegressionTest {
 
         ArrayList<Object> entries = new ArrayList<>();
         collect.invoke(index, 250f, 0f, radius, entries);
-        Field comparatorField = PrepatcherHooks.class.getDeclaredField("COMM_RELAY_ENTRY_ORDER");
+        Field comparatorField = StarsectorPrepatcherHooks.class.getDeclaredField("COMM_RELAY_ENTRY_ORDER");
         comparatorField.setAccessible(true);
         entries.sort((Comparator) comparatorField.get(null));
         Class<?> entryClass = Class.forName(
-                "com.starsector.prepatcher.runtime.PrepatcherHooks$CommRelaySystemEntry");
+                "com.fs.starfarer.api.StarsectorPrepatcherHooks$CommRelaySystemEntry");
         Field ordinal = entryClass.getDeclaredField("ordinal");
         Field systemField = entryClass.getDeclaredField("system");
         ordinal.setAccessible(true);
@@ -390,12 +391,12 @@ public final class Exp8RuntimeRegressionTest {
     private static void assertDisabledFallbacks() throws Exception {
         installConfig(config(false));
         ArrayList<Object> source = new ArrayList<>(List.of(new Object()));
-        ArrayList first = PrepatcherHooks.borrowShipList();
-        ArrayList second = PrepatcherHooks.borrowShipList();
-        ArrayList snapshot = PrepatcherHooks.borrowShipListSnapshot(source);
-        HashSet firstSet = PrepatcherHooks.borrowShipSet();
-        HashSet secondSet = PrepatcherHooks.borrowShipSet();
-        ArrayList particle = PrepatcherHooks.borrowParticleRemovalList();
+        ArrayList first = StarsectorPrepatcherHooks.borrowShipList();
+        ArrayList second = StarsectorPrepatcherHooks.borrowShipList();
+        ArrayList snapshot = StarsectorPrepatcherHooks.borrowShipListSnapshot(source);
+        HashSet firstSet = StarsectorPrepatcherHooks.borrowShipSet();
+        HashSet secondSet = StarsectorPrepatcherHooks.borrowShipSet();
+        ArrayList particle = StarsectorPrepatcherHooks.borrowParticleRemovalList();
         require(first != second && firstSet != secondSet,
                 "disabled exp8 scratch unexpectedly pooled vanilla fallback collections");
         require(snapshot.equals(source) && snapshot != source && particle.isEmpty(),
@@ -423,23 +424,23 @@ public final class Exp8RuntimeRegressionTest {
     }
 
     private static void installConfig(PrepatcherConfig config) throws Exception {
-        Field field = PrepatcherHooks.class.getDeclaredField("config");
+        Field field = StarsectorPrepatcherHooks.class.getDeclaredField("config");
         field.setAccessible(true);
         field.set(null, config);
     }
 
     @SuppressWarnings("unchecked")
     private static Map<ReachEconomy, Object> economyStates() throws Exception {
-        Field field = PrepatcherHooks.class.getDeclaredField("ECONOMY_LOCATION_STATES");
+        Field field = StarsectorPrepatcherHooks.class.getDeclaredField("ECONOMY_LOCATION_STATES");
         field.setAccessible(true);
         return (Map<ReachEconomy, Object>) field.get(null);
     }
 
     private static void activateEconomyOwner(Object engine, ReachEconomy economy) throws Exception {
-        long transition = PrepatcherHooks.beginCampaignEngineChange(engine);
+        long transition = StarsectorPrepatcherHooks.beginCampaignEngineChange(engine);
         require(transition >= 0L, "test engine switch did not open a cache generation");
-        PrepatcherHooks.completeCampaignEngineChange(engine, transition);
-        Field owner = PrepatcherHooks.class.getDeclaredField("activeReachEconomy");
+        StarsectorPrepatcherHooks.completeCampaignEngineChange(engine, transition);
+        Field owner = StarsectorPrepatcherHooks.class.getDeclaredField("activeReachEconomy");
         owner.setAccessible(true);
         owner.set(null, new WeakReference<>(economy));
     }
@@ -465,7 +466,7 @@ public final class Exp8RuntimeRegressionTest {
     }
 
     private static void drainScratchScopes() {
-        for (int i = 0; i < 16; i++) PrepatcherHooks.endScratchScope();
+        for (int i = 0; i < 16; i++) StarsectorPrepatcherHooks.endScratchScope();
     }
 
     private static Object primitiveDefault(Class<?> type) {

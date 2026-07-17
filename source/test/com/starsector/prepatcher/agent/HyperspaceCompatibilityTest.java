@@ -1,7 +1,8 @@
 
 package com.starsector.prepatcher.agent;
 
-import com.starsector.prepatcher.hyperspace.HyperspaceHooks;
+import com.fs.starfarer.api.StarsectorPrepatcherHyperspaceHooks;
+import com.fs.starfarer.api.StarsectorPrepatcherRuntimeBridge;
 import java.io.*;
 import java.nio.file.*;
 import java.util.*;
@@ -15,7 +16,7 @@ public final class HyperspaceCompatibilityTest {
         if(a.length<4)throw new IllegalArgumentException("usage: config core api report");
         PrepatcherConfig cfg=PrepatcherConfig.load(Paths.get(a[0]));
         Path core=Paths.get(a[1]),api=Paths.get(a[2]),report=Paths.get(a[3]);
-        HyperspaceHooks.configure(cfg);PrepatcherTransformer tr=new PrepatcherTransformer(cfg);
+        StarsectorPrepatcherRuntimeBridge.configure(cfg,report.getParent());PrepatcherTransformer tr=new PrepatcherTransformer(cfg);
         ArrayList<String> lines=new ArrayList<>();int patched=0,verified=0,unchanged=0,failed=0;
         try{runAutomatonRegression();lines.add("REGRESSION_OK automaton exact-owner marker, virtual fallback, alias isolation, zeroing, and safe reuse");}
         catch(Throwable x){failed++;lines.add("REGRESSION_FAIL automaton "+x);}
@@ -97,7 +98,7 @@ public final class HyperspaceCompatibilityTest {
         if(!java.lang.reflect.Modifier.isTransient(spare.getModifiers())||!spare.isSynthetic()||!java.lang.reflect.Modifier.isTransient(exposed.getModifiers())||!exposed.isSynthetic())throw new AssertionError("injected state must be transient and synthetic");
         if(!java.lang.reflect.Modifier.isStatic(marker.getModifiers())||!java.lang.reflect.Modifier.isFinal(marker.getModifiers())||!marker.isSynthetic()||!marker.getBoolean(null))throw new AssertionError("instrumentation marker contract");
         int[][] first={{7,8},{9,10}},second={{1,2},{3,4}};cells.set(owner,first);next.set(owner,second);
-        Object internal=HyperspaceHooks.automatonCellsInternal(owner,type.getName());
+        Object internal=StarsectorPrepatcherHyperspaceHooks.automatonCellsInternal(owner,type.getName());
         if(internal!=first)throw new AssertionError("internal cells read changed identity");
         if(getterCalls.getInt(owner)!=0)throw new AssertionError("instrumented exact owner did not use direct cells access");
         type.getMethod("advance",float.class).invoke(owner,0f);
@@ -113,16 +114,16 @@ public final class HyperspaceCompatibilityTest {
         if(cells.get(owner)!=fourth||next.get(owner)==third)throw new AssertionError("escaped cells buffer was reused");
         if(third[0][0]!=11||third[1][1]!=14)throw new AssertionError("escaped cells buffer was mutated");
         if(spare.get(owner)!=null)throw new AssertionError("owner retained an extra spare after rollover");
-        if(HyperspaceHooks.retainAutomatonSpare(first,false,new Object(),type.getName())!=null)
+        if(StarsectorPrepatcherHyperspaceHooks.retainAutomatonSpare(first,false,new Object(),type.getName())!=null)
             throw new AssertionError("unknown/subclass owner was allowed to reuse a protected buffer");
 
         String subclassName=name+"Subclass";
         Class<?> subclass=loader.define(subclassName.replace('/','.'),subclassBytes(name,subclassName));
         Object child=subclass.getConstructor().newInstance();int[][] childCells={{21}};cells.set(child,childCells);
-        if(HyperspaceHooks.automatonCellsInternal(child,type.getName())!=childCells)
+        if(StarsectorPrepatcherHyperspaceHooks.automatonCellsInternal(child,type.getName())!=childCells)
             throw new AssertionError("subclass virtual getter changed identity");
         if(getterCalls.getInt(child)!=2)throw new AssertionError("subclass override was bypassed");
-        if(HyperspaceHooks.automatonCellsInternal(child,subclass.getName())!=childCells || getterCalls.getInt(child)!=4)
+        if(StarsectorPrepatcherHyperspaceHooks.automatonCellsInternal(child,subclass.getName())!=childCells || getterCalls.getInt(child)!=4)
             throw new AssertionError("inherited marker enabled direct access for a subclass");
 
         String hiddenSubclassName=name+"HiddenSubclass";
@@ -131,7 +132,7 @@ public final class HyperspaceCompatibilityTest {
         java.lang.reflect.Constructor<?> hiddenConstructor=hiddenSubclass.getDeclaredConstructor();
         hiddenConstructor.setAccessible(true);Object hiddenChild=hiddenConstructor.newInstance();
         int[][] hiddenCells={{25}};cells.set(hiddenChild,hiddenCells);
-        if(HyperspaceHooks.automatonCellsInternal(hiddenChild,type.getName())!=hiddenCells)
+        if(StarsectorPrepatcherHyperspaceHooks.automatonCellsInternal(hiddenChild,type.getName())!=hiddenCells)
             throw new AssertionError("non-public subclass virtual getter changed identity");
         if(getterCalls.getInt(hiddenChild)!=2)
             throw new AssertionError("non-public subclass override was bypassed");
@@ -140,7 +141,7 @@ public final class HyperspaceCompatibilityTest {
         Class<?> throwingSubclass=loader.define(throwingSubclassName.replace('/','.'),
                 throwingSubclassBytes(name,throwingSubclassName));
         Object throwingChild=throwingSubclass.getConstructor().newInstance();
-        try{HyperspaceHooks.automatonCellsInternal(throwingChild,type.getName());
+        try{StarsectorPrepatcherHyperspaceHooks.automatonCellsInternal(throwingChild,type.getName());
             throw new AssertionError("checked getter failure was swallowed");}
         catch(Throwable expected){
             if(!(expected instanceof java.io.IOException)
@@ -151,10 +152,10 @@ public final class HyperspaceCompatibilityTest {
         Class<?> partial=new ByteLoader().define(name.replace('/','.'),vanilla);Object partialOwner=partial.getConstructor().newInstance();
         java.lang.reflect.Field partialCells=partial.getDeclaredField("cells"),partialCalls=partial.getDeclaredField("getterCalls");partialCells.setAccessible(true);partialCalls.setAccessible(true);
         int[][] partialValue={{31}};partialCells.set(partialOwner,partialValue);
-        if(HyperspaceHooks.automatonCellsInternal(partialOwner,partial.getName())!=partialValue || partialCalls.getInt(partialOwner)!=1)
+        if(StarsectorPrepatcherHyperspaceHooks.automatonCellsInternal(partialOwner,partial.getName())!=partialValue || partialCalls.getInt(partialOwner)!=1)
             throw new AssertionError("unpatched exact owner bypassed its virtual getter");
 
-        try{HyperspaceHooks.automatonCellsInternal(null,type.getName());
+        try{StarsectorPrepatcherHyperspaceHooks.automatonCellsInternal(null,type.getName());
             throw new AssertionError("null automaton owner did not preserve invokevirtual NPE");}
         catch(NullPointerException expected){/* Original INVOKEVIRTUAL fails at the call site. */}
     }
@@ -176,20 +177,20 @@ public final class HyperspaceCompatibilityTest {
         MethodVisitor getter=source.visitMethod(Opcodes.ACC_PUBLIC,"getCells","()[[I",null,null);getter.visitCode();getter.visitTypeInsn(Opcodes.NEW,"java/io/IOException");getter.visitInsn(Opcodes.DUP);getter.visitLdcInsn("checked-getCells");getter.visitMethodInsn(Opcodes.INVOKESPECIAL,"java/io/IOException","<init>","(Ljava/lang/String;)V",false);getter.visitInsn(Opcodes.ATHROW);getter.visitMaxs(0,0);getter.visitEnd();source.visitEnd();return source.toByteArray();
     }
     static void runTelemetryRegression(PrepatcherConfig cfg)throws Exception{
-        long before=HyperspaceHooks.pooledRandomApprox();
-        for(int i=0;i<37;i++)HyperspaceHooks.seededRandom(0x5eedL+i);
-        long after=HyperspaceHooks.pooledRandomApprox();
+        long before=StarsectorPrepatcherHyperspaceHooks.pooledRandomApprox();
+        for(int i=0;i<37;i++)StarsectorPrepatcherHyperspaceHooks.seededRandom(0x5eedL+i);
+        long after=StarsectorPrepatcherHyperspaceHooks.pooledRandomApprox();
         if(after-before!=37L)throw new AssertionError("unflushed random tail missing: "+before+" -> "+after);
-        String first=HyperspaceHooks.statsSnapshot(),second=HyperspaceHooks.statsSnapshot();
+        String first=StarsectorPrepatcherHyperspaceHooks.statsSnapshot(),second=StarsectorPrepatcherHyperspaceHooks.statsSnapshot();
         if(!first.equals(second))throw new AssertionError("cumulative stats changed without new events: "+first+" / "+second);
         if(!first.contains("pooledRandomApprox="+after))throw new AssertionError("stats snapshot omitted random tail: "+first);
 
-        java.lang.reflect.Field workerField=HyperspaceHooks.class.getDeclaredField("statsThread");workerField.setAccessible(true);
+        java.lang.reflect.Field workerField=StarsectorPrepatcherHyperspaceHooks.class.getDeclaredField("statsThread");workerField.setAccessible(true);
         @SuppressWarnings("unchecked") java.lang.ref.WeakReference<Thread> firstRef=(java.lang.ref.WeakReference<Thread>)workerField.get(null);
         Thread firstWorker=firstRef.get();if(firstWorker==null||!firstWorker.isAlive())throw new AssertionError("stats worker did not start");
         firstWorker.interrupt();firstWorker.join(1000L);
         if(firstWorker.isAlive())throw new AssertionError("stats worker ignored interruption");
-        HyperspaceHooks.configure(cfg);
+        StarsectorPrepatcherRuntimeBridge.configure(cfg,Path.of("."));
         @SuppressWarnings("unchecked") java.lang.ref.WeakReference<Thread> secondRef=(java.lang.ref.WeakReference<Thread>)workerField.get(null);
         Thread secondWorker=secondRef.get();
         if(secondWorker==null||secondWorker==firstWorker||!secondWorker.isAlive())throw new AssertionError("stats worker did not restart");

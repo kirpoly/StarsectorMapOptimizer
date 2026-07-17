@@ -1,5 +1,5 @@
 
-package com.starsector.prepatcher.hyperspace;
+package com.fs.starfarer.api;
 
 import com.fs.starfarer.api.campaign.CampaignEngineLayers;
 import com.fs.starfarer.api.combat.ViewportAPI;
@@ -11,7 +11,7 @@ import java.util.*;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.atomic.LongAdder;
 
-public final class HyperspaceHooks {
+public final class StarsectorPrepatcherHyperspaceHooks {
     private static volatile PrepatcherConfig cfg;
     private static final LongAdder randomCalls=new LongAdder();
     private static final LongAdder layerFilters=new LongAdder(), autoAlloc=new LongAdder(), autoReuse=new LongAdder();
@@ -20,7 +20,7 @@ public final class HyperspaceHooks {
     private static WeakReference<Thread> statsThread=new WeakReference<>(null);
     private static long lastRandomApprox;
 
-    public static synchronized void configure(PrepatcherConfig c){
+    static synchronized void configure(PrepatcherConfig c){
         cfg=c;
         if(c!=null && c.statsLogIntervalSeconds>0)startStatsThread();
     }
@@ -28,7 +28,7 @@ public final class HyperspaceHooks {
         Thread running=statsThread.get();
         if(running!=null && running.isAlive())return;
         try{
-            Thread thread=new Thread(HyperspaceHooks::statsLoop,"StarsectorPrepatcher-Stats");
+            Thread thread=new Thread(StarsectorPrepatcherHyperspaceHooks::statsLoop,"StarsectorPrepatcher-Stats");
             thread.setDaemon(true);thread.setPriority(Thread.MIN_PRIORITY);
             thread.start();statsThread=new WeakReference<>(thread);
         }catch(Throwable ex){
@@ -151,7 +151,7 @@ public final class HyperspaceHooks {
     }
 
     private static RuntimeException propagate(Throwable t){
-        HyperspaceHooks.<RuntimeException>rethrowUnchecked(t);
+        StarsectorPrepatcherHyperspaceHooks.<RuntimeException>rethrowUnchecked(t);
         throw new AssertionError("unreachable");
     }
     @SuppressWarnings("unchecked")
@@ -227,7 +227,7 @@ public final class HyperspaceHooks {
         for(RandomPoolRef ref:RANDOM_POOL_REFS){
             total+=Math.max(0,ref.pendingStats);
         }
-        synchronized(HyperspaceHooks.class){
+        synchronized(StarsectorPrepatcherHyperspaceHooks.class){
             if(total<lastRandomApprox)return lastRandomApprox;
             return lastRandomApprox=total;
         }
@@ -255,10 +255,10 @@ public final class HyperspaceHooks {
             }
         }catch(InterruptedException ex){current.interrupt();}
         finally{
-            synchronized(HyperspaceHooks.class){
+            synchronized(StarsectorPrepatcherHyperspaceHooks.class){
                 if(statsThread.get()==current)statsThread=new WeakReference<>(null);
             }
         }
     }
-    private HyperspaceHooks(){}
+    private StarsectorPrepatcherHyperspaceHooks(){}
 }

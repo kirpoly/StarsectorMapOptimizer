@@ -45,7 +45,8 @@ import java.util.concurrent.atomic.AtomicInteger;
  * used as a compatibility decision.
  */
 public final class PrepatcherTransformer implements ClassFileTransformer {
-    private static final String HOOKS = "com/starsector/prepatcher/runtime/PrepatcherHooks";
+    private static final String HOOKS =
+            "com/fs/starfarer/api/StarsectorPrepatcherHooks";
     static final String H = "com/fs/starfarer/coreui/A/H";
     static final String A = "com/fs/starfarer/coreui/A/A";
     static final String Z = "com/fs/starfarer/coreui/A/Z";
@@ -90,19 +91,46 @@ public final class PrepatcherTransformer implements ClassFileTransformer {
     // routine SemVer bump from changing idempotency/ownership semantics.
     private static final String PATCH_MARKER_VALUE_PREFIX = "StarsectorPrepatcher:patch-v1:";
     private final PrepatcherConfig config;
+    /**
+     * Loader that owns the typed runtime hooks. A null value is used only by
+     * the offline structural harness, which transforms byte arrays without
+     * defining them in a JVM class loader.
+     */
+    private final ClassLoader runtimeLoader;
     private final AtomicInteger patchedClasses = new AtomicInteger();
     private final AtomicInteger appliedPatches = new AtomicInteger();
     private final AtomicInteger skippedPatches = new AtomicInteger();
     private final AtomicInteger alreadyPatched = new AtomicInteger();
 
     public PrepatcherTransformer(PrepatcherConfig config) {
+        this(config, null);
+    }
+
+    public PrepatcherTransformer(PrepatcherConfig config, ClassLoader runtimeLoader) {
         this.config = config;
+        this.runtimeLoader = runtimeLoader;
     }
 
     @Override
     public byte[] transform(ClassLoader loader, String className, Class<?> classBeingRedefined,
                             ProtectionDomain protectionDomain, byte[] classfileBuffer) {
         if (!TARGET_CLASSES.contains(className) || !isTargetEnabled(className)) return null;
+        // FR child-loads com.fs.* while keeping javaagents in a sibling loader.
+        // Never emit a typed hook call unless caller and hook are owned by the
+        // exact same loader; a mismatch would otherwise become a late
+        // loader-constraint LinkageError at the first invocation.
+        if (runtimeLoader != null && className.startsWith("com/fs/")
+                && loader != runtimeLoader) {
+            String key = "starsector.prepatcher.patchStatus."
+                    + className.replace('/', '.') + ".classLoader";
+            if (!"SKIPPED_LOADER".equals(System.getProperty(key))) {
+                System.setProperty(key, "SKIPPED_LOADER");
+                PrepatcherLog.warn("SKIPPED_LOADER " + className
+                        + ": target loader=" + loaderName(loader)
+                        + ", runtime loader=" + loaderName(runtimeLoader));
+            }
+            return null;
+        }
 
         TransformState state = new TransformState(className, classfileBuffer);
         switch (className) {
@@ -332,7 +360,7 @@ public final class PrepatcherTransformer implements ClassFileTransformer {
                 + className.replace('/', '.') + "." + patchId, status);
     }
 
-    private boolean isTargetEnabled(String className) {
+    boolean isTargetEnabled(String className) {
         return switch (className) {
             case H -> config.retainAll || config.scratchCollections || config.labelSpatialCandidates
                     || config.intelEntityIndex || config.systemNebulaCache
@@ -496,7 +524,13 @@ public final class PrepatcherTransformer implements ClassFileTransformer {
     }
 
     private PatchReport patchSoundStartupLogs(ClassNode node) {
-        int count = suppressExactInfoBlocks(node, "Loading sound [", 1, 6);
+        // sound.Sound is parent-loaded by Faster Rendering and cannot resolve
+        // the typed runtime installed in FR's child system loader. Removing
+        // this pure INFO block inline preserves the optimization without a
+        // cross-loader helper call. The structural marker remains the source
+        // of ownership/idempotency truth; only the optional runtime counter is
+        // intentionally absent for this one parent-owned target.
+        int count = suppressExactInfoBlocks(node, "Loading sound [", 1, 6, false);
         PatchReport report = new PatchReport();
         report.add("soundLoadInfo", count);
         return report;
@@ -659,6 +693,12 @@ public final class PrepatcherTransformer implements ClassFileTransformer {
 
     private static int suppressExactInfoBlocks(ClassNode node, String literal,
                                                int expected, int category) {
+        return suppressExactInfoBlocks(node, literal, expected, category, true);
+    }
+
+    private static int suppressExactInfoBlocks(ClassNode node, String literal,
+                                               int expected, int category,
+                                               boolean emitRuntimeCounter) {
         List<LogBlock> plans = new ArrayList<>();
         for (MethodNode method : node.methods) {
             for (AbstractInsnNode insn : method.instructions.toArray()) {
@@ -694,20 +734,29 @@ public final class PrepatcherTransformer implements ClassFileTransformer {
             }
         }
         int hooks = countCategoryHooks(node, "startupLogSuppressed", "(I)V", category);
-        if (plans.isEmpty() && hooks == expected) {
+        int expectedHooks = emitRuntimeCounter ? expected : 0;
+        if (plans.isEmpty() && hooks == expectedHooks) {
             throw already("startup INFO suppression postcondition matches for " + literal);
         }
         requireCount("startup INFO blocks for " + literal, plans.size(), expected);
         requireCount("startup suppression hooks for category " + category, hooks, 0);
         for (LogBlock plan : plans) {
-            InsnList replacement = new InsnList();
-            replacement.add(new LdcInsnNode(category));
-            replacement.add(new MethodInsnNode(Opcodes.INVOKESTATIC, HOOKS,
-                    "startupLogSuppressed", "(I)V", false));
-            plan.method.instructions.insertBefore(plan.start, replacement);
+            if (emitRuntimeCounter) {
+                InsnList replacement = new InsnList();
+                replacement.add(new LdcInsnNode(category));
+                replacement.add(new MethodInsnNode(Opcodes.INVOKESTATIC, HOOKS,
+                        "startupLogSuppressed", "(I)V", false));
+                plan.method.instructions.insertBefore(plan.start, replacement);
+            }
             removeRange(plan.method, plan.start, plan.end);
         }
         return plans.size();
+    }
+
+    private static String loaderName(ClassLoader loader) {
+        return loader == null ? "<bootstrap>"
+                : loader.getClass().getName() + "@"
+                + Integer.toHexString(System.identityHashCode(loader));
     }
 
     private static void requireOriginalLoadingTextReaderShape(MethodNode method) {

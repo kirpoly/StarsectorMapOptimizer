@@ -1,5 +1,6 @@
 package com.starsector.prepatcher.runtime;
 
+import com.fs.starfarer.api.StarsectorPrepatcherHooks;
 import com.starsector.prepatcher.agent.PrepatcherConfig;
 
 import java.lang.management.ManagementFactory;
@@ -68,13 +69,13 @@ public final class Exp6RuntimeRegressionTest {
 
     private static void assertEmptyScopeDoesNotClearIdentityMap() throws Exception {
         Iterator<?> iterator;
-        PrepatcherHooks.beginScratchScope();
+        StarsectorPrepatcherHooks.beginScratchScope();
         try {
             IdentityHashMap<Object, Boolean> membership = scratchIdentityMembership(0);
             require(membership.isEmpty(), "identity membership was not empty before empty scope test");
             iterator = membership.keySet().iterator();
         } finally {
-            PrepatcherHooks.endScratchScope();
+            StarsectorPrepatcherHooks.endScratchScope();
         }
         assertUnmodifiedEmptyIterator(iterator,
                 "empty scratch scope invoked IdentityHashMap.clear()");
@@ -83,16 +84,16 @@ public final class Exp6RuntimeRegressionTest {
     private static void assertEmptyRetainDoesNotClearIdentityMap() throws Exception {
         Iterator<?> iterator;
         Set<Object> target = new LinkedHashSet<>(List.of(new Object(), new Object()));
-        PrepatcherHooks.beginScratchScope();
+        StarsectorPrepatcherHooks.beginScratchScope();
         try {
             IdentityHashMap<Object, Boolean> membership = scratchIdentityMembership(0);
             require(membership.isEmpty(), "identity membership was not empty before empty retain test");
             iterator = membership.keySet().iterator();
-            require(PrepatcherHooks.retainAllFast(target, List.of(), null),
+            require(StarsectorPrepatcherHooks.retainAllFast(target, List.of(), null),
                     "empty retain did not report removal of target values");
             require(target.isEmpty(), "empty retain left target values behind");
         } finally {
-            PrepatcherHooks.endScratchScope();
+            StarsectorPrepatcherHooks.endScratchScope();
         }
         assertUnmodifiedEmptyIterator(iterator,
                 "empty retain path invoked IdentityHashMap.clear()");
@@ -103,16 +104,16 @@ public final class Exp6RuntimeRegressionTest {
         Object removed = new Object();
         Set<Object> target = new LinkedHashSet<>(List.of(kept, removed));
 
-        PrepatcherHooks.beginScratchScope();
+        StarsectorPrepatcherHooks.beginScratchScope();
         try {
             IdentityHashMap<Object, Boolean> membership = scratchIdentityMembership(0);
-            require(PrepatcherHooks.retainAllFast(target, List.of(kept), null),
+            require(StarsectorPrepatcherHooks.retainAllFast(target, List.of(kept), null),
                     "normal retain did not report removal");
             require(target.equals(Set.of(kept)), "normal retain changed collection semantics");
             require(membership.isEmpty(),
                     "normal retain left campaign values in identity membership");
         } finally {
-            PrepatcherHooks.endScratchScope();
+            StarsectorPrepatcherHooks.endScratchScope();
         }
     }
 
@@ -120,11 +121,11 @@ public final class Exp6RuntimeRegressionTest {
         Object value = new Object();
         IdentityHashMap<Object, Boolean> membership;
 
-        PrepatcherHooks.beginScratchScope();
+        StarsectorPrepatcherHooks.beginScratchScope();
         try {
             membership = scratchIdentityMembership(0);
             try {
-                PrepatcherHooks.retainAllFast(new LinkedHashSet<>(),
+                StarsectorPrepatcherHooks.retainAllFast(new LinkedHashSet<>(),
                         new PartiallyReadableList(value), null);
                 throw new AssertionError("partially readable keep list did not throw");
             } catch (RetainProbeFailure expected) {
@@ -132,7 +133,7 @@ public final class Exp6RuntimeRegressionTest {
                         "exceptional retain did not populate the identity map before failing");
             }
         } finally {
-            PrepatcherHooks.endScratchScope();
+            StarsectorPrepatcherHooks.endScratchScope();
         }
         require(membership.isEmpty(),
                 "exceptional retain scope retained a campaign value");
@@ -143,24 +144,24 @@ public final class Exp6RuntimeRegressionTest {
         IdentityHashMap<Object, Boolean> outer;
         Iterator<?> innerIterator;
 
-        PrepatcherHooks.beginScratchScope();
+        StarsectorPrepatcherHooks.beginScratchScope();
         try {
             outer = scratchIdentityMembership(0);
             outer.put(outerValue, Boolean.TRUE);
-            PrepatcherHooks.beginScratchScope();
+            StarsectorPrepatcherHooks.beginScratchScope();
             try {
                 IdentityHashMap<Object, Boolean> inner = scratchIdentityMembership(1);
                 require(inner.isEmpty(), "nested identity frame started populated");
                 innerIterator = inner.keySet().iterator();
             } finally {
-                PrepatcherHooks.endScratchScope();
+                StarsectorPrepatcherHooks.endScratchScope();
             }
             assertUnmodifiedEmptyIterator(innerIterator,
                     "empty nested scope invoked IdentityHashMap.clear()");
             require(outer.containsKey(outerValue),
                     "nested scope cleared the active outer identity frame");
         } finally {
-            PrepatcherHooks.endScratchScope();
+            StarsectorPrepatcherHooks.endScratchScope();
         }
         require(outer.isEmpty(), "outer identity frame was not cleared on exit");
     }
@@ -168,7 +169,7 @@ public final class Exp6RuntimeRegressionTest {
     @SuppressWarnings("unchecked")
     private static IdentityHashMap<Object, Boolean> scratchIdentityMembership(int frameIndex)
             throws Exception {
-        Field scratchField = PrepatcherHooks.class.getDeclaredField("SCRATCH");
+        Field scratchField = StarsectorPrepatcherHooks.class.getDeclaredField("SCRATCH");
         scratchField.setAccessible(true);
         ThreadLocal<?> threadLocal = (ThreadLocal<?>) scratchField.get(null);
         Object scratch = threadLocal.get();
@@ -200,16 +201,16 @@ public final class Exp6RuntimeRegressionTest {
         List<?> second;
         List<?> entityScripts;
 
-        PrepatcherHooks.beginScratchScope();
+        StarsectorPrepatcherHooks.beginScratchScope();
         try {
-            List<?> emptyScripts = PrepatcherHooks.borrowEntityScriptSnapshot(List.of());
+            List<?> emptyScripts = StarsectorPrepatcherHooks.borrowEntityScriptSnapshot(List.of());
             require(emptyScripts == Collections.emptyList(),
                     "empty entity-script snapshot did not return Collections.emptyList()");
-            require(emptyScripts == PrepatcherHooks.borrowEntityScriptSnapshot(List.of()),
+            require(emptyScripts == StarsectorPrepatcherHooks.borrowEntityScriptSnapshot(List.of()),
                     "empty entity-script snapshots did not share the allocation-free singleton");
             assertReadOnly(emptyScripts, "empty entity-script snapshot");
 
-            first = PrepatcherHooks.borrowLocationAdvanceSnapshot(source);
+            first = StarsectorPrepatcherHooks.borrowLocationAdvanceSnapshot(source);
             require(first != source && first.equals(List.of(firstValue, secondValue)),
                     "location snapshot did not capture the source contents");
             assertReadOnly(first, "location snapshot");
@@ -219,8 +220,8 @@ public final class Exp6RuntimeRegressionTest {
             require(first.equals(List.of(firstValue, secondValue)),
                     "source mutation changed an already-borrowed location snapshot");
 
-            second = PrepatcherHooks.borrowPausedLocationSnapshot(source);
-            entityScripts = PrepatcherHooks.borrowEntityScriptSnapshot(source);
+            second = StarsectorPrepatcherHooks.borrowPausedLocationSnapshot(source);
+            entityScripts = StarsectorPrepatcherHooks.borrowEntityScriptSnapshot(source);
             require(first != second && first != entityScripts && second != entityScripts,
                     "multiple live snapshots in one scope aliased each other");
             require(second.equals(List.of(secondValue)) && entityScripts.equals(List.of(secondValue)),
@@ -230,19 +231,19 @@ public final class Exp6RuntimeRegressionTest {
             require(second.equals(List.of(secondValue)) && entityScripts.equals(List.of(secondValue)),
                     "source replacement leaked into a borrowed snapshot");
         } finally {
-            PrepatcherHooks.endScratchScope();
+            StarsectorPrepatcherHooks.endScratchScope();
         }
 
         require(first.isEmpty() && second.isEmpty() && entityScripts.isEmpty(),
                 "ending a scratch scope did not clear every live snapshot");
 
-        PrepatcherHooks.beginScratchScope();
+        StarsectorPrepatcherHooks.beginScratchScope();
         try {
-            List<?> reused = PrepatcherHooks.borrowLocationAdvanceSnapshot(List.of(secondValue));
+            List<?> reused = StarsectorPrepatcherHooks.borrowLocationAdvanceSnapshot(List.of(secondValue));
             require(reused == first, "first snapshot slot was not reused by the next scope");
             require(reused.equals(List.of(secondValue)), "reused snapshot contains stale values");
         } finally {
-            PrepatcherHooks.endScratchScope();
+            StarsectorPrepatcherHooks.endScratchScope();
         }
     }
 
@@ -250,40 +251,40 @@ public final class Exp6RuntimeRegressionTest {
         Object outerValue = new Object();
         Object innerValue = new Object();
 
-        PrepatcherHooks.beginScratchScope();
+        StarsectorPrepatcherHooks.beginScratchScope();
         try {
-            List<?> outer = PrepatcherHooks.borrowLocationAdvanceSnapshot(List.of(outerValue));
+            List<?> outer = StarsectorPrepatcherHooks.borrowLocationAdvanceSnapshot(List.of(outerValue));
             List<?> firstInner;
-            PrepatcherHooks.beginScratchScope();
+            StarsectorPrepatcherHooks.beginScratchScope();
             try {
-                firstInner = PrepatcherHooks.borrowEntityScriptSnapshot(List.of(innerValue));
+                firstInner = StarsectorPrepatcherHooks.borrowEntityScriptSnapshot(List.of(innerValue));
                 require(firstInner != outer, "nested scratch scope reused an active outer snapshot");
                 require(firstInner.equals(List.of(innerValue)), "nested snapshot contents changed");
             } finally {
-                PrepatcherHooks.endScratchScope();
+                StarsectorPrepatcherHooks.endScratchScope();
             }
             require(firstInner.isEmpty(), "nested scratch frame was not cleared on exit");
             require(outer.equals(List.of(outerValue)), "nested scope cleared its active outer frame");
 
-            PrepatcherHooks.beginScratchScope();
+            StarsectorPrepatcherHooks.beginScratchScope();
             try {
-                List<?> reusedInner = PrepatcherHooks.borrowEntityScriptSnapshot(List.of(innerValue));
+                List<?> reusedInner = StarsectorPrepatcherHooks.borrowEntityScriptSnapshot(List.of(innerValue));
                 require(reusedInner == firstInner, "nested snapshot frame was not reused");
             } finally {
-                PrepatcherHooks.endScratchScope();
+                StarsectorPrepatcherHooks.endScratchScope();
             }
             require(outer.equals(List.of(outerValue)), "reused nested frame corrupted outer state");
         } finally {
-            PrepatcherHooks.endScratchScope();
+            StarsectorPrepatcherHooks.endScratchScope();
         }
     }
 
     private static void assertSnapshotFallback() throws Exception {
         installConfig(config(false));
         ArrayList<Object> source = new ArrayList<>(List.of(new Object()));
-        List<?> first = PrepatcherHooks.borrowLocationAdvanceSnapshot(source);
-        List<?> second = PrepatcherHooks.borrowLocationAdvanceSnapshot(source);
-        List<?> scripts = PrepatcherHooks.borrowEntityScriptSnapshot(source);
+        List<?> first = StarsectorPrepatcherHooks.borrowLocationAdvanceSnapshot(source);
+        List<?> second = StarsectorPrepatcherHooks.borrowLocationAdvanceSnapshot(source);
+        List<?> scripts = StarsectorPrepatcherHooks.borrowEntityScriptSnapshot(source);
         require(first instanceof ArrayList<?> && second instanceof ArrayList<?>
                         && scripts instanceof ArrayList<?>,
                 "disabled snapshot reuse did not preserve vanilla ArrayList snapshots");
@@ -296,15 +297,15 @@ public final class Exp6RuntimeRegressionTest {
 
     private static void assertMemoryIteratorMatrix() {
         Iterator<?> canonicalEmpty = Collections.emptyIterator();
-        Iterator<?> expireEmpty = PrepatcherHooks.memoryExpireIterator(new ArrayList<>());
-        Iterator<?> requireEmpty = PrepatcherHooks.memoryRequireIterator(new ArrayList<>());
+        Iterator<?> expireEmpty = StarsectorPrepatcherHooks.memoryExpireIterator(new ArrayList<>());
+        Iterator<?> requireEmpty = StarsectorPrepatcherHooks.memoryRequireIterator(new ArrayList<>());
         require(expireEmpty == canonicalEmpty && requireEmpty == canonicalEmpty,
                 "empty memory collections did not use the shared empty iterator");
         require(!expireEmpty.hasNext() && !requireEmpty.hasNext(),
                 "empty memory iterator unexpectedly contained an element");
 
         ArrayList<String> expire = new ArrayList<>(List.of("first", "second"));
-        Iterator expireIterator = PrepatcherHooks.memoryExpireIterator(expire);
+        Iterator expireIterator = StarsectorPrepatcherHooks.memoryExpireIterator(expire);
         require(expireIterator.next().equals("first"), "expire iterator changed source order");
         expireIterator.remove();
         require(expire.equals(List.of("second")), "expire iterator did not delegate remove()");
@@ -315,7 +316,7 @@ public final class Exp6RuntimeRegressionTest {
         requireMap.put("one", "first");
         requireMap.put("two", "second");
         Collection<String> values = requireMap.values();
-        Iterator requireIterator = PrepatcherHooks.memoryRequireIterator(values);
+        Iterator requireIterator = StarsectorPrepatcherHooks.memoryRequireIterator(values);
         require(requireIterator.next().equals("first"), "require iterator changed values order");
         requireIterator.remove();
         require(!requireMap.containsKey("one") && requireMap.size() == 1,
@@ -342,16 +343,16 @@ public final class Exp6RuntimeRegressionTest {
         WeakReference<Object> valueReference = new WeakReference<>(value, valueQueue);
         WeakReference<Collection<?>> sourceReference = new WeakReference<>(source, sourceQueue);
 
-        PrepatcherHooks.beginScratchScope();
+        StarsectorPrepatcherHooks.beginScratchScope();
         try {
-            require(PrepatcherHooks.borrowLocationAdvanceSnapshot(source).get(0) == value,
+            require(StarsectorPrepatcherHooks.borrowLocationAdvanceSnapshot(source).get(0) == value,
                     "location snapshot lost its source value");
-            require(PrepatcherHooks.borrowPausedLocationSnapshot(source).get(0) == value,
+            require(StarsectorPrepatcherHooks.borrowPausedLocationSnapshot(source).get(0) == value,
                     "paused snapshot lost its source value");
-            require(PrepatcherHooks.borrowEntityScriptSnapshot(source).get(0) == value,
+            require(StarsectorPrepatcherHooks.borrowEntityScriptSnapshot(source).get(0) == value,
                     "entity-script snapshot lost its source value");
         } finally {
-            PrepatcherHooks.endScratchScope();
+            StarsectorPrepatcherHooks.endScratchScope();
         }
         source.clear();
         return new SnapshotProbe(valueReference, sourceReference);
@@ -360,12 +361,12 @@ public final class Exp6RuntimeRegressionTest {
     private static void assertExceptionalSnapshotReachability() throws Exception {
         // Ensure slot zero owns a reusable array before exercising the supplied-array
         // failure path; an empty first use would give the custom collection a zero-length array.
-        PrepatcherHooks.beginScratchScope();
+        StarsectorPrepatcherHooks.beginScratchScope();
         try {
-            PrepatcherHooks.borrowLocationAdvanceSnapshot(
+            StarsectorPrepatcherHooks.borrowLocationAdvanceSnapshot(
                     List.of(new Object(), new Object(), new Object()));
         } finally {
-            PrepatcherHooks.endScratchScope();
+            StarsectorPrepatcherHooks.endScratchScope();
         }
 
         ReferenceQueue<Object> queue = new ReferenceQueue<>();
@@ -379,14 +380,14 @@ public final class Exp6RuntimeRegressionTest {
         WeakReference<Object> reference = new WeakReference<>(value, queue);
         Collection<Object> source = new PartiallyWritingCollection(value);
 
-        PrepatcherHooks.beginScratchScope();
+        StarsectorPrepatcherHooks.beginScratchScope();
         try {
-            PrepatcherHooks.borrowLocationAdvanceSnapshot(source);
+            StarsectorPrepatcherHooks.borrowLocationAdvanceSnapshot(source);
             throw new AssertionError("partially writing collection did not throw");
         } catch (SnapshotCopyFailure expected) {
             // The hook must propagate the original failure after clearing its backing array.
         } finally {
-            PrepatcherHooks.endScratchScope();
+            StarsectorPrepatcherHooks.endScratchScope();
         }
         return reference;
     }
@@ -408,13 +409,13 @@ public final class Exp6RuntimeRegressionTest {
     private static EmptyIteratorProbe emptyExpireIterator(ReferenceQueue<Collection<?>> queue) {
         ArrayList<Object> source = new ArrayList<>();
         WeakReference<Collection<?>> reference = new WeakReference<>(source, queue);
-        return new EmptyIteratorProbe(reference, PrepatcherHooks.memoryExpireIterator(source));
+        return new EmptyIteratorProbe(reference, StarsectorPrepatcherHooks.memoryExpireIterator(source));
     }
 
     private static EmptyIteratorProbe emptyRequireIterator(ReferenceQueue<Collection<?>> queue) {
         ArrayList<Object> source = new ArrayList<>();
         WeakReference<Collection<?>> reference = new WeakReference<>(source, queue);
-        return new EmptyIteratorProbe(reference, PrepatcherHooks.memoryRequireIterator(source));
+        return new EmptyIteratorProbe(reference, StarsectorPrepatcherHooks.memoryRequireIterator(source));
     }
 
     private static void assertReadOnly(List<?> snapshot, String label) {
@@ -442,13 +443,13 @@ public final class Exp6RuntimeRegressionTest {
     }
 
     private static void installConfig(PrepatcherConfig config) throws Exception {
-        Field field = PrepatcherHooks.class.getDeclaredField("config");
+        Field field = StarsectorPrepatcherHooks.class.getDeclaredField("config");
         field.setAccessible(true);
         field.set(null, config);
     }
 
     private static void drainScratchScopes() {
-        for (int i = 0; i < 8; i++) PrepatcherHooks.endScratchScope();
+        for (int i = 0; i < 8; i++) StarsectorPrepatcherHooks.endScratchScope();
     }
 
     private static void awaitCollected(WeakReference<?> reference, ReferenceQueue<?> queue,

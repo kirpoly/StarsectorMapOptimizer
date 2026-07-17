@@ -1,6 +1,5 @@
-package com.starsector.prepatcher.runtime;
+package com.fs.starfarer.api;
 
-import com.fs.starfarer.api.Global;
 import com.fs.starfarer.api.campaign.JumpPointAPI;
 import com.fs.starfarer.api.campaign.LocationAPI;
 import com.fs.starfarer.api.campaign.SectorAPI;
@@ -53,7 +52,7 @@ import java.util.WeakHashMap;
 import java.util.concurrent.atomic.LongAdder;
 
 /** Runtime entry points called by transformed Starsector classes. */
-public final class PrepatcherHooks {
+public final class StarsectorPrepatcherHooks {
     private static volatile PrepatcherConfig config;
     private static volatile Path modRoot;
 
@@ -158,13 +157,13 @@ public final class PrepatcherHooks {
     private static volatile float cachedGridWidth = Float.NaN;
     private static volatile float cachedGridHeight = Float.NaN;
 
-    private PrepatcherHooks() {}
+    private StarsectorPrepatcherHooks() {}
 
-    public static void configure(PrepatcherConfig optimizerConfig, Path root) {
+    static void configure(PrepatcherConfig optimizerConfig, Path root) {
         config = optimizerConfig;
         modRoot = root;
         if (optimizerConfig.statsLogIntervalSeconds > 0) {
-            Thread stats = new Thread(PrepatcherHooks::statsLoop, "StarsectorPrepatcher-Stats");
+            Thread stats = new Thread(StarsectorPrepatcherHooks::statsLoop, "StarsectorPrepatcher-Stats");
             stats.setDaemon(true);
             stats.setPriority(Thread.MIN_PRIORITY);
             stats.start();

@@ -29,6 +29,29 @@ printf '%s\n' \
 jar cfm "$MOD_ROOT/agent/StarsectorPrepatcherAgent.jar" "$BUILD/agent.mf" -C "$BUILD/agent-classes" .
 jar cfm "$MOD_ROOT/jars/StarsectorPrepatcherBootstrap.jar" "$BUILD/bootstrap.mf" -C "$BUILD/bootstrap-classes" .
 
+# RuntimeInstaller reads these classfiles as bytes from the agent JAR and
+# defines them in the target game loader. Keep them as normal class entries,
+# but never link to them from the agent control-loader classes.
+AGENT_ENTRIES="$BUILD/agent-entries.txt"
+jar tf "$MOD_ROOT/agent/StarsectorPrepatcherAgent.jar" > "$AGENT_ENTRIES"
+REQUIRED_RUNTIME_PAYLOAD=(
+  'com/fs/starfarer/api/StarsectorPrepatcherHooks.class'
+  'com/fs/starfarer/api/StarsectorPrepatcherHyperspaceHooks.class'
+  'com/fs/starfarer/api/StarsectorPrepatcherRuntimeBridge.class'
+)
+for payload_entry in "${REQUIRED_RUNTIME_PAYLOAD[@]}"; do
+  if ! grep -Fqx "$payload_entry" "$AGENT_ENTRIES"; then
+    echo "Required target-loader runtime payload is missing from the agent JAR: $payload_entry" >&2
+    exit 1
+  fi
+done
+EXPECTED_RUNTIME_PAYLOAD_COUNT=48
+runtime_payload_count="$(grep -Ec '^com/fs/starfarer/api/StarsectorPrepatcher[^/]*\.class$' "$AGENT_ENTRIES" || true)"
+if [[ "$runtime_payload_count" -ne "$EXPECTED_RUNTIME_PAYLOAD_COUNT" ]]; then
+  echo "Target-loader runtime payload inventory changed: expected $EXPECTED_RUNTIME_PAYLOAD_COUNT class entries, found $runtime_payload_count." >&2
+  exit 1
+fi
+
 # Keep the release manifest synchronized with the exact tree produced by this build.
 # Runtime logs, build intermediates and SHA256SUMS.txt itself are intentionally excluded.
 CHECKSUM_INPUTS="$BUILD/checksum-inputs.txt"

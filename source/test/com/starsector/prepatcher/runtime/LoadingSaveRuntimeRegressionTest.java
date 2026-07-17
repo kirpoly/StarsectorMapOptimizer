@@ -1,5 +1,7 @@
 package com.starsector.prepatcher.runtime;
 
+import com.fs.starfarer.api.StarsectorPrepatcherHooks;
+import com.fs.starfarer.api.StarsectorPrepatcherRuntimeBridge;
 import com.starsector.prepatcher.agent.PrepatcherConfig;
 
 import java.io.ByteArrayInputStream;
@@ -49,7 +51,7 @@ public final class LoadingSaveRuntimeRegressionTest {
         for (String sample : samples) {
             byte[] bytes = sample.getBytes(StandardCharsets.UTF_8);
             TrackingInputStream input = new TrackingInputStream(bytes);
-            String actual = PrepatcherHooks.readUtf8Normalized(input);
+            String actual = StarsectorPrepatcherHooks.readUtf8Normalized(input);
             String expected = new String(bytes, StandardCharsets.UTF_8).replace("\r", "");
             require(expected.equals(actual), "UTF-8 reader mismatch for sample length " + sample.length());
             require(input.closed, "UTF-8 reader did not close input");
@@ -63,7 +65,7 @@ public final class LoadingSaveRuntimeRegressionTest {
         };
         for (byte[] bytes : malformed) {
             TrackingInputStream input = new TrackingInputStream(bytes);
-            String actual = PrepatcherHooks.readUtf8Normalized(input);
+            String actual = StarsectorPrepatcherHooks.readUtf8Normalized(input);
             String expected = new String(bytes, StandardCharsets.UTF_8).replace("\r", "");
             require(expected.equals(actual), "malformed UTF-8 replacement behavior changed");
             require(input.closed, "malformed UTF-8 input was not closed");
@@ -74,7 +76,7 @@ public final class LoadingSaveRuntimeRegressionTest {
         FailingInputStream input = new FailingInputStream(1024, 333);
         boolean failed = false;
         try {
-            PrepatcherHooks.readUtf8Normalized(input);
+            StarsectorPrepatcherHooks.readUtf8Normalized(input);
         } catch (IOException expected) {
             failed = true;
         }
@@ -100,25 +102,25 @@ public final class LoadingSaveRuntimeRegressionTest {
     }
 
     private static void compareLiteralHelpers(String value) {
-        require(value.replaceAll("\\r", "").equals(PrepatcherHooks.removeCarriageReturns(value)),
+        require(value.replaceAll("\\r", "").equals(StarsectorPrepatcherHooks.removeCarriageReturns(value)),
                 "CR removal changed for " + printable(value));
-        require(value.replaceAll("\\n", " ").equals(PrepatcherHooks.replaceNewlinesWithSpace(value)),
+        require(value.replaceAll("\\n", " ").equals(StarsectorPrepatcherHooks.replaceNewlinesWithSpace(value)),
                 "newline replacement changed for " + printable(value));
-        require(Arrays.equals(value.split("\\n"), PrepatcherHooks.splitNewlines(value)),
+        require(Arrays.equals(value.split("\\n"), StarsectorPrepatcherHooks.splitNewlines(value)),
                 "newline split changed for " + printable(value));
-        require(Arrays.equals(value.split("\nOR\n"), PrepatcherHooks.splitOrBlocks(value)),
+        require(Arrays.equals(value.split("\nOR\n"), StarsectorPrepatcherHooks.splitOrBlocks(value)),
                 "OR split changed for " + printable(value));
-        require(Arrays.equals(value.split(Pattern.quote(":")), PrepatcherHooks.splitColon(value)),
+        require(Arrays.equals(value.split(Pattern.quote(":")), StarsectorPrepatcherHooks.splitColon(value)),
                 "colon split changed for " + printable(value));
     }
 
     private static void testProgressFrequency(Path temp) throws Exception {
         configure(temp, 15);
-        require(Float.floatToIntBits(PrepatcherHooks.saveLoadProgressMinIntervalSeconds())
+        require(Float.floatToIntBits(StarsectorPrepatcherHooks.saveLoadProgressMinIntervalSeconds())
                         == Float.floatToIntBits(1f / 15f),
                 "15 Hz progress interval mismatch");
         configure(temp, 0);
-        require(Float.floatToIntBits(PrepatcherHooks.saveLoadProgressMinIntervalSeconds())
+        require(Float.floatToIntBits(StarsectorPrepatcherHooks.saveLoadProgressMinIntervalSeconds())
                         == Float.floatToIntBits(1f / 60f),
                 "vanilla progress fallback mismatch");
     }
@@ -131,7 +133,7 @@ public final class LoadingSaveRuntimeRegressionTest {
         try (var output = Files.newOutputStream(file)) {
             properties.store(output, "test");
         }
-        PrepatcherHooks.configure(PrepatcherConfig.load(file), temp);
+        StarsectorPrepatcherRuntimeBridge.configure(PrepatcherConfig.load(file), temp);
     }
 
     private static String printable(String value) {

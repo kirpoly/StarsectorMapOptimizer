@@ -11,6 +11,7 @@ $core = Join-Path $gameRoot 'starsector-core'
 $build = Join-Path $modRoot '.build'
 $agentClasses = Join-Path $build 'agent-classes'
 $testClasses = Join-Path $build 'test-classes'
+$frSmokeClasses = Join-Path $build 'fr-smoke-classes'
 $reportDir = Join-Path $build 'reports'
 $utf8 = New-Object Text.UTF8Encoding($false)
 $exports = @(
@@ -21,7 +22,7 @@ $exports = @(
 
 & (Join-Path $modRoot 'build-agent.ps1')
 if (Test-Path $testClasses) { Remove-Item -Recurse -Force $testClasses }
-New-Item -ItemType Directory -Force -Path $testClasses, $reportDir | Out-Null
+New-Item -ItemType Directory -Force -Path $testClasses, $frSmokeClasses, $reportDir | Out-Null
 
 $testCp = @(
     $agentClasses,
@@ -32,9 +33,15 @@ $testCp = @(
     (Join-Path $core 'lwjgl.jar'),
     (Join-Path $core 'lwjgl_util.jar')
 ) -join [IO.Path]::PathSeparator
-$testSources = Get-ChildItem -Path (Join-Path $modRoot 'source\test') -Filter '*.java' -Recurse | ForEach-Object FullName
+$frSmokeSource = Join-Path $modRoot `
+    'source\test\com\starsector\prepatcher\fr\FasterRenderingLoaderSmokeTest.java'
+$testSources = Get-ChildItem -Path (Join-Path $modRoot 'source\test') -Filter '*.java' -Recurse |
+    Where-Object { $_.FullName -ne $frSmokeSource } |
+    ForEach-Object FullName
 & javac -encoding UTF-8 -source 17 -target 17 @exports -cp $testCp -d $testClasses @testSources
 if ($LASTEXITCODE -ne 0) { throw 'Test compilation failed.' }
+& javac -encoding UTF-8 -source 17 -target 17 -d $frSmokeClasses $frSmokeSource
+if ($LASTEXITCODE -ne 0) { throw 'FR smoke harness compilation failed.' }
 
 $savedErrorActionPreference = $ErrorActionPreference
 $documentationReport = Join-Path $reportDir 'documentation-consistency.txt'
@@ -159,4 +166,54 @@ $startupLines
 [IO.File]::WriteAllLines($startupReport, [string[]] $startupLines, $utf8)
 if ($startupExitCode -ne 0) { throw 'Javaagent startup smoke failed.' }
 
-Write-Host 'Documentation/structural/runtime/hyperspace/startup verification completed.' -ForegroundColor Green
+$frSmokeReport = Join-Path $reportDir 'faster-rendering-loader-smoke.txt'
+$frJar = Join-Path $core 'fr.jar'
+if (-not (Test-Path -LiteralPath $frJar -PathType Leaf)) {
+    $frSmokeLines = @("SKIPPED Faster Rendering loader smoke: fr.jar not found at $frJar")
+    $frSmokeLines
+    [IO.File]::WriteAllLines($frSmokeReport, [string[]] $frSmokeLines, $utf8)
+} else {
+    # Keep agent classes out of this classpath. Faster Rendering must place the
+    # javaagent in JavaAgentLoader while defining the injected runtime hooks in
+    # its custom system loader; adding agent-classes here would hide that split.
+    $frSmokeCp = @(
+        $frJar,
+        $frSmokeClasses,
+        (Join-Path $core 'janino.jar'),
+        (Join-Path $core 'commons-compiler.jar'),
+        (Join-Path $core 'commons-compiler-jdk.jar'),
+        (Join-Path $core 'starfarer.api.jar'),
+        (Join-Path $core 'starfarer_obf.jar'),
+        (Join-Path $core 'jogg-0.0.7.jar'),
+        (Join-Path $core 'jorbis-0.0.15.jar'),
+        (Join-Path $core 'json.jar'),
+        (Join-Path $core 'lwjgl.jar'),
+        (Join-Path $core 'jinput.jar'),
+        (Join-Path $core 'log4j-1.2.9.jar'),
+        (Join-Path $core 'lwjgl_util.jar'),
+        (Join-Path $core 'fs.sound_obf.jar'),
+        (Join-Path $core 'fs.common_obf.jar'),
+        (Join-Path $core 'xstream-1.4.10.jar'),
+        (Join-Path $core 'txw2-3.0.2.jar'),
+        (Join-Path $core 'jaxb-api-2.4.0-b180830.0359.jar'),
+        (Join-Path $core 'webp-imageio-0.1.6.jar')
+    ) -join [IO.Path]::PathSeparator
+    $ErrorActionPreference = 'Continue'
+    try {
+        $frSmokeOutput = @(& java `
+            '-Djava.system.class.loader=com.genir.renderer.loaders.AppClassLoader' `
+            "-javaagent:$mainAgentJar=config=$verificationConfig" `
+            -cp $frSmokeCp `
+            com.starsector.prepatcher.fr.FasterRenderingLoaderSmokeTest `
+            $mainAgentJar 2>&1)
+        $frSmokeExitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $savedErrorActionPreference
+    }
+    $frSmokeLines = @($frSmokeOutput | ForEach-Object { $_.ToString() })
+    $frSmokeLines
+    [IO.File]::WriteAllLines($frSmokeReport, [string[]] $frSmokeLines, $utf8)
+    if ($frSmokeExitCode -ne 0) { throw 'Faster Rendering loader smoke failed.' }
+}
+
+Write-Host 'Documentation/structural/runtime/hyperspace/startup/FR verification completed.' -ForegroundColor Green

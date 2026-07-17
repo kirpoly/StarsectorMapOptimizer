@@ -37,9 +37,10 @@ import java.util.jar.JarFile;
 
 /** In-memory regression harness; it never writes modified game classes. */
 public final class StructuralCompatibilityTest {
-    private static final String HOOKS = "com/starsector/prepatcher/runtime/PrepatcherHooks";
+    private static final String HOOKS =
+            "com/fs/starfarer/api/StarsectorPrepatcherHooks";
     private static final String HYPERSPACE_HOOKS =
-            "com/starsector/prepatcher/hyperspace/HyperspaceHooks";
+            "com/fs/starfarer/api/StarsectorPrepatcherHyperspaceHooks";
 
     private StructuralCompatibilityTest() {}
 
@@ -87,6 +88,8 @@ public final class StructuralCompatibilityTest {
         require(classes == PrepatcherTransformer.TARGET_CLASSES.size(),
                 "not all optimizer target classes were found across supplied JARs: expected "
                         + PrepatcherTransformer.TARGET_CLASSES.size() + ", found " + classes);
+        runLoaderGuardTests(config, Arrays.stream(args).skip(1)
+                .map(value -> Path.of(value).toAbsolutePath().normalize()).toList());
         runNegativeRetainAllTests(config, Path.of(args[1]).toAbsolutePath().normalize());
         runNegativeLifecycleTests(config, Path.of(args[1]).toAbsolutePath().normalize());
         runExp6OwnershipTests(config, Path.of(args[1]).toAbsolutePath().normalize());
@@ -101,9 +104,45 @@ public final class StructuralCompatibilityTest {
                 + " exp8-late-postcondition-tamper entity-fastpath-prologue"
                 + " entity-fastpath-epilogue memory-fastpath-source"
                 + " memory-fastpath-order-placement inline-marker-receiver"
-                + " inline-marker-branch inline-marker-order safe-missing-config-defaults");
+                + " inline-marker-branch inline-marker-order loader-guard"
+                + " safe-missing-config-defaults");
         System.out.println("SUMMARY jars=" + jars + " transformedClasses=" + classes
                 + " verifiedMethods=" + methods);
+    }
+
+    private static void runLoaderGuardTests(PrepatcherConfig config,
+                                            List<Path> jarPaths) throws Exception {
+        byte[] campaign = null;
+        for (Path jarPath : jarPaths) {
+            try (JarFile jar = new JarFile(jarPath.toFile())) {
+                var entry = jar.getJarEntry(PrepatcherTransformer.CAMPAIGN_ENGINE + ".class");
+                if (entry != null) {
+                    campaign = jar.getInputStream(entry).readAllBytes();
+                    break;
+                }
+            }
+        }
+        require(campaign != null, "CampaignEngine fixture missing for loader-guard test");
+
+        ClassLoader runtimeLoader = new ClassLoader(null) {};
+        ClassLoader foreignLoader = new ClassLoader(null) {};
+        String property = "starsector.prepatcher.patchStatus."
+                + PrepatcherTransformer.CAMPAIGN_ENGINE.replace('/', '.') + ".classLoader";
+        System.clearProperty(property);
+        byte[] rejected = new PrepatcherTransformer(config, runtimeLoader).transform(
+                foreignLoader, PrepatcherTransformer.CAMPAIGN_ENGINE,
+                null, null, campaign);
+        require(rejected == null, "loader guard transformed a foreign com.fs target");
+        require("SKIPPED_LOADER".equals(System.getProperty(property)),
+                "loader guard did not publish SKIPPED_LOADER");
+
+        System.clearProperty(property);
+        byte[] accepted = new PrepatcherTransformer(config, runtimeLoader).transform(
+                runtimeLoader, PrepatcherTransformer.CAMPAIGN_ENGINE,
+                null, null, campaign);
+        require(accepted != null, "loader guard rejected its own runtime loader");
+        require(System.getProperty(property) == null,
+                "matching loader unexpectedly published loader skip status");
     }
 
     private static Result verifyJar(PrepatcherConfig config, Path jarPath,
@@ -786,8 +825,21 @@ public final class StructuralCompatibilityTest {
                 expected.put("splitColon", 1);
             }
             case PrepatcherTransformer.SPEC_STORE -> expected.put("suppressStartupInfo", 53);
-            case PrepatcherTransformer.TEXTURE_LOADER, PrepatcherTransformer.SOUND ->
+            case PrepatcherTransformer.TEXTURE_LOADER ->
                     expected.put("startupLogSuppressed", 1);
+            case PrepatcherTransformer.SOUND -> {
+                ClassNode sound = read(bytes);
+                assertHookCount(bytes, HOOKS, "startupLogSuppressed", 0);
+                require(hasOwnershipMarker(sound, "startupLogAggregation"),
+                        "sound inline startup-log patch has no ownership marker");
+                for (MethodNode method : sound.methods) {
+                    for (AbstractInsnNode insn : method.instructions.toArray()) {
+                        require(!(insn instanceof LdcInsnNode ldc
+                                        && "Loading sound [".equals(ldc.cst)),
+                                "sound inline startup-log patch left its INFO literal");
+                    }
+                }
+            }
             case PrepatcherTransformer.PROGRESS_INPUT, PrepatcherTransformer.PROGRESS_OUTPUT ->
                     expected.put("saveLoadProgressMinIntervalSeconds", 1);
             case PrepatcherTransformer.CAMPAIGN_GAME_MANAGER -> {

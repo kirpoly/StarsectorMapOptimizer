@@ -1,5 +1,7 @@
 package com.starsector.prepatcher.runtime;
 
+import com.fs.starfarer.api.StarsectorPrepatcherHooks;
+
 import java.lang.management.ManagementFactory;
 import java.lang.ref.ReferenceQueue;
 import java.lang.ref.WeakReference;
@@ -19,7 +21,7 @@ import java.util.Set;
  * GC/lifecycle regression harness for the system-classloader runtime hooks.
  *
  * <p>The test deliberately populates the exact private cache structures shipped in
- * {@link PrepatcherHooks}. It then exercises the public two-phase identity hooks and
+ * {@link StarsectorPrepatcherHooks}. It then exercises the public two-phase identity hooks and
  * verifies both structural cleanup and actual reachability of a shared sentinel.
  * No game objects are required: generic collection types are erased at runtime and
  * the private NebulaCache is instantiated reflectively with sentinel-backed lists.
@@ -313,7 +315,7 @@ public final class LifecycleGcRegressionTest {
         frameAt.setAccessible(true);
         Object frame = frameAt.invoke(replacement, 0);
         addToCollection(frame, "entityList", postResetSentinel);
-        PrepatcherHooks.endScratchScope();
+        StarsectorPrepatcherHooks.endScratchScope();
         require(((Collection) instanceField(frame.getClass(), "entityList").get(frame)).isEmpty(),
                 "post-reset campaign reference survived the interrupted scope's finally hook");
         Object afterDrain = scratchThreadLocal().get();
@@ -325,7 +327,7 @@ public final class LifecycleGcRegressionTest {
 
     private static void assertExactPackagedStructures() throws Exception {
         Set<String> actualMapFields = new HashSet<>();
-        for (Field field : PrepatcherHooks.class.getDeclaredFields()) {
+        for (Field field : StarsectorPrepatcherHooks.class.getDeclaredFields()) {
             if (Modifier.isStatic(field.getModifiers()) && Map.class.isAssignableFrom(field.getType())) {
                 require(Modifier.isVolatile(field.getModifiers()),
                         field.getName() + " must be volatile for lock-free lifecycle detachment");
@@ -341,11 +343,11 @@ public final class LifecycleGcRegressionTest {
                 "SCRATCH is no longer a final ThreadLocal");
         Field nebulaSlot = staticField("nebulaCacheSlot");
         require(Modifier.isVolatile(nebulaSlot.getModifiers())
-                        && nebulaSlot.getType().getName().endsWith("PrepatcherHooks$NebulaCacheSlot"),
+                        && nebulaSlot.getType().getName().endsWith("StarsectorPrepatcherHooks$NebulaCacheSlot"),
                 "nebulaCacheSlot packaged shape changed");
         Field nebulaValue = instanceField(nebulaSlot.getType(), "value");
         require(Modifier.isVolatile(nebulaValue.getModifiers())
-                        && nebulaValue.getType().getName().endsWith("PrepatcherHooks$NebulaCache"),
+                        && nebulaValue.getType().getName().endsWith("StarsectorPrepatcherHooks$NebulaCache"),
                 "NebulaCacheSlot.value packaged shape changed");
 
         Field generationActive = staticField("campaignCacheGenerationActive");
@@ -381,7 +383,7 @@ public final class LifecycleGcRegressionTest {
     }
 
     private static Method beginMethod() throws Exception {
-        Method method = PrepatcherHooks.class.getDeclaredMethod(BEGIN_METHOD, Object.class);
+        Method method = StarsectorPrepatcherHooks.class.getDeclaredMethod(BEGIN_METHOD, Object.class);
         int required = Modifier.PUBLIC | Modifier.STATIC;
         require((method.getModifiers() & required) == required
                         && method.getReturnType() == long.class,
@@ -390,7 +392,7 @@ public final class LifecycleGcRegressionTest {
     }
 
     private static Method completeMethod() throws Exception {
-        Method method = PrepatcherHooks.class.getDeclaredMethod(
+        Method method = StarsectorPrepatcherHooks.class.getDeclaredMethod(
                 COMPLETE_METHOD, Object.class, long.class);
         int required = Modifier.PUBLIC | Modifier.STATIC;
         require((method.getModifiers() & required) == required
@@ -471,7 +473,7 @@ public final class LifecycleGcRegressionTest {
     }
 
     private static Field staticField(String name) throws Exception {
-        Field field = PrepatcherHooks.class.getDeclaredField(name);
+        Field field = StarsectorPrepatcherHooks.class.getDeclaredField(name);
         field.setAccessible(true);
         return field;
     }
