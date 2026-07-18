@@ -15,8 +15,10 @@ import jdk.internal.org.objectweb.asm.tree.InsnNode;
 import jdk.internal.org.objectweb.asm.tree.JumpInsnNode;
 import jdk.internal.org.objectweb.asm.tree.LabelNode;
 import jdk.internal.org.objectweb.asm.tree.LdcInsnNode;
+import jdk.internal.org.objectweb.asm.tree.LookupSwitchInsnNode;
 import jdk.internal.org.objectweb.asm.tree.MethodInsnNode;
 import jdk.internal.org.objectweb.asm.tree.MethodNode;
+import jdk.internal.org.objectweb.asm.tree.TableSwitchInsnNode;
 import jdk.internal.org.objectweb.asm.tree.TypeInsnNode;
 import jdk.internal.org.objectweb.asm.tree.TryCatchBlockNode;
 import jdk.internal.org.objectweb.asm.tree.VarInsnNode;
@@ -31,7 +33,9 @@ import jdk.internal.org.objectweb.asm.tree.analysis.SourceValue;
 import java.lang.instrument.ClassFileTransformer;
 import java.security.ProtectionDomain;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashSet;
+import java.util.IdentityHashMap;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -175,8 +179,13 @@ public final class PrepatcherTransformer implements ClassFileTransformer {
                     config.routeJumpPointIndex, this::patchRouteJumpPointIndex);
             case BASE_LOCATION -> apply(state, "campaignSnapshotReuse",
                     config.campaignSnapshotReuse, this::patchCampaignSnapshotReuse);
-            case BASE_CAMPAIGN_ENTITY -> apply(state, "entityScriptSnapshotReuse",
-                    config.entityScriptSnapshotReuse, this::patchEntityScriptSnapshotReuse);
+            case BASE_CAMPAIGN_ENTITY -> {
+                apply(state, "entityScriptSnapshotReuse",
+                        config.entityScriptSnapshotReuse, this::patchEntityScriptSnapshotReuse);
+                apply(state, "planetConditionMarketAdvanceBridge",
+                        config.planetConditionMarketScheduler || config.directMarketObservation,
+                        this::patchPlanetConditionMarketAdvanceBridge);
+            }
             case MEMORY -> apply(state, "emptyMemoryAdvanceFastPath",
                     config.emptyMemoryAdvanceFastPath, this::patchEmptyMemoryAdvanceFastPath);
             case ECONOMY -> {
@@ -186,6 +195,9 @@ public final class PrepatcherTransformer implements ClassFileTransformer {
                         this::patchEconomySnapshots);
                 apply(state, "remoteMarketScheduler", config.remoteMarketScheduler,
                         this::patchRemoteMarketScheduler);
+                apply(state, "planetConditionMarketFrameClock",
+                        config.planetConditionMarketScheduler && !config.remoteMarketScheduler,
+                        this::patchPlanetConditionMarketFrameClock);
             }
             case MARKET -> {
                 apply(state, "economySnapshotReuse", config.economySnapshotReuse,
@@ -230,7 +242,8 @@ public final class PrepatcherTransformer implements ClassFileTransformer {
             case CAMPAIGN_GAME_MANAGER -> {
                 apply(state, "saveOutputBufferDedup",
                         config.saveOutputBufferDedup, this::patchSaveOutputBufferDedup);
-                apply(state, "remoteMarketScheduler", config.remoteMarketScheduler,
+                apply(state, "remoteMarketScheduler",
+                        config.remoteMarketScheduler || config.planetConditionMarketScheduler,
                         this::patchRemoteMarketSaveFlush);
             }
             case HyperspacePatches.BASE_TILED -> {
@@ -388,10 +401,11 @@ public final class PrepatcherTransformer implements ClassFileTransformer {
             case CAMPAIGN_ENGINE -> campaignCacheLifecycleEnabled() || config.campaignListenerThrottle;
             case COURSE_WIDGET -> config.routeJumpPointIndex;
             case BASE_LOCATION -> config.campaignSnapshotReuse;
-            case BASE_CAMPAIGN_ENTITY -> config.entityScriptSnapshotReuse;
+            case BASE_CAMPAIGN_ENTITY -> config.entityScriptSnapshotReuse
+                    || config.planetConditionMarketScheduler || config.directMarketObservation;
             case MEMORY -> config.emptyMemoryAdvanceFastPath;
             case ECONOMY -> config.economyLocationCache || config.economySnapshotReuse
-                    || config.remoteMarketScheduler;
+                    || config.remoteMarketScheduler || config.planetConditionMarketScheduler;
             case MARKET -> config.economySnapshotReuse || config.directMarketObservation;
             case COMMODITY_ON_MARKET -> config.commodityEventModDirtyCache;
             case INTEL_MANAGER -> config.commRelaySystemIndex;
@@ -402,7 +416,7 @@ public final class PrepatcherTransformer implements ClassFileTransformer {
             case RULES -> config.startupLogAggregation || config.rulesLiteralParser;
             case PROGRESS_INPUT, PROGRESS_OUTPUT -> config.saveLoadProgressThrottle;
             case CAMPAIGN_GAME_MANAGER -> config.saveOutputBufferDedup
-                    || config.remoteMarketScheduler;
+                    || config.remoteMarketScheduler || config.planetConditionMarketScheduler;
             case HyperspacePatches.BASE_TILED -> config.hyperspaceCulling
                     || config.hyperspaceYClamp || config.terrainRandomReuse;
             case HyperspacePatches.HYPER_TERRAIN -> config.skipNoOpTerrainLayer
@@ -419,7 +433,7 @@ public final class PrepatcherTransformer implements ClassFileTransformer {
                 || config.systemNebulaCache || config.sampleCacheClearThrottle
                 || config.campaignListenerThrottle || config.routeJumpPointIndex
                 || config.economyLocationCache || config.remoteMarketScheduler
-                || config.commRelaySystemIndex;
+                || config.planetConditionMarketScheduler || config.commRelaySystemIndex;
     }
 
 
@@ -2515,13 +2529,151 @@ public final class PrepatcherTransformer implements ClassFileTransformer {
         return report;
     }
 
+    private PatchReport patchPlanetConditionMarketAdvanceBridge(ClassNode node) {
+        MethodNode advance = requireMethod(node, "advance", "(F)V");
+        String market = "com/fs/starfarer/api/campaign/econ/MarketAPI";
+        String hookDesc = "(L" + market + ";F)V";
+        List<MethodInsnNode> originals = calls(advance, Opcodes.INVOKEINTERFACE,
+                market, "advance", "(F)V");
+        List<MethodInsnNode> hooks = calls(advance, Opcodes.INVOKESTATIC, HOOKS,
+                "advancePlanetConditionMarketScheduled", hookDesc);
+        boolean originalState = originals.size() == 1 && hooks.isEmpty();
+        boolean patchedState = originals.isEmpty() && hooks.size() == 1;
+        if (!originalState && !patchedState) {
+            throw mismatch("BaseCampaignEntity planet-condition Market.advance call is missing, "
+                    + "duplicated, or partially patched");
+        }
+        requireCount("BaseCampaignEntity planet-condition predicate",
+                countCalls(advance, Opcodes.INVOKEINTERFACE, market,
+                        "isPlanetConditionMarketOnly", "()Z"), 1);
+
+        MethodInsnNode target = originalState ? originals.get(0) : hooks.get(0);
+        AbstractInsnNode amount = previousMeaningful(target);
+        AbstractInsnNode fieldInsn = previousMeaningful(amount);
+        AbstractInsnNode owner = previousMeaningful(fieldInsn);
+        if (!(amount instanceof VarInsnNode amountLoad)
+                || amountLoad.getOpcode() != Opcodes.FLOAD || amountLoad.var != 1
+                || !(fieldInsn instanceof FieldInsnNode field)
+                || field.getOpcode() != Opcodes.GETFIELD
+                || !field.owner.equals(node.name)
+                || !field.desc.equals("L" + market + ";")
+                || !(owner instanceof VarInsnNode ownerLoad)
+                || ownerLoad.getOpcode() != Opcodes.ALOAD || ownerLoad.var != 0) {
+            throw mismatch("BaseCampaignEntity planet-condition Market.advance receiver/amount "
+                    + "shape changed structurally");
+        }
+
+        AbstractInsnNode predicateBranchInsn = previousMeaningful(owner);
+        AbstractInsnNode predicateInsn = previousMeaningful(predicateBranchInsn);
+        AbstractInsnNode predicateFieldInsn = previousMeaningful(predicateInsn);
+        AbstractInsnNode predicateOwnerInsn = previousMeaningful(predicateFieldInsn);
+        AbstractInsnNode nullBranchInsn = previousMeaningful(predicateOwnerInsn);
+        AbstractInsnNode nullFieldInsn = previousMeaningful(nullBranchInsn);
+        AbstractInsnNode nullOwnerInsn = previousMeaningful(nullFieldInsn);
+        AbstractInsnNode join = nextMeaningful(target);
+        if (!(predicateBranchInsn instanceof JumpInsnNode predicateBranch)
+                || predicateBranch.getOpcode() != Opcodes.IFEQ
+                || !(predicateInsn instanceof MethodInsnNode predicate)
+                || !callMatches(predicate, Opcodes.INVOKEINTERFACE, market,
+                        "isPlanetConditionMarketOnly", "()Z")
+                || !(predicateFieldInsn instanceof FieldInsnNode predicateField)
+                || predicateField.getOpcode() != Opcodes.GETFIELD
+                || !predicateField.owner.equals(field.owner)
+                || !predicateField.name.equals(field.name)
+                || !predicateField.desc.equals(field.desc)
+                || !(predicateOwnerInsn instanceof VarInsnNode predicateOwner)
+                || predicateOwner.getOpcode() != Opcodes.ALOAD || predicateOwner.var != 0
+                || !(nullBranchInsn instanceof JumpInsnNode nullBranch)
+                || nullBranch.getOpcode() != Opcodes.IFNULL
+                || !(nullFieldInsn instanceof FieldInsnNode nullField)
+                || nullField.getOpcode() != Opcodes.GETFIELD
+                || !nullField.owner.equals(field.owner)
+                || !nullField.name.equals(field.name)
+                || !nullField.desc.equals(field.desc)
+                || !(nullOwnerInsn instanceof VarInsnNode nullOwner)
+                || nullOwner.getOpcode() != Opcodes.ALOAD || nullOwner.var != 0
+                || join == null
+                || nextMeaningful(predicateBranch.label) != join
+                || nextMeaningful(nullBranch.label) != join
+                || hasExternalControlFlowEntry(advance, nullOwnerInsn, target)) {
+            throw mismatch("BaseCampaignEntity planet-condition predicate/null guards are not "
+                    + "the exact control-flow owner of the Market.advance call");
+        }
+
+        if (patchedState) {
+            throw already("planet-condition Market.advance bridge postcondition matches");
+        }
+
+        advance.instructions.set(target, new MethodInsnNode(Opcodes.INVOKESTATIC,
+                HOOKS, "advancePlanetConditionMarketScheduled", hookDesc, false));
+        requireCount("planet-condition market bridge",
+                countCalls(advance, Opcodes.INVOKESTATIC, HOOKS,
+                        "advancePlanetConditionMarketScheduled", hookDesc), 1);
+        requireCount("retired direct planet-condition Market.advance",
+                countCalls(advance, Opcodes.INVOKEINTERFACE, market,
+                        "advance", "(F)V"), 0);
+
+        PatchReport report = new PatchReport();
+        report.add("planet-condition market scheduler/observer bridge", 1);
+        return report;
+    }
+
+    /**
+     * Supplies the shared once-per-Economy-frame clock when the planet-condition
+     * scheduler is enabled without the central remote-market scheduler.
+     */
+    private PatchReport patchPlanetConditionMarketFrameClock(ClassNode node) {
+        MethodNode advance = requireMethod(node, "advance", "(F)V");
+        PatchState scopeState = scratchScopeState(node.name, advance,
+                "Economy.advance planet-condition frame clock");
+        int hooks = countCalls(advance, Opcodes.INVOKESTATIC, HOOKS,
+                "beginRemoteMarketFrame", "()V");
+        if (hooks == 1) {
+            if (scopeState != PatchState.PATCHED) {
+                throw mismatch("planet-condition frame clock exists without its scratch scope");
+            }
+            AbstractInsnNode first = firstMeaningful(advance);
+            AbstractInsnNode expected = first;
+            if (first instanceof MethodInsnNode scratch
+                    && callMatches(scratch, Opcodes.INVOKESTATIC, HOOKS,
+                    "beginScratchScope", "()V")) {
+                expected = nextMeaningful(first);
+            }
+            if (!(expected instanceof MethodInsnNode begin)
+                    || !callMatches(begin, Opcodes.INVOKESTATIC, HOOKS,
+                    "beginRemoteMarketFrame", "()V")) {
+                throw mismatch("planet-condition frame clock is not at Economy.advance entry");
+            }
+            throw already("planet-condition frame clock postcondition matches");
+        }
+        requireCount("planet-condition frame clock hooks", hooks, 0);
+        boolean scopeInstalled = ensureScratchScope(node.name, advance,
+                "Economy.advance planet-condition frame clock");
+
+        MethodInsnNode beginHook = new MethodInsnNode(Opcodes.INVOKESTATIC,
+                HOOKS, "beginRemoteMarketFrame", "()V", false);
+        AbstractInsnNode entry = firstMeaningful(advance);
+        if (entry instanceof MethodInsnNode scratch
+                && callMatches(scratch, Opcodes.INVOKESTATIC, HOOKS,
+                "beginScratchScope", "()V")) {
+            advance.instructions.insert(entry, beginHook);
+        } else {
+            advance.instructions.insertBefore(entry, beginHook);
+        }
+
+        PatchReport report = new PatchReport();
+        report.add("planet-condition scheduler frame clock", 1);
+        report.add("planet-condition scheduler reentrancy scope", scopeInstalled ? 1 : 0);
+        return report;
+    }
+
     private PatchReport patchRemoteMarketScheduler(ClassNode node) {
         MethodNode advance = requireMethod(node, "advance", "(F)V");
         // The scheduler uses the existing re-entrant scratch-scope depth as its
         // central-loop ownership guard. Install it even when economy snapshot
         // reuse is disabled so nested Economy.advance() calls fail open without
         // overwriting the outer scheduling frame.
-        boolean scopeInstalled = ensureScratchScope(node.name, advance,
+        PatchState scopeState = scratchScopeState(node.name, advance,
                 "Economy.advance remote-market scheduler");
         String market = "com/fs/starfarer/api/campaign/econ/MarketAPI";
         String scheduledDesc = "(L" + market + ";F)V";
@@ -2534,6 +2686,10 @@ public final class PrepatcherTransformer implements ClassFileTransformer {
 
         boolean patched = originals.isEmpty() && beginHooks == 1 && scheduleHooks == 1;
         if (patched) {
+            if (scopeState != PatchState.PATCHED) {
+                throw mismatch("Economy remote-market scheduler hooks exist without their "
+                        + "scratch scope");
+            }
             AbstractInsnNode first = firstMeaningful(advance);
             AbstractInsnNode expected = first;
             if (first instanceof MethodInsnNode scratch
@@ -2546,12 +2702,18 @@ public final class PrepatcherTransformer implements ClassFileTransformer {
                     "beginRemoteMarketFrame", "()V")) {
                 throw mismatch("Economy remote-market frame hook is not at the verified entry point");
             }
+            requireEconomyMarketAdvanceOperands(only(calls(advance, Opcodes.INVOKESTATIC,
+                    HOOKS, "advanceMarketScheduled", scheduledDesc),
+                    "Economy scheduled market call"));
             throw already("Economy remote-market scheduler hooks and call-site postcondition match");
         }
 
         if (originals.size() != 1 || beginHooks != 0 || scheduleHooks != 0) {
             throw mismatch("Economy market-advance call is missing, duplicated, or partially patched");
         }
+        requireEconomyMarketAdvanceOperands(originals.get(0));
+        boolean scopeInstalled = ensureScratchScope(node.name, advance,
+                "Economy.advance remote-market scheduler");
 
         MethodInsnNode beginHook = new MethodInsnNode(Opcodes.INVOKESTATIC,
                 HOOKS, "beginRemoteMarketFrame", "()V", false);
@@ -2578,6 +2740,17 @@ public final class PrepatcherTransformer implements ClassFileTransformer {
         report.add("staggered central market loop", 1);
         report.add("remote-market reentrancy scope", scopeInstalled ? 1 : 0);
         return report;
+    }
+
+    private static void requireEconomyMarketAdvanceOperands(MethodInsnNode call) {
+        AbstractInsnNode amount = previousMeaningful(call);
+        AbstractInsnNode market = previousMeaningful(amount);
+        if (!(amount instanceof VarInsnNode amountLoad)
+                || amountLoad.getOpcode() != Opcodes.FLOAD || amountLoad.var != 1
+                || !(market instanceof VarInsnNode marketLoad)
+                || marketLoad.getOpcode() != Opcodes.ALOAD || marketLoad.var != 2) {
+            throw mismatch("Economy market scheduler receiver/amount operands changed structurally");
+        }
     }
 
     private PatchReport patchDirectMarketObservationEntry(ClassNode node) {
@@ -3489,6 +3662,45 @@ public final class PrepatcherTransformer implements ClassFileTransformer {
         }
         requireCount(label + " scratch-scope catch-all", handlers, 1);
         return PatchState.PATCHED;
+    }
+
+    private static boolean hasExternalControlFlowEntry(
+            MethodNode method, AbstractInsnNode start, AbstractInsnNode end) {
+        Set<AbstractInsnNode> guarded = Collections.newSetFromMap(new IdentityHashMap<>());
+        AbstractInsnNode cursor = start;
+        while (cursor != null) {
+            guarded.add(cursor);
+            if (cursor == end) break;
+            cursor = nextMeaningful(cursor);
+        }
+        if (cursor == null) return true;
+
+        for (AbstractInsnNode insn : method.instructions.toArray()) {
+            if (guarded.contains(insn)) continue;
+            if (insn instanceof JumpInsnNode jump) {
+                AbstractInsnNode entry = nextMeaningful(jump.label);
+                if (entry != start && guarded.contains(entry)) return true;
+            } else if (insn instanceof LookupSwitchInsnNode lookup) {
+                AbstractInsnNode defaultEntry = nextMeaningful(lookup.dflt);
+                if (defaultEntry != start && guarded.contains(defaultEntry)) return true;
+                for (LabelNode label : lookup.labels) {
+                    AbstractInsnNode entry = nextMeaningful(label);
+                    if (entry != start && guarded.contains(entry)) return true;
+                }
+            } else if (insn instanceof TableSwitchInsnNode table) {
+                AbstractInsnNode defaultEntry = nextMeaningful(table.dflt);
+                if (defaultEntry != start && guarded.contains(defaultEntry)) return true;
+                for (LabelNode label : table.labels) {
+                    AbstractInsnNode entry = nextMeaningful(label);
+                    if (entry != start && guarded.contains(entry)) return true;
+                }
+            }
+        }
+        for (TryCatchBlockNode block : method.tryCatchBlocks) {
+            AbstractInsnNode entry = nextMeaningful(block.handler);
+            if (entry != start && guarded.contains(entry)) return true;
+        }
+        return false;
     }
 
     private static void installScratchScope(String owner, MethodNode method, String label) {

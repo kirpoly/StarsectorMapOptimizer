@@ -2,7 +2,7 @@
 
 [English](README.md) | [Русский](README_RU.md)
 
-Current version: **0.9.2**. Supported game build: **Starsector 0.98a-RC8**.
+Current version: **0.9.3**. Supported game build: **Starsector 0.98a-RC8**.
 
 [![Unplayable without Prepatcher versus smooth with Prepatcher](media/smoothness_comparison.gif)](https://github.com/kirpoly/StarsectorPrepatcher/releases/download/v0.8.0/StarsectorPrepatcher-0.8.0-comparison.webm)
 
@@ -20,7 +20,7 @@ The project has a broader direction than map optimization alone:
 - keep version-specific bytecode knowledge inside the prepatcher instead of duplicating it across
   gameplay mods.
 
-The public API is a roadmap item, not a published compatibility surface in `0.9.2`. Its intended
+The public API is a roadmap item, not a published compatibility surface in `0.9.3`. Its intended
 namespace is `com.starsector.prepatcher.api`; API types will only become supported once they are
 documented and covered by compatibility tests.
 
@@ -88,10 +88,10 @@ The prepatcher does not modify save data, and its runtime caches are never seria
 
 - sector, system, and Intel maps: reconciliation, spatial candidates, callbacks, hover checks,
   entity indexes, nebula metadata, scratch collections, and grid LOD;
-- campaign and economy: lifecycle-bound caches, listener refresh, reusable snapshots, an aggressive
-  staggered scheduler for remote markets, observation of direct mod `Market.advance()` calls,
-  repeated absent commodity event-mod removal suppression, empty-script and empty-memory fast paths,
-  and comm-relay candidates;
+- campaign and economy: lifecycle-bound caches, listener refresh, reusable snapshots, aggressive
+  staggered schedulers for central remote markets and planet-condition-only markets, corrected
+  observation of direct mod `Market.advance()` calls, repeated absent commodity event-mod removal
+  suppression, empty-script and empty-memory fast paths, and comm-relay candidates;
 - routing: ordered jump-point and system indexes with vanilla selection and fallback semantics;
 - combat and particles: internal scratch collections and stable deferred cleanup;
 - loading and save paths: literal parsing, progress redraw, and output-path fixes;
@@ -114,15 +114,23 @@ because they participated in confirmed mission-startup failures. They will not b
 their fixes pass an isolated startup and mission suite.
 
 `patch.remoteMarketScheduler` is enabled in the default/aggressive profile and intentionally changes
-`MarketAPI.advance()` cadence for remote markets. The current location, interaction market, and
-player-owned markets remain full-rate; an individual market can opt out through the memory key
-`$starsectorPrepatcher_fullRateMarket=true`. Use `profiles/safe.properties` or disable the switch for
-fully conservative callback cadence.
+`MarketAPI.advance()` cadence for markets reached through the central economy loop. The current
+location, interaction market, and player-owned markets remain full-rate.
 
-`patch.directMarketObservation` is also enabled in the default/aggressive profile in 0.9.2. It does
-not throttle direct mod calls: each call remains synchronous and immediate. It writes per-run
-CSV/stacks under `logs/direct-market-observe/session-*/`. Disable it after collecting data to remove
-the sampling overhead.
+`patch.planetConditionMarketScheduler` independently covers the vanilla
+`BaseCampaignEntity.advance()` path used by `planetConditionMarketOnly` markets. It preserves exact
+accumulated `amount`, runs the first tick immediately, keeps the player's current location at full
+cadence, and flushes pending time before save. Both schedulers honor the memory key
+`$starsectorPrepatcher_fullRateMarket=true`. Use `profiles/safe.properties` or disable the relevant
+switches for fully conservative callback cadence.
+
+`patch.directMarketObservation` is also enabled in the default/aggressive profile in 0.9.3. It does
+not throttle direct mod calls: each call remains synchronous and immediate. Known planet-condition
+engine calls are reported separately from unknown entries, transformed call sites are written to the
+manifest before first execution, and the unknown-stack budget renews every report interval. Per-run
+CSV/stacks are written under `logs/direct-market-observe/session-*/`; validation-smoke directories are
+visibly labelled and `session.json` records `sessionOrigin`. Disable observation after collecting data
+to remove sampling overhead.
 
 Run `uninstall-agent.bat` for vanilla, `uninstall-agent.bat -Target FasterRendering` for FR, or
 `uninstall-agent.bat -Target Both` to remove both managed entries. Each changed file is backed up.
@@ -155,6 +163,6 @@ Build details are in [`BUILDING.md`](BUILDING.md).
 - [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md) — structural matching and fail-open rules;
 - [`docs/VALIDATION.md`](docs/VALIDATION.md) — regression and performance validation playbook;
 - [`docs/ROADMAP.md`](docs/ROADMAP.md) — structural discovery, architecture, tooling, and platform plan;
-- [`docs/releases/0.9.2.md`](docs/releases/0.9.2.md) — current detailed release report.
+- [`docs/releases/0.9.3.md`](docs/releases/0.9.3.md) — current detailed release report.
 
 StarsectorPrepatcher is distributed under the terms in [`LICENSE`](LICENSE).

@@ -38,7 +38,8 @@ Hyperspace-патчи проходят тот же независимый struct
 | `patch.economyLocationCache` | `Economy.advance` | omit only redundant automatic dirty write | explicit mod dirty state authoritative |
 | `patch.economySnapshotReuse` | Economy/Market | reusable market/condition/industry snapshots | callback cadence/order unchanged |
 | `patch.remoteMarketScheduler` | `Economy.advance` + pre-save boundary | stable-phase full-market scheduling with exact accumulated amount | direct mod calls immediate; hot markets full-rate; callback cadence of remote markets intentionally changes |
-| `patch.directMarketObservation` | mod call sites + concrete `Market.advance` entry | observation-only synchronous wrappers, sampled inclusive timing and stack attribution | no delay/merge/suppression; original amount, multiplicity, thread and exceptions preserved |
+| `patch.planetConditionMarketScheduler` | `BaseCampaignEntity.advance` + `Economy` frame boundary + pre-save | independent stable-phase scheduling for `planetConditionMarketOnly` markets | first tick/current location immediate; exact amount; separate identity state and save flush |
+| `patch.directMarketObservation` | mod call sites + known engine origins + concrete `Market.advance` entry | synchronous wrappers, eager call-site manifest, sampled timing and interval-bounded stack attribution | direct mod calls are never delayed/merged/suppressed; known planet path is classified separately |
 | `patch.commodityEventModDirtyCache` | `CommodityOnMarket.reapplyEventMod` | skip repeated removal after zero quantity proved private `eMod` absent | first zero call/load and the complete nonzero remove/calculate/add path stay vanilla; direct external mutation of the private key is unsupported |
 | `patch.commRelaySystemIndex` | `IntelManager` | conservative spatial system candidates + TTL position audit | original order/live relay checks; bounded coordinate staleness |
 | `patch.shipAdvanceScratch` | `Ship.advance` | reuse 3 lists + command snapshot + 2 sets | fresh listener snapshot, no API objects pooled |
@@ -100,6 +101,47 @@ market.getMemoryWithoutUpdate().set(
 через reentrant scope и полностью уходит в immediate fallback, не меняя frame context внешнего
 прохода.
 
+### Scheduler `planetConditionMarketOnly`
+
+`patch.planetConditionMarketScheduler` закрывает отдельный vanilla call site:
+
+```text
+BaseCampaignEntity.advance(float)
+  -> market.isPlanetConditionMarketOnly()
+  -> MarketAPI.advance(amount)
+```
+
+Этот путь не входит в ordered snapshot-loop `Economy.advance()` и поэтому не мог использовать
+`patch.remoteMarketScheduler`. Новый bridge применяется только после точной structural-проверки
+predicate, receiver `this.market`, аргумента `amount` и единственного interface-call site.
+
+Настройки default/aggressive profile:
+
+```properties
+patch.planetConditionMarketScheduler=true
+market.planetCondition.frames=4
+market.planetCondition.currentLocationFrames=1
+market.planetCondition.maxDeferredFrames=8
+market.planetCondition.maxDeferredGameDays=0.02
+market.planetCondition.policyAuditFrames=60
+market.planetCondition.fullRateMemoryKey=$starsectorPrepatcher_fullRateMarket
+```
+
+Scheduler имеет отдельную identity map и не объединяет debt с central remote-market scheduler. Это
+сохраняет multiplicity в патологическом случае, когда один и тот же `MarketAPI` достигается обоими
+vanilla-путями. Первый вызов нового market выполняется немедленно. В location игрока cadence по
+умолчанию равен vanilla; direct opt-out memory key, reentrant fallback, campaign-lifecycle reset и
+pre-save flush работают независимо от центрального scheduler.
+
+Если `patch.remoteMarketScheduler=false`, transformer добавляет в `Economy.advance()` только точный
+frame-clock/scratch boundary, необходимый planet scheduler; обычный central market call остаётся
+vanilla. Если frame context ещё не существует, amount некорректен или helper не может безопасно
+получить policy/state, текущий planet-condition вызов выполняется немедленно.
+
+Performance-first компромисс тот же: удалённый condition-only market получает меньше полных
+`Market.advance()` callbacks с суммарным elapsed `amount`; код, считающий callbacks вместо времени,
+может изменить поведение. `profiles/safe.properties` оставляет этот патч выключенным.
+
 ### Level 1: observation прямых mod-вызовов Market.advance
 
 `patch.directMarketObservation` не является scheduler-патчем. Он предназначен для диагностического
@@ -113,7 +155,8 @@ invokeinterface MarketAPI.advance(F)V
 invokevirtual   Market.advance(F)V
 ```
 
-на typed wrapper, который:
+на typed wrapper. Transformer заранее регистрирует manifest call site после успешной bytecode
+verification, поэтому `call-sites.csv` содержит найденные sites даже до первого исполнения. Wrapper:
 
 1. записывает site ID и дешёвые counters;
 2. при выбранном sampling измеряет inclusive время и снимает stack;
@@ -121,10 +164,11 @@ invokevirtual   Market.advance(F)V
 4. сохраняет multiplicity, float `amount`, порядок и exception propagation.
 
 Concrete vanilla `Market.advance(float)` дополнительно имеет дешёвый entry probe. Calls от
-central scheduler, его fail-open пути, pre-save flush и instrumented mod sites помечаются через
-`ThreadLocal` origin. Непомеченный вход классифицируется как `UNKNOWN_DIRECT` и получает только
-ограниченное число stack samples; это позволяет обнаруживать reflection/MethodHandle и
-нестандартные loaders.
+central scheduler, planet-condition scheduler/immediate path, их fail-open/save-flush путей и
+instrumented mod sites помечаются через `ThreadLocal` origin. Поэтому массовый известный vanilla
+`planetConditionMarketOnly` путь больше не загрязняет `UNKNOWN_DIRECT`. Непомеченный вход получает
+ограниченное число stack samples **на каждый отчётный интервал**, что сохраняет шанс обнаружить
+поздние reflection/MethodHandle и нестандартные loader paths.
 
 Настройки default/aggressive profile:
 
@@ -138,10 +182,14 @@ directMarket.maxSites=4096
 directMarket.unknownStackSamples=32
 ```
 
+`session.json` использует schema 2 и содержит `sessionOrigin`. Обычный запуск имеет значение
+`game`; startup/FR validation smoke получает отдельное значение и заметный префикс каталога, чтобы
+короткую тестовую JVM нельзя было принять за игровую телеметрию.
+
 Каждый запуск создаёт отдельную session-директорию:
 
 ```text
-logs/direct-market-observe/session-<UTC>-pid<PID>/
+logs/direct-market-observe/session-[<origin>-]<UTC>-pid<PID>/
 ```
 
 Для анализа нужны все файлы session вместе с `logs/prepatcher.log`. Observer не удерживает

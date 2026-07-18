@@ -16,7 +16,40 @@
 
 ## [Unreleased]
 
-Пока нет пользовательских изменений после `0.9.2`.
+Пока нет пользовательских изменений после `0.9.3`.
+
+## [0.9.3] - 2026-07-18
+
+### Добавлено
+
+- `patch.planetConditionMarketScheduler` покрывает отдельный vanilla-путь
+  `BaseCampaignEntity.advance() -> MarketAPI.advance()` для `planetConditionMarketOnly` markets.
+- Добавлены stable phases, exact accumulated `amount`, first-tick/current-location full-rate,
+  memory opt-out, frame/day caps, lifecycle reset, reentrant fallback и pre-save flush для нового
+  scheduler-а.
+- `summary.csv` observer-а получил отдельные scheduled/fallback/save-flush/immediate counters
+  planet-condition пути.
+- `session.json` schema 2 содержит `sessionOrigin`; startup/FR smoke создают явно помеченные каталоги.
+
+### Исправлено
+
+- Массовый известный `planetConditionMarketOnly` engine path больше не учитывается как
+  `unknown Market.advance()`.
+- `call-sites.csv` теперь получает manifest трансформированных mod call sites до первого
+  выполнения, поэтому пустой runtime не выглядит как отсутствие найденных sites.
+- Лимит unknown stack samples обновляется каждый report interval; ранний частый caller больше не
+  исчерпывает его на весь процесс.
+- Если central scheduler выключен, planet scheduler всё равно получает frame-clock boundary, не
+  изменяя central market-loop.
+
+### Проверено
+
+- Добавлены structural negative/idempotency tests точного BaseCampaignEntity bridge.
+- Runtime suite покрывает stable cadence, current-location policy, opt-out, separate identity state,
+  save flush, reentrancy, disabled fallback, eager observer manifest и interval stack budget.
+- Lifecycle/GC suite проверяет точный inventory из 12 campaign-bound maps.
+
+Подробности: [отчёт о выпуске 0.9.3](docs/releases/0.9.3.md).
 
 ## [0.9.2] - 2026-07-18
 

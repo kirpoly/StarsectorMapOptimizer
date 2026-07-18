@@ -2,7 +2,7 @@
 
 [English](README.md) | [Русский](README_RU.md)
 
-Текущая версия: **0.9.2**. Поддерживаемая версия игры: **Starsector 0.98a-RC8**.
+Текущая версия: **0.9.3**. Поддерживаемая версия игры: **Starsector 0.98a-RC8**.
 
 [![Без препатчера и с ним](media/smoothness_comparison.gif)](https://github.com/kirpoly/StarsectorPrepatcher/releases/download/v0.8.0/StarsectorPrepatcher-0.8.0-comparison.webm)
 
@@ -21,7 +21,7 @@ StarsectorPrepatcher — compatibility-first слой ранних патчей 
 - хранить зависимое от версии игры знание о bytecode внутри prepatcher, а не размножать его по
   игровым модам.
 
-Публичный API в `0.9.2` ещё не выпущен и остаётся пунктом roadmap. Планируемый namespace —
+Публичный API в `0.9.3` ещё не выпущен и остаётся пунктом roadmap. Планируемый namespace —
 `com.starsector.prepatcher.api`; типы станут поддерживаемым контрактом только после появления
 документации и compatibility-тестов.
 
@@ -89,10 +89,10 @@ Prepatcher не изменяет формат сохранений, а его ru
 
 - sector, system и Intel map: reconciliation, spatial candidates, callbacks, hover, entity indexes,
   nebula metadata, scratch collections и grid LOD;
-- campaign и economy: lifecycle-bound кэши, listener refresh, reusable snapshots, агрессивный
-  staggered scheduler удалённых рынков, observation прямых mod-вызовов `Market.advance()`,
-  подавление повторного удаления уже отсутствующего commodity event mod, fast paths для пустых
-  scripts/Memory и comm-relay candidates;
+- campaign и economy: lifecycle-bound кэши, listener refresh, reusable snapshots, агрессивные
+  staggered scheduler'ы центральных удалённых рынков и `planetConditionMarketOnly`, исправленное
+  observation прямых mod-вызовов `Market.advance()`, подавление повторного удаления уже
+  отсутствующего commodity event mod, fast paths для пустых scripts/Memory и comm-relay candidates;
 - routing: упорядоченные jump-point/system indexes с vanilla selection/fallback;
 - combat и particles: внутренние scratch collections и стабильная deferred cleanup;
 - loading/save: literal parsing, progress redraw и исправления output path;
@@ -116,14 +116,22 @@ enabled=false
 исправления и изолированного startup/mission-прогона.
 
 `patch.remoteMarketScheduler` включён в default/aggressive profile и намеренно меняет cadence
-`MarketAPI.advance()` для удалённых рынков. Текущая location, interaction market и player-owned
-рынки остаются full-rate; отдельный рынок можно исключить через memory key
-`$starsectorPrepatcher_fullRateMarket=true`. Для максимально консервативного поведения используйте
-`profiles/safe.properties` или выключите этот переключатель.
+`MarketAPI.advance()` для рынков, достигаемых через центральный цикл экономики. Текущая location,
+interaction market и player-owned рынки остаются full-rate.
 
-`patch.directMarketObservation` также включён в default/aggressive profile в 0.9.2. Он не
-throttling-ует прямые вызовы модов: каждый вызов остаётся синхронным и немедленным. Результаты
-записываются в `logs/direct-market-observe/session-*/`. После сбора данных переключатель стоит
+`patch.planetConditionMarketScheduler` независимо покрывает vanilla-путь
+`BaseCampaignEntity.advance()` для `planetConditionMarketOnly` markets. Он сохраняет точный
+накопленный `amount`, выполняет первый tick немедленно, оставляет location игрока full-rate и
+сбрасывает pending time перед сохранением. Оба scheduler'а поддерживают memory key
+`$starsectorPrepatcher_fullRateMarket=true`. Для консервативного cadence используйте
+`profiles/safe.properties` или выключите нужные переключатели.
+
+`patch.directMarketObservation` также включён в default/aggressive profile в 0.9.3. Он не
+throttling-ует прямые вызовы модов: каждый вызов остаётся синхронным и немедленным. Известный
+planet-condition engine path учитывается отдельно от unknown, manifest преобразованных call sites
+пишется до первого выполнения, а лимит unknown stacks обновляется каждый отчётный интервал.
+Каталоги validation-smoke имеют заметную метку, а `session.json` содержит `sessionOrigin`.
+Результаты находятся в `logs/direct-market-observe/session-*/`; после сбора данных observer стоит
 выключить, чтобы убрать sampling overhead.
 
 Для удаления записи vanilla запустите `uninstall-agent.bat`, для FR —
@@ -158,6 +166,6 @@ classloader Faster Rendering. Сборка описана в [`BUILDING.md`](BUI
 - [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md) — structural matching и fail-open правила;
 - [`docs/VALIDATION.md`](docs/VALIDATION.md) — playbook регрессионных и performance-проверок;
 - [`docs/ROADMAP.md`](docs/ROADMAP.md) — план structural discovery, архитектуры, tooling и платформ;
-- [`docs/releases/0.9.2.md`](docs/releases/0.9.2.md) — подробный отчёт текущего выпуска.
+- [`docs/releases/0.9.3.md`](docs/releases/0.9.3.md) — подробный отчёт текущего выпуска.
 
 Условия распространения находятся в [`LICENSE`](LICENSE).

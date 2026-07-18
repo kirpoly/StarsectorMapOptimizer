@@ -164,7 +164,7 @@ $hyperReport = Join-Path $reportDir 'hyperspace-verification.txt'
 $ErrorActionPreference = 'Continue'
 try {
     $hyperCp = @($testClasses, $testCp) -join [IO.Path]::PathSeparator
-    $hyperOutput = @(& java @exports -cp $hyperCp com.starsector.prepatcher.agent.HyperspaceCompatibilityTest $verificationConfig (Join-Path $core 'starfarer_obf.jar') (Join-Path $core 'starfarer.api.jar') $hyperReport 2>&1)
+    $hyperOutput = @(& java @exports '-Dstarsector.prepatcher.sessionOrigin=structural-hyperspace' -cp $hyperCp com.starsector.prepatcher.agent.HyperspaceCompatibilityTest $verificationConfig (Join-Path $core 'starfarer_obf.jar') (Join-Path $core 'starfarer.api.jar') $hyperReport 2>&1)
     $hyperExitCode = $LASTEXITCODE
 } finally {
     $ErrorActionPreference = $savedErrorActionPreference
@@ -177,7 +177,7 @@ $startupReport = Join-Path $reportDir 'startup-smoke.txt'
 $mainAgentJar = Join-Path $modRoot 'agent\StarsectorPrepatcherAgent.jar'
 $ErrorActionPreference = 'Continue'
 try {
-    $startupOutput = @(& java "-javaagent:$mainAgentJar" -version 2>&1)
+    $startupOutput = @(& java '-Dstarsector.prepatcher.sessionOrigin=startup-smoke' "-javaagent:$mainAgentJar" -version 2>&1)
     $startupExitCode = $LASTEXITCODE
 } finally {
     $ErrorActionPreference = $savedErrorActionPreference
@@ -223,6 +223,7 @@ if (-not (Test-Path -LiteralPath $frJar -PathType Leaf)) {
     try {
         $frSmokeOutput = @(& java `
             '-Djava.system.class.loader=com.genir.renderer.loaders.AppClassLoader' `
+            '-Dstarsector.prepatcher.sessionOrigin=fr-smoke' `
             "-javaagent:$mainAgentJar=config=$verificationConfig" `
             -cp $frSmokeCp `
             com.starsector.prepatcher.fr.FasterRenderingLoaderSmokeTest `

@@ -78,12 +78,15 @@ RUNTIME_CP="$TEST_CLASSES:$MOD_ROOT/agent/StarsectorPrepatcherAgent.jar:$CORE/st
   java -cp "$RUNTIME_CP" com.starsector.prepatcher.runtime.LoadingSaveRuntimeRegressionTest
 } 2>&1 | tee "$REPORT_DIR/runtime-regression.txt"
 
-java "${EXPORTS[@]}" -cp "$TEST_CLASSES:$TEST_CP" \
+java "${EXPORTS[@]}" \
+  -Dstarsector.prepatcher.sessionOrigin=structural-hyperspace \
+  -cp "$TEST_CLASSES:$TEST_CP" \
   com.starsector.prepatcher.agent.HyperspaceCompatibilityTest \
   "$VERIFICATION_CONFIG" "$CORE/starfarer_obf.jar" "$CORE/starfarer.api.jar" \
   "$REPORT_DIR/hyperspace-verification.txt"
 
 java \
+  -Dstarsector.prepatcher.sessionOrigin=startup-smoke \
   "-javaagent:$MOD_ROOT/agent/StarsectorPrepatcherAgent.jar" \
   -version 2>&1 | tee "$REPORT_DIR/startup-smoke.txt"
 
@@ -105,6 +108,7 @@ else
   FR_SMOKE_CP+=":$CORE/txw2-3.0.2.jar:$CORE/jaxb-api-2.4.0-b180830.0359.jar:$CORE/webp-imageio-0.1.6.jar"
   java \
     -Djava.system.class.loader=com.genir.renderer.loaders.AppClassLoader \
+    -Dstarsector.prepatcher.sessionOrigin=fr-smoke \
     "-javaagent:$MOD_ROOT/agent/StarsectorPrepatcherAgent.jar=config=$VERIFICATION_CONFIG" \
     -cp "$FR_SMOKE_CP" \
     com.starsector.prepatcher.fr.FasterRenderingLoaderSmokeTest \

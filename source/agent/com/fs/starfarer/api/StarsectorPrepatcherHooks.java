@@ -60,6 +60,7 @@ import java.util.WeakHashMap;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.atomic.DoubleAdder;
 import java.util.concurrent.atomic.LongAdder;
 import java.util.stream.Collectors;
@@ -74,6 +75,10 @@ public final class StarsectorPrepatcherHooks {
     private static final int MARKET_ORIGIN_SCHEDULER_FALLBACK = 2;
     private static final int MARKET_ORIGIN_SAVE_FLUSH = 3;
     private static final int MARKET_ORIGIN_DIRECT_CALL_SITE = 4;
+    private static final int MARKET_ORIGIN_PLANET_CONDITION_SCHEDULED = 5;
+    private static final int MARKET_ORIGIN_PLANET_CONDITION_FALLBACK = 6;
+    private static final int MARKET_ORIGIN_PLANET_CONDITION_SAVE_FLUSH = 7;
+    private static final int MARKET_ORIGIN_PLANET_CONDITION_IMMEDIATE = 8;
     private static final ThreadLocal<MarketAdvanceObservationContext> MARKET_ADVANCE_CONTEXT =
             ThreadLocal.withInitial(MarketAdvanceObservationContext::new);
     private static volatile DirectMarketObserver DIRECT_MARKET_OBSERVER;
@@ -98,6 +103,9 @@ public final class StarsectorPrepatcherHooks {
     private static volatile Map<ReachEconomy, EconomyLocationState> ECONOMY_LOCATION_STATES =
             Collections.synchronizedMap(new WeakHashMap<>());
     private static volatile Map<MarketAPI, RemoteMarketScheduleState> REMOTE_MARKET_STATES =
+            Collections.synchronizedMap(new IdentityHashMap<>());
+    private static volatile Map<MarketAPI, RemoteMarketScheduleState>
+            PLANET_CONDITION_MARKET_STATES =
             Collections.synchronizedMap(new IdentityHashMap<>());
     private static volatile Map<Object, CommRelaySystemIndex> COMM_RELAY_SYSTEM_INDEXES =
             Collections.synchronizedMap(new WeakHashMap<>());
@@ -165,6 +173,12 @@ public final class StarsectorPrepatcherHooks {
     private static final LongAdder REMOTE_MARKET_HIDDEN_ADVANCES = new LongAdder();
     private static final LongAdder REMOTE_MARKET_SAVE_FLUSHES = new LongAdder();
     private static final LongAdder REMOTE_MARKET_FALLBACKS = new LongAdder();
+    private static final LongAdder PLANET_CONDITION_MARKET_CALLS = new LongAdder();
+    private static final LongAdder PLANET_CONDITION_MARKET_FULL_ADVANCES = new LongAdder();
+    private static final LongAdder PLANET_CONDITION_MARKET_DEFERRED_CALLS = new LongAdder();
+    private static final LongAdder PLANET_CONDITION_MARKET_HOT_ADVANCES = new LongAdder();
+    private static final LongAdder PLANET_CONDITION_MARKET_SAVE_FLUSHES = new LongAdder();
+    private static final LongAdder PLANET_CONDITION_MARKET_FALLBACKS = new LongAdder();
     private static final LongAdder SHIP_SCRATCH_LISTS = new LongAdder();
     private static final LongAdder SHIP_SCRATCH_SETS = new LongAdder();
     private static final LongAdder PARTICLE_GROUPS = new LongAdder();
@@ -494,6 +508,8 @@ public final class StarsectorPrepatcherHooks {
         ROUTE_SYSTEM_INDEXES = Collections.synchronizedMap(new WeakHashMap<>());
         ECONOMY_LOCATION_STATES = Collections.synchronizedMap(new WeakHashMap<>());
         REMOTE_MARKET_STATES = Collections.synchronizedMap(new IdentityHashMap<>());
+        PLANET_CONDITION_MARKET_STATES =
+                Collections.synchronizedMap(new IdentityHashMap<>());
         COMM_RELAY_SYSTEM_INDEXES = Collections.synchronizedMap(new WeakHashMap<>());
         remoteMarketFrame = 0L;
         remoteMarketFrameGeneration = -1L;
@@ -865,6 +881,17 @@ public final class StarsectorPrepatcherHooks {
     // Direct Market.advance observation
     // ---------------------------------------------------------------------
 
+    /** Registers a transformed direct-call site before its first execution. */
+    public static void registerDirectMarketCallSite(long siteId, String metadata) {
+        DirectMarketObserver observer = DIRECT_MARKET_OBSERVER;
+        if (observer == null) return;
+        try {
+            observer.registerSite(siteId, metadata);
+        } catch (Throwable ignored) {
+            // Registration is diagnostic only and must never block class loading.
+        }
+    }
+
     /**
      * Observation-only replacement for direct mod call sites. The original
      * MarketAPI.advance call remains synchronous and receives the exact same
@@ -961,7 +988,8 @@ public final class StarsectorPrepatcherHooks {
 
         PrepatcherConfig c = config;
         long generation = campaignCacheGeneration;
-        if (c == null || !c.remoteMarketScheduler || !campaignCachesReady(generation)) {
+        if (c == null || (!c.remoteMarketScheduler && !c.planetConditionMarketScheduler)
+                || !campaignCachesReady(generation)) {
             remoteMarketFrameGeneration = -1L;
             remoteMarketCurrentLocation = null;
             remoteMarketInteractionMarket = null;
@@ -1168,6 +1196,183 @@ public final class StarsectorPrepatcherHooks {
         }
     }
 
+
+    /**
+     * Staggered scheduler for the vanilla BaseCampaignEntity path that advances
+     * planet-condition-only markets outside Economy.advance(). This path is
+     * deliberately tracked separately from ordinary economy markets because the
+     * same MarketAPI object must never accidentally consume both scheduler debts.
+     *
+     * <p>When the scheduler is disabled the method is still used as an observer
+     * bridge: the original MarketAPI.advance() call remains immediate and is
+     * attributed to the known vanilla planet-condition origin instead of the
+     * unknown bucket.</p>
+     */
+    public static void advancePlanetConditionMarketScheduled(MarketAPI market, float amount) {
+        if (market == null) throw new NullPointerException("market");
+        PLANET_CONDITION_MARKET_CALLS.increment();
+
+        PrepatcherConfig c = config;
+        if (c == null || !c.planetConditionMarketScheduler) {
+            invokeObservedMarketAdvance(
+                    market, amount, MARKET_ORIGIN_PLANET_CONDITION_IMMEDIATE);
+            return;
+        }
+
+        long generation = campaignCacheGeneration;
+        long frame = remoteMarketFrame;
+        if (!campaignCachesReady(generation)
+                || remoteMarketFrameGeneration != generation
+                || frame <= 0L
+                || !Float.isFinite(amount) || amount < 0f) {
+            PLANET_CONDITION_MARKET_FALLBACKS.increment();
+            invokeObservedMarketAdvance(
+                    market, amount, MARKET_ORIGIN_PLANET_CONDITION_FALLBACK);
+            return;
+        }
+
+        RemoteMarketScheduleState state;
+        boolean created = false;
+        boolean mapFallback = false;
+        try {
+            Map<MarketAPI, RemoteMarketScheduleState> states =
+                    PLANET_CONDITION_MARKET_STATES;
+            synchronized (states) {
+                if (states != PLANET_CONDITION_MARKET_STATES
+                        || !campaignCachesReady(generation)) {
+                    mapFallback = true;
+                    state = null;
+                } else {
+                    state = states.get(market);
+                    if (state == null) {
+                        state = new RemoteMarketScheduleState();
+                        states.put(market, state);
+                        created = true;
+                    }
+                }
+            }
+        } catch (Throwable ignored) {
+            PLANET_CONDITION_MARKET_FALLBACKS.increment();
+            invokeObservedMarketAdvance(
+                    market, amount, MARKET_ORIGIN_PLANET_CONDITION_FALLBACK);
+            return;
+        }
+        if (mapFallback || state == null) {
+            PLANET_CONDITION_MARKET_FALLBACKS.increment();
+            invokeObservedMarketAdvance(
+                    market, amount, MARKET_ORIGIN_PLANET_CONDITION_FALLBACK);
+            return;
+        }
+
+        boolean auditMemory;
+        boolean cachedMemoryFullRate;
+        boolean directFallback;
+        synchronized (state) {
+            directFallback = state.inAdvance || state.lastCallFrame == frame;
+            if (directFallback) {
+                auditMemory = false;
+                cachedMemoryFullRate = false;
+            } else {
+                state.lastCallFrame = frame;
+                auditMemory = !c.planetConditionMarketFullRateMemoryKey.isEmpty()
+                        && (state.lastPolicyAuditFrame == Long.MIN_VALUE
+                        || frame - state.lastPolicyAuditFrame
+                        >= c.planetConditionMarketPolicyAuditFrames);
+                if (auditMemory) state.lastPolicyAuditFrame = frame;
+                cachedMemoryFullRate = state.memoryFullRate;
+            }
+        }
+        if (directFallback) {
+            // A duplicate entity reference or recursive Market.advance() is an
+            // observable extra vanilla call. Preserve it instead of coalescing.
+            PLANET_CONDITION_MARKET_FALLBACKS.increment();
+            invokeObservedMarketAdvance(
+                    market, amount, MARKET_ORIGIN_PLANET_CONDITION_FALLBACK);
+            return;
+        }
+
+        boolean hot = false;
+        boolean memoryFullRate = cachedMemoryFullRate;
+        boolean policyFallback = false;
+        int interval;
+        int phase;
+        try {
+            LocationAPI containingLocation = market.getContainingLocation();
+            if (containingLocation == null) {
+                SectorEntityToken primary = market.getPrimaryEntity();
+                if (primary != null) containingLocation = primary.getContainingLocation();
+            }
+            boolean currentLocation = containingLocation != null
+                    && containingLocation == remoteMarketCurrentLocation;
+
+            if (auditMemory) {
+                MemoryAPI memory = market.getMemoryWithoutUpdate();
+                memoryFullRate = memory != null
+                        && memory.getBoolean(c.planetConditionMarketFullRateMemoryKey);
+            }
+            hot = memoryFullRate;
+            interval = currentLocation
+                    ? c.planetConditionMarketCurrentLocationFrames
+                    : c.planetConditionMarketFrames;
+            if (hot) interval = 1;
+            phase = stableMarketPhase(market, interval);
+        } catch (Throwable ignored) {
+            // Unknown modded MarketAPI policy state is safer at full cadence.
+            hot = true;
+            interval = 1;
+            phase = 0;
+            policyFallback = true;
+            PLANET_CONDITION_MARKET_FALLBACKS.increment();
+        }
+
+        float totalAmount;
+        boolean run;
+        synchronized (state) {
+            if (auditMemory) state.memoryFullRate = memoryFullRate;
+
+            totalAmount = state.pendingAmount + amount;
+            boolean finiteTotal = Float.isFinite(totalAmount) && totalAmount >= 0f;
+            boolean dueByPhase = interval <= 1 || Math.floorMod(frame, interval) == phase;
+            boolean dueByFrameCap = state.deferredCalls
+                    >= c.planetConditionMarketMaxDeferredFrames - 1;
+            boolean dueByDayCap = false;
+            float secondsPerDay = remoteMarketSecondsPerDay;
+            if (c.planetConditionMarketMaxDeferredGameDays > 0f
+                    && Float.isFinite(secondsPerDay) && secondsPerDay > 0f
+                    && finiteTotal) {
+                dueByDayCap = totalAmount / secondsPerDay
+                        >= c.planetConditionMarketMaxDeferredGameDays;
+            }
+
+            run = created || hot || dueByPhase || dueByFrameCap
+                    || dueByDayCap || !finiteTotal;
+            if (!run) {
+                state.pendingAmount = totalAmount;
+                state.deferredCalls++;
+                PLANET_CONDITION_MARKET_DEFERRED_CALLS.increment();
+                return;
+            }
+
+            state.pendingAmount = 0f;
+            state.deferredCalls = 0;
+            state.inAdvance = true;
+            state.lastAdvanceFrame = frame;
+        }
+
+        try {
+            invokeObservedMarketAdvance(market, totalAmount,
+                    policyFallback
+                            ? MARKET_ORIGIN_PLANET_CONDITION_FALLBACK
+                            : MARKET_ORIGIN_PLANET_CONDITION_SCHEDULED);
+            PLANET_CONDITION_MARKET_FULL_ADVANCES.increment();
+            if (hot) PLANET_CONDITION_MARKET_HOT_ADVANCES.increment();
+        } finally {
+            synchronized (state) {
+                state.inAdvance = false;
+            }
+        }
+    }
+
     /**
      * Applies accumulated remote-market time before XStream observes the
      * campaign. This keeps transient scheduler state out of the save format and
@@ -1177,15 +1382,42 @@ public final class StarsectorPrepatcherHooks {
     public static void flushRemoteMarketsBeforeSave() {
         PrepatcherConfig c = config;
         long generation = campaignCacheGeneration;
-        if (c == null || !c.remoteMarketScheduler || !campaignCachesReady(generation)) return;
+        if (c == null || !campaignCachesReady(generation)) return;
 
+        if (c.remoteMarketScheduler) {
+            flushScheduledMarketMapBeforeSave(
+                    REMOTE_MARKET_STATES, false, generation,
+                    MARKET_ORIGIN_SAVE_FLUSH,
+                    REMOTE_MARKET_SAVE_FLUSHES,
+                    REMOTE_MARKET_FALLBACKS,
+                    "Remote-market");
+        }
+        if (c.planetConditionMarketScheduler) {
+            flushScheduledMarketMapBeforeSave(
+                    PLANET_CONDITION_MARKET_STATES, true, generation,
+                    MARKET_ORIGIN_PLANET_CONDITION_SAVE_FLUSH,
+                    PLANET_CONDITION_MARKET_SAVE_FLUSHES,
+                    PLANET_CONDITION_MARKET_FALLBACKS,
+                    "Planet-condition market");
+        }
+    }
+
+    private static void flushScheduledMarketMapBeforeSave(
+            Map<MarketAPI, RemoteMarketScheduleState> states,
+            boolean planetCondition,
+            long generation,
+            int origin,
+            LongAdder flushCounter,
+            LongAdder fallbackCounter,
+            String label) {
         ArrayList<MarketAPI> markets = new ArrayList<>();
         ArrayList<RemoteMarketScheduleState> statesToFlush = new ArrayList<>();
         ArrayList<Float> amounts = new ArrayList<>();
         try {
-            Map<MarketAPI, RemoteMarketScheduleState> states = REMOTE_MARKET_STATES;
             synchronized (states) {
-                if (states != REMOTE_MARKET_STATES || !campaignCachesReady(generation)) return;
+                Map<MarketAPI, RemoteMarketScheduleState> current = planetCondition
+                        ? PLANET_CONDITION_MARKET_STATES : REMOTE_MARKET_STATES;
+                if (states != current || !campaignCachesReady(generation)) return;
                 for (Map.Entry<MarketAPI, RemoteMarketScheduleState> entry : states.entrySet()) {
                     MarketAPI market = entry.getKey();
                     RemoteMarketScheduleState state = entry.getValue();
@@ -1203,7 +1435,7 @@ public final class StarsectorPrepatcherHooks {
                 }
             }
         } catch (Throwable ignored) {
-            REMOTE_MARKET_FALLBACKS.increment();
+            fallbackCounter.increment();
             return;
         }
 
@@ -1213,12 +1445,12 @@ public final class StarsectorPrepatcherHooks {
             float pending = amounts.get(i);
             boolean success = false;
             try {
-                invokeObservedMarketAdvance(market, pending, MARKET_ORIGIN_SAVE_FLUSH);
+                invokeObservedMarketAdvance(market, pending, origin);
                 success = true;
-                REMOTE_MARKET_SAVE_FLUSHES.increment();
+                flushCounter.increment();
             } catch (Throwable failure) {
-                REMOTE_MARKET_FALLBACKS.increment();
-                PrepatcherLog.warn("Remote-market save flush failed for "
+                fallbackCounter.increment();
+                PrepatcherLog.warn(label + " save flush failed for "
                         + safeMarketId(market) + "; pending time remains deferred: "
                         + failure.getClass().getName() + ": " + failure.getMessage());
             } finally {
@@ -3189,6 +3421,18 @@ public final class StarsectorPrepatcherHooks {
                         + ", remoteMarketHiddenAdvances=" + REMOTE_MARKET_HIDDEN_ADVANCES.sumThenReset()
                         + ", remoteMarketSaveFlushes=" + REMOTE_MARKET_SAVE_FLUSHES.sumThenReset()
                         + ", remoteMarketFallbacks=" + REMOTE_MARKET_FALLBACKS.sumThenReset()
+                        + ", planetConditionMarketCalls="
+                        + PLANET_CONDITION_MARKET_CALLS.sumThenReset()
+                        + ", planetConditionMarketFullAdvances="
+                        + PLANET_CONDITION_MARKET_FULL_ADVANCES.sumThenReset()
+                        + ", planetConditionMarketDeferredCalls="
+                        + PLANET_CONDITION_MARKET_DEFERRED_CALLS.sumThenReset()
+                        + ", planetConditionMarketHotAdvances="
+                        + PLANET_CONDITION_MARKET_HOT_ADVANCES.sumThenReset()
+                        + ", planetConditionMarketSaveFlushes="
+                        + PLANET_CONDITION_MARKET_SAVE_FLUSHES.sumThenReset()
+                        + ", planetConditionMarketFallbacks="
+                        + PLANET_CONDITION_MARKET_FALLBACKS.sumThenReset()
                         + ", commRelayIndexHits=" + COMM_RELAY_INDEX_HITS.sumThenReset()
                         + ", commRelayIndexBuilds=" + COMM_RELAY_INDEX_BUILDS.sumThenReset()
                         + ", commRelayIndexFallbacks=" + COMM_RELAY_INDEX_FALLBACKS.sumThenReset()
@@ -3258,7 +3502,9 @@ public final class StarsectorPrepatcherHooks {
                 "timestamp_utc,site_id,samples,stack\n";
         private static final String SUMMARY_HEADER =
                 "timestamp_utc,interval_seconds,scheduled_entries,scheduler_fallback_entries,"
-                        + "save_flush_entries,direct_callsite_entries,unknown_entries,"
+                        + "save_flush_entries,planet_condition_scheduled_entries,"
+                        + "planet_condition_fallback_entries,planet_condition_save_flush_entries,"
+                        + "planet_condition_immediate_entries,direct_callsite_entries,unknown_entries,"
                         + "direct_wrapper_calls,site_count,site_overflow_calls,metadata_collisions\n";
         private static final String UNKNOWN_HEADER =
                 "timestamp_utc,samples,stack\n";
@@ -3279,18 +3525,23 @@ public final class StarsectorPrepatcherHooks {
                 new ConcurrentHashMap<>();
         private final DirectMarketSiteStats overflowSite =
                 DirectMarketSiteStats.overflow();
-        private final ConcurrentHashMap<String, LongAdder> unknownStacks =
-                new ConcurrentHashMap<>();
-        private final AtomicInteger unknownStackSamples = new AtomicInteger();
+        private final AtomicReference<UnknownStackInterval> unknownStackInterval =
+                new AtomicReference<>(new UnknownStackInterval());
         private final LongAdder scheduledEntries = new LongAdder();
         private final LongAdder schedulerFallbackEntries = new LongAdder();
         private final LongAdder saveFlushEntries = new LongAdder();
+        private final LongAdder planetConditionScheduledEntries = new LongAdder();
+        private final LongAdder planetConditionFallbackEntries = new LongAdder();
+        private final LongAdder planetConditionSaveFlushEntries = new LongAdder();
+        private final LongAdder planetConditionImmediateEntries = new LongAdder();
         private final LongAdder directCallsiteEntries = new LongAdder();
         private final LongAdder unknownEntries = new LongAdder();
         private final LongAdder directWrapperCalls = new LongAdder();
         private final LongAdder siteOverflowCalls = new LongAdder();
         private final LongAdder metadataCollisions = new LongAdder();
+        private final Object metadataWriteLock = new Object();
         private volatile long lastReportNanos = System.nanoTime();
+        private final String sessionOrigin;
 
         DirectMarketObserver(PrepatcherConfig configuration, Path root) throws IOException {
             timingSampleEvery = configuration.directMarketTimingSampleEvery;
@@ -3299,8 +3550,11 @@ public final class StarsectorPrepatcherHooks {
             reportIntervalSeconds = configuration.directMarketReportIntervalSeconds;
             maxSites = configuration.directMarketMaxSites;
             unknownStackSampleLimit = configuration.directMarketUnknownStackSamples;
+            sessionOrigin = sanitizeSessionOrigin(System.getProperty(
+                    "starsector.prepatcher.sessionOrigin", "game"));
 
-            String sessionName = "session-" + SESSION_FORMAT.format(Instant.now())
+            String originSegment = "game".equals(sessionOrigin) ? "" : sessionOrigin + "-";
+            String sessionName = "session-" + originSegment + SESSION_FORMAT.format(Instant.now())
                     + "-pid" + ProcessHandle.current().pid();
             Path base = root.resolve("logs").resolve("direct-market-observe");
             sessionDir = base.resolve(sessionName);
@@ -3335,6 +3589,12 @@ public final class StarsectorPrepatcherHooks {
             reporter.setDaemon(true);
             reporter.setPriority(Thread.MIN_PRIORITY);
             reporter.start();
+        }
+
+        void registerSite(long siteId, String metadata) {
+            DirectMarketSiteStats stats = site(null, siteId, metadata);
+            if (stats == overflowSite) return;
+            writeMetadataIfNeeded(stats);
         }
 
         DirectMarketCallToken beginDirectCall(MarketAdvanceObservationContext context,
@@ -3386,13 +3646,31 @@ public final class StarsectorPrepatcherHooks {
                 case MARKET_ORIGIN_SCHEDULED -> scheduledEntries.increment();
                 case MARKET_ORIGIN_SCHEDULER_FALLBACK -> schedulerFallbackEntries.increment();
                 case MARKET_ORIGIN_SAVE_FLUSH -> saveFlushEntries.increment();
+                case MARKET_ORIGIN_PLANET_CONDITION_SCHEDULED ->
+                        planetConditionScheduledEntries.increment();
+                case MARKET_ORIGIN_PLANET_CONDITION_FALLBACK ->
+                        planetConditionFallbackEntries.increment();
+                case MARKET_ORIGIN_PLANET_CONDITION_SAVE_FLUSH ->
+                        planetConditionSaveFlushEntries.increment();
+                case MARKET_ORIGIN_PLANET_CONDITION_IMMEDIATE ->
+                        planetConditionImmediateEntries.increment();
                 case MARKET_ORIGIN_DIRECT_CALL_SITE -> directCallsiteEntries.increment();
                 default -> {
                     unknownEntries.increment();
-                    int sample = unknownStackSamples.getAndIncrement();
-                    if (sample < unknownStackSampleLimit) {
-                        String stack = captureDirectStack();
-                        unknownStacks.computeIfAbsent(stack, ignored -> new LongAdder()).increment();
+                    UnknownStackInterval interval;
+                    while (true) {
+                        interval = unknownStackInterval.get();
+                        if (interval.tryAcquireWriter()) break;
+                    }
+                    try {
+                        int sample = interval.samples.getAndIncrement();
+                        if (sample < unknownStackSampleLimit) {
+                            String stack = captureDirectStack();
+                            interval.stacks.computeIfAbsent(
+                                    stack, ignored -> new LongAdder()).increment();
+                        }
+                    } finally {
+                        interval.releaseWriter();
                     }
                 }
             }
@@ -3401,12 +3679,14 @@ public final class StarsectorPrepatcherHooks {
         private DirectMarketSiteStats site(MarketAdvanceObservationContext context,
                                              long siteId, String metadata) {
             int slot = (int) (siteId ^ (siteId >>> 32)) & 7;
-            DirectMarketSiteStats cached = context.observerStats[slot];
-            String cachedMetadata = context.observerMetadata[slot];
-            if (cached != null && context.observerSiteIds[slot] == siteId
-                    && (cachedMetadata == metadata
-                    || Objects.equals(cachedMetadata, metadata))) {
-                return cached;
+            if (context != null) {
+                DirectMarketSiteStats cached = context.observerStats[slot];
+                String cachedMetadata = context.observerMetadata[slot];
+                if (cached != null && context.observerSiteIds[slot] == siteId
+                        && (cachedMetadata == metadata
+                        || Objects.equals(cachedMetadata, metadata))) {
+                    return cached;
+                }
             }
 
             DirectMarketSiteStats existing = sites.get(siteId);
@@ -3421,10 +3701,29 @@ public final class StarsectorPrepatcherHooks {
                 existing = raced == null ? candidate : raced;
             }
             if (!existing.metadata.raw.equals(metadata)) metadataCollisions.increment();
-            context.observerSiteIds[slot] = siteId;
-            context.observerMetadata[slot] = metadata;
-            context.observerStats[slot] = existing;
+            if (context != null) {
+                context.observerSiteIds[slot] = siteId;
+                context.observerMetadata[slot] = metadata;
+                context.observerStats[slot] = existing;
+            }
             return existing;
+        }
+
+        private void writeMetadataIfNeeded(DirectMarketSiteStats stats) {
+            if (stats == null || stats == overflowSite || stats.metadataWritten) return;
+            synchronized (metadataWriteLock) {
+                if (stats.metadataWritten) return;
+                StringBuilder row = new StringBuilder();
+                appendSiteRow(row, stats.metadata);
+                try {
+                    append(sitesFile, row);
+                    stats.metadataWritten = true;
+                } catch (IOException failure) {
+                    PrepatcherLog.warn("Direct market call-site manifest write failed for "
+                            + unsignedHex(stats.metadata.siteId) + ": "
+                            + failure.getMessage());
+                }
+            }
         }
 
         private void reportLoop() {
@@ -3459,27 +3758,28 @@ public final class StarsectorPrepatcherHooks {
             snapshots.sort((left, right) -> Long.compare(
                     right.estimatedInclusiveNanos(), left.estimatedInclusiveNanos()));
 
-            StringBuilder siteRows = new StringBuilder();
             StringBuilder observationRows = new StringBuilder();
             StringBuilder stackRows = new StringBuilder();
             for (DirectMarketIntervalSnapshot snapshot : snapshots) {
                 DirectMarketSiteStats stats = snapshot.stats;
-                if (!stats.metadataWritten && stats != overflowSite) {
-                    appendSiteRow(siteRows, stats.metadata);
-                    stats.metadataWritten = true;
-                }
+                writeMetadataIfNeeded(stats);
                 if (snapshot.calls > 0L) {
                     appendObservationRow(observationRows, timestamp, elapsedSeconds, snapshot);
                 }
                 stats.appendStackRows(stackRows, timestamp);
             }
-            if (siteRows.length() > 0) append(sitesFile, siteRows);
             if (observationRows.length() > 0) append(observationsFile, observationRows);
             if (stackRows.length() > 0) append(stacksFile, stackRows);
 
+            // Atomically detach the interval so stack signatures do not accumulate
+            // for the process lifetime and calls racing the report go to one of the
+            // two complete intervals rather than sharing a reset counter.
+            UnknownStackInterval unknownInterval = unknownStackInterval.getAndSet(
+                    new UnknownStackInterval());
+            unknownInterval.sealAndAwaitWriters();
             StringBuilder unknownRows = new StringBuilder();
-            for (Map.Entry<String, LongAdder> entry : unknownStacks.entrySet()) {
-                long samples = entry.getValue().sumThenReset();
+            for (Map.Entry<String, LongAdder> entry : unknownInterval.stacks.entrySet()) {
+                long samples = entry.getValue().sum();
                 if (samples <= 0L) continue;
                 unknownRows.append(csv(timestamp)).append(',')
                         .append(samples).append(',')
@@ -3490,21 +3790,31 @@ public final class StarsectorPrepatcherHooks {
             long scheduled = scheduledEntries.sumThenReset();
             long fallback = schedulerFallbackEntries.sumThenReset();
             long save = saveFlushEntries.sumThenReset();
+            long planetScheduled = planetConditionScheduledEntries.sumThenReset();
+            long planetFallback = planetConditionFallbackEntries.sumThenReset();
+            long planetSave = planetConditionSaveFlushEntries.sumThenReset();
+            long planetImmediate = planetConditionImmediateEntries.sumThenReset();
             long direct = directCallsiteEntries.sumThenReset();
             long unknown = unknownEntries.sumThenReset();
             long wrappers = directWrapperCalls.sumThenReset();
             long overflowCalls = siteOverflowCalls.sumThenReset();
             long collisions = metadataCollisions.sumThenReset();
             String summary = csv(timestamp) + ',' + decimal(elapsedSeconds) + ','
-                    + scheduled + ',' + fallback + ',' + save + ',' + direct + ','
-                    + unknown + ',' + wrappers + ',' + sites.size() + ','
-                    + overflowCalls + ',' + collisions + '\n';
+                    + scheduled + ',' + fallback + ',' + save + ','
+                    + planetScheduled + ',' + planetFallback + ',' + planetSave + ','
+                    + planetImmediate + ',' + direct + ',' + unknown + ',' + wrappers + ','
+                    + sites.size() + ',' + overflowCalls + ',' + collisions + '\n';
             append(summaryFile, new StringBuilder(summary));
 
-            if (wrappers > 0L || unknown > 0L || overflowCalls > 0L || collisions > 0L) {
+            if (wrappers > 0L || unknown > 0L || planetScheduled > 0L
+                    || planetFallback > 0L || planetImmediate > 0L
+                    || overflowCalls > 0L || collisions > 0L) {
                 PrepatcherLog.info("direct-market-observe: calls=" + wrappers
                         + ", sites=" + sites.size()
                         + ", scheduledEntries=" + scheduled
+                        + ", planetScheduledEntries=" + planetScheduled
+                        + ", planetFallbackEntries=" + planetFallback
+                        + ", planetImmediateEntries=" + planetImmediate
                         + ", directEntries=" + direct
                         + ", unknownEntries=" + unknown
                         + ", overflowCalls=" + overflowCalls
@@ -3515,18 +3825,36 @@ public final class StarsectorPrepatcherHooks {
         private String sessionJson() {
             String version = System.getProperty("starsector.prepatcher.version", "unknown");
             return "{\n"
-                    + "  \"schema\": 1,\n"
+                    + "  \"schema\": 2,\n"
                     + "  \"mode\": \"observe\",\n"
                     + "  \"createdUtc\": " + json(Instant.now().toString()) + ",\n"
                     + "  \"prepatcherVersion\": " + json(version) + ",\n"
+                    + "  \"sessionOrigin\": " + json(sessionOrigin) + ",\n"
                     + "  \"timingSampleEvery\": " + timingSampleEvery + ",\n"
                     + "  \"stackSampleEvery\": " + stackSampleEvery + ",\n"
                     + "  \"maxStacksPerSite\": " + maxStacksPerSite + ",\n"
                     + "  \"reportIntervalSeconds\": " + reportIntervalSeconds + ",\n"
                     + "  \"maxSites\": " + maxSites + ",\n"
-                    + "  \"unknownStackSamples\": " + unknownStackSampleLimit + ",\n"
-                    + "  \"behavior\": \"All observed direct calls remain synchronous and immediate.\"\n"
+                    + "  \"unknownStackSamplesPerInterval\": "
+                    + unknownStackSampleLimit + ",\n"
+                    + "  \"behavior\": \"Direct mod calls remain synchronous and immediate; the separately classified planet-condition engine path may be staggered when its patch is enabled.\"\n"
                     + "}\n";
+        }
+
+        private static String sanitizeSessionOrigin(String raw) {
+            if (raw == null || raw.isBlank()) return "game";
+            StringBuilder sanitized = new StringBuilder(Math.min(raw.length(), 48));
+            for (int index = 0; index < raw.length() && sanitized.length() < 48; index++) {
+                char value = raw.charAt(index);
+                if ((value >= 'a' && value <= 'z') || (value >= 'A' && value <= 'Z')
+                        || (value >= '0' && value <= '9') || value == '.' || value == '_'
+                        || value == '-') {
+                    sanitized.append(value);
+                } else {
+                    sanitized.append('_');
+                }
+            }
+            return sanitized.length() == 0 ? "game" : sanitized.toString();
         }
 
         private static void appendSiteRow(StringBuilder output, DirectMarketMetadata metadata) {
@@ -3648,6 +3976,33 @@ public final class StarsectorPrepatcherHooks {
 
         private static String unsignedHex(long value) {
             return "0x" + Long.toUnsignedString(value, 16);
+        }
+    }
+
+    private static final class UnknownStackInterval {
+        final AtomicInteger samples = new AtomicInteger();
+        final AtomicInteger activeWriters = new AtomicInteger();
+        final ConcurrentHashMap<String, LongAdder> stacks = new ConcurrentHashMap<>();
+        volatile boolean sealed;
+
+        boolean tryAcquireWriter() {
+            activeWriters.incrementAndGet();
+            if (!sealed) return true;
+            activeWriters.decrementAndGet();
+            return false;
+        }
+
+        void releaseWriter() {
+            activeWriters.decrementAndGet();
+        }
+
+        void sealAndAwaitWriters() {
+            sealed = true;
+            int spins = 0;
+            while (activeWriters.get() != 0) {
+                if (spins++ < 256) Thread.onSpinWait();
+                else Thread.yield();
+            }
         }
     }
 

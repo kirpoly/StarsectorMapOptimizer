@@ -22,4 +22,9 @@ public final class StarsectorPrepatcherRuntimeBridge {
         StarsectorPrepatcherHooks.configure(config, modRoot);
         StarsectorPrepatcherHyperspaceHooks.configure(config);
     }
+
+    /** Loader-neutral registration endpoint used by the mod call-site transformer. */
+    public static void registerDirectMarketCallSite(long siteId, String metadata) {
+        StarsectorPrepatcherHooks.registerDirectMarketCallSite(siteId, metadata);
+    }
 }

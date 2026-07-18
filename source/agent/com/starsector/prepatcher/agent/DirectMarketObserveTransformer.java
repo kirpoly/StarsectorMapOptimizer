@@ -21,6 +21,7 @@ import jdk.internal.org.objectweb.asm.tree.analysis.BasicValue;
 import jdk.internal.org.objectweb.asm.tree.analysis.BasicVerifier;
 
 import java.lang.instrument.ClassFileTransformer;
+import java.lang.reflect.Method;
 import java.net.URI;
 import java.net.URL;
 import java.nio.file.Path;
@@ -54,6 +55,7 @@ public final class DirectMarketObserveTransformer implements ClassFileTransforme
     private final PrepatcherConfig config;
     private final ClassLoader runtimeLoader;
     private final Path modRoot;
+    private final Method registerSiteMethod;
     private final AtomicInteger patchedClasses = new AtomicInteger();
     private final AtomicInteger patchedCallSites = new AtomicInteger();
     private final Set<String> warnedClasses = java.util.Collections.synchronizedSet(new HashSet<>());
@@ -64,6 +66,7 @@ public final class DirectMarketObserveTransformer implements ClassFileTransforme
         this.config = config;
         this.runtimeLoader = runtimeLoader;
         this.modRoot = modRoot == null ? null : modRoot.toAbsolutePath().normalize();
+        this.registerSiteMethod = resolveRegisterSiteMethod(runtimeLoader);
     }
 
     @Override
@@ -88,6 +91,7 @@ public final class DirectMarketObserveTransformer implements ClassFileTransforme
             }
 
             List<MethodNode> changedMethods = new ArrayList<>();
+            List<SiteRegistration> registrations = new ArrayList<>();
             int changed = 0;
             for (MethodNode method : node.methods) {
                 if ((method.access & (Opcodes.ACC_ABSTRACT | Opcodes.ACC_NATIVE)) != 0) continue;
@@ -105,6 +109,7 @@ public final class DirectMarketObserveTransformer implements ClassFileTransforme
                     String metadata = metadata(source, node.name, method.name, method.desc,
                             line, ordinal, amountSource, call.owner, call.getOpcode());
                     long siteId = fnv1a64(metadata);
+                    registrations.add(new SiteRegistration(siteId, metadata));
 
                     InsnList replacement = new InsnList();
                     replacement.add(new LdcInsnNode(siteId));
@@ -137,6 +142,7 @@ public final class DirectMarketObserveTransformer implements ClassFileTransforme
                 return null;
             }
 
+            registerSites(registrations, className);
             int classes = patchedClasses.incrementAndGet();
             int sites = patchedCallSites.addAndGet(changed);
             System.setProperty("starsector.prepatcher.directMarketPatchedClasses",
@@ -151,6 +157,35 @@ public final class DirectMarketObserveTransformer implements ClassFileTransforme
             warnOnce(className, "direct-market observation failed open: "
                     + failure.getClass().getName() + ": " + failure.getMessage());
             return null;
+        }
+    }
+
+    private static Method resolveRegisterSiteMethod(ClassLoader runtimeLoader) {
+        if (runtimeLoader == null) return null;
+        try {
+            Class<?> bridge = Class.forName(
+                    "com.fs.starfarer.api.StarsectorPrepatcherRuntimeBridge",
+                    false, runtimeLoader);
+            return bridge.getMethod(
+                    "registerDirectMarketCallSite", long.class, String.class);
+        } catch (Throwable failure) {
+            PrepatcherLog.warn("DIRECT_MARKET_OBSERVE could not resolve eager call-site "
+                    + "registration bridge; metadata will be registered lazily: "
+                    + failure.getClass().getName() + ": " + failure.getMessage());
+            return null;
+        }
+    }
+
+    private void registerSites(List<SiteRegistration> registrations, String className) {
+        if (registerSiteMethod == null || registrations.isEmpty()) return;
+        try {
+            for (SiteRegistration registration : registrations) {
+                registerSiteMethod.invoke(null, registration.siteId(), registration.metadata());
+            }
+        } catch (Throwable failure) {
+            warnOnce(className, "eager call-site metadata registration failed; wrappers "
+                    + "remain active and will register lazily: "
+                    + failure.getClass().getName() + ": " + failure.getMessage());
         }
     }
 
@@ -383,4 +418,6 @@ public final class DirectMarketObserveTransformer implements ClassFileTransforme
         return loader.getClass().getName() + "@"
                 + Integer.toHexString(System.identityHashCode(loader));
     }
+
+    private record SiteRegistration(long siteId, String metadata) {}
 }

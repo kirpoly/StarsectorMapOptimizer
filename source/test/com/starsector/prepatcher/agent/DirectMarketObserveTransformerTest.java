@@ -1,5 +1,6 @@
 package com.starsector.prepatcher.agent;
 
+import com.fs.starfarer.api.StarsectorPrepatcherRuntimeBridge;
 import com.fs.starfarer.api.campaign.econ.MarketAPI;
 import jdk.internal.org.objectweb.asm.ClassReader;
 import jdk.internal.org.objectweb.asm.ClassWriter;
@@ -15,12 +16,17 @@ import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
 import java.net.URL;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.security.CodeSource;
 import java.security.ProtectionDomain;
 import java.security.cert.Certificate;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.List;
 import java.util.Properties;
+import java.util.stream.Stream;
 
 /** Structural and synchronous-behavior test for arbitrary mod call-site observation. */
 public final class DirectMarketObserveTransformerTest {
@@ -32,7 +38,17 @@ public final class DirectMarketObserveTransformerTest {
     private DirectMarketObserveTransformerTest() {}
 
     public static void main(String[] args) throws Exception {
+        Path root = Files.createTempDirectory("prepatcher-direct-transformer-");
+        try {
+            run(root);
+        } finally {
+            deleteRecursively(root);
+        }
+    }
+
+    private static void run(Path root) throws Exception {
         PrepatcherConfig config = config();
+        StarsectorPrepatcherRuntimeBridge.configure(config, root);
         ClassLoader parent = ClassLoader.getSystemClassLoader();
         ChildLoader loader = new ChildLoader(parent);
         ProtectionDomain domain = new ProtectionDomain(
@@ -43,6 +59,17 @@ public final class DirectMarketObserveTransformerTest {
                 new DirectMarketObserveTransformer(config, parent, null);
         byte[] transformed = transformer.transform(loader, CLASS_NAME, null, domain, original);
         require(transformed != null, "candidate mod class was not transformed");
+
+        Path session = Path.of(System.getProperty(
+                "starsector.prepatcher.directMarketObservationDir"));
+        String manifest = Files.readString(
+                session.resolve("call-sites.csv"), StandardCharsets.UTF_8);
+        require(dataRows(manifest) == 4,
+                "eager transformer registration did not persist four call sites before define: "
+                        + manifest);
+        require(manifest.contains("test.mod.DirectMarketCaller")
+                        && manifest.contains("mods/TestMod/jars/test.jar"),
+                "eager transformer manifest lost class/source metadata: " + manifest);
 
         ClassNode node = read(transformed);
         int originals = 0;
@@ -108,12 +135,13 @@ public final class DirectMarketObserveTransformerTest {
         }
 
         System.out.println("OK direct-market-transformer callSites=" + hooks
-                + " calls=" + counter.calls);
+                + " calls=" + counter.calls + " eager-manifest");
     }
 
     private static PrepatcherConfig config() throws Exception {
         Properties properties = new Properties();
         properties.setProperty("patch.directMarketObservation", "true");
+        properties.setProperty("directMarket.reportIntervalSeconds", "3600");
         properties.setProperty("logging.statsIntervalSeconds", "0");
         Constructor<PrepatcherConfig> constructor =
                 PrepatcherConfig.class.getDeclaredConstructor(Properties.class);
@@ -195,6 +223,22 @@ public final class DirectMarketObserveTransformerTest {
         if (type == double.class) return 0d;
         if (type == char.class) return '\0';
         return null;
+    }
+
+    private static int dataRows(String text) {
+        String[] lines = text.split("\\R");
+        int rows = 0;
+        for (int i = 1; i < lines.length; i++) if (!lines[i].isBlank()) rows++;
+        return rows;
+    }
+
+    private static void deleteRecursively(Path root) throws Exception {
+        if (root == null || !Files.exists(root)) return;
+        try (Stream<Path> paths = Files.walk(root)) {
+            for (Path path : paths.sorted(Comparator.reverseOrder()).toList()) {
+                Files.deleteIfExists(path);
+            }
+        }
     }
 
     private static void require(boolean condition, String message) {

@@ -25,6 +25,7 @@ import jdk.internal.org.objectweb.asm.tree.analysis.AnalyzerException;
 import jdk.internal.org.objectweb.asm.tree.analysis.BasicValue;
 import jdk.internal.org.objectweb.asm.tree.analysis.BasicVerifier;
 
+import java.lang.reflect.Constructor;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -34,6 +35,7 @@ import java.util.List;
 import java.util.LinkedHashSet;
 import java.util.Set;
 import java.util.Map;
+import java.util.Properties;
 import java.util.jar.JarFile;
 
 /** In-memory regression harness; it never writes modified game classes. */
@@ -68,6 +70,8 @@ public final class StructuralCompatibilityTest {
                 "behavior-changing commodity cache must remain disabled when configuration is missing");
         require(!defaults.remoteMarketScheduler,
                 "remote-market scheduler must remain disabled when configuration is missing");
+        require(!defaults.planetConditionMarketScheduler,
+                "planet-condition market scheduler must remain disabled when configuration is missing");
         require(!defaults.directMarketObservation,
                 "direct-market observation must remain disabled when configuration is missing");
         PrepatcherConfig config = PrepatcherConfig.load(configPath);
@@ -95,15 +99,16 @@ public final class StructuralCompatibilityTest {
         require(classes == PrepatcherTransformer.TARGET_CLASSES.size(),
                 "not all optimizer target classes were found across supplied JARs: expected "
                         + PrepatcherTransformer.TARGET_CLASSES.size() + ", found " + classes);
-        runLoaderGuardTests(config, Arrays.stream(args).skip(1)
-                .map(value -> Path.of(value).toAbsolutePath().normalize()).toList());
+        List<Path> suppliedJars = Arrays.stream(args).skip(1)
+                .map(value -> Path.of(value).toAbsolutePath().normalize()).toList();
+        runLoaderGuardTests(config, suppliedJars);
+        runPlanetConditionOnlyStructuralTest(suppliedJars);
         runNegativeRetainAllTests(config, Path.of(args[1]).toAbsolutePath().normalize());
         runNegativeLifecycleTests(config, Path.of(args[1]).toAbsolutePath().normalize());
         runExp6OwnershipTests(config, Path.of(args[1]).toAbsolutePath().normalize());
         runInlineFastPathNegativeTests(config,
                 Path.of(args[1]).toAbsolutePath().normalize());
-        runExp8OwnershipTests(config, Arrays.stream(args).skip(1)
-                .map(value -> Path.of(value).toAbsolutePath().normalize()).toList());
+        runExp8OwnershipTests(config, suppliedJars);
         System.out.println("OK negative-tests retainAll missing ambiguous unrelated-call unrelated-change"
                 + " marker-ownership scratch-scope-tamper wrapper-tamper wrapper-metadata idempotency"
                 + " lifecycle-missing-write lifecycle-wrong-source exp6-marker-ownership"
@@ -112,9 +117,159 @@ public final class StructuralCompatibilityTest {
                 + " entity-fastpath-epilogue memory-fastpath-source"
                 + " memory-fastpath-order-placement inline-marker-receiver"
                 + " inline-marker-branch inline-marker-order loader-guard"
+                + " planet-condition-only-frame-clock scheduler-scope-tamper"
+                + " planet-condition-predicate-branch/receiver/bypass-edge/branch-entry"
+                + " remote-scheduler-operands"
                 + " safe-missing-config-defaults");
         System.out.println("SUMMARY jars=" + jars + " transformedClasses=" + classes
                 + " verifiedMethods=" + methods);
+    }
+
+    private static void runPlanetConditionOnlyStructuralTest(
+            List<Path> jarPaths) throws Exception {
+        Properties properties = new Properties();
+        properties.setProperty("patch.planetConditionMarketScheduler", "true");
+        properties.setProperty("patch.remoteMarketScheduler", "false");
+        properties.setProperty("patch.economyLocationCache", "false");
+        properties.setProperty("patch.economySnapshotReuse", "false");
+        properties.setProperty("patch.entityScriptSnapshotReuse", "false");
+        properties.setProperty("patch.directMarketObservation", "false");
+        properties.setProperty("patch.saveOutputBufferDedup", "false");
+        Constructor<PrepatcherConfig> constructor =
+                PrepatcherConfig.class.getDeclaredConstructor(Properties.class);
+        constructor.setAccessible(true);
+        PrepatcherConfig planetOnly = constructor.newInstance(properties);
+
+        byte[] economyOriginal = classBytes(jarPaths, PrepatcherTransformer.ECONOMY);
+        byte[] economy = new PrepatcherTransformer(planetOnly).transform(
+                null, PrepatcherTransformer.ECONOMY, null, null,
+                economyOriginal);
+        require(economy != null, "planet-condition-only Economy frame clock was not applied");
+        require(countHook(economy, "beginRemoteMarketFrame") == 1
+                        && countHook(economy, "advanceMarketScheduled") == 0,
+                "planet-condition-only Economy transform changed central market scheduling");
+        assertScratchScope(economy, "advance", "(F)V");
+
+        ClassNode unscopedEconomy = read(economy);
+        removeScratchScope(method(unscopedEconomy, "advance", "(F)V"));
+        byte[] unscopedEconomyResult = new PrepatcherTransformer(planetOnly).transform(
+                null, PrepatcherTransformer.ECONOMY, null, null, write(unscopedEconomy));
+        require(unscopedEconomyResult == null,
+                "planet-condition frame clock without scratch scope was modified");
+        require("SKIPPED_STRUCTURAL".equals(System.getProperty(
+                        "starsector.prepatcher.patchStatus."
+                                + PrepatcherTransformer.ECONOMY.replace('/', '.')
+                                + ".planetConditionMarketFrameClock")),
+                "planet-condition frame clock without scratch scope was accepted");
+
+        byte[] entityOriginal = classBytes(
+                jarPaths, PrepatcherTransformer.BASE_CAMPAIGN_ENTITY);
+        byte[] entity = new PrepatcherTransformer(planetOnly).transform(
+                null, PrepatcherTransformer.BASE_CAMPAIGN_ENTITY, null, null,
+                entityOriginal);
+        require(entity != null
+                        && countHook(entity, "advancePlanetConditionMarketScheduled") == 1,
+                "planet-condition-only BaseCampaignEntity bridge was not applied");
+
+        ClassNode invertedPredicate = read(entityOriginal);
+        MethodNode invertedAdvance = method(invertedPredicate, "advance", "(F)V");
+        MethodInsnNode invertedCall = uniqueCall(invertedAdvance, Opcodes.INVOKEINTERFACE,
+                "com/fs/starfarer/api/campaign/econ/MarketAPI",
+                "isPlanetConditionMarketOnly", "()Z");
+        AbstractInsnNode invertedBranchInsn = nextMeaningful(invertedCall);
+        require(invertedBranchInsn instanceof JumpInsnNode
+                        && invertedBranchInsn.getOpcode() == Opcodes.IFEQ,
+                "planet-condition predicate branch changed in test input");
+        JumpInsnNode invertedBranch = (JumpInsnNode) invertedBranchInsn;
+        invertedAdvance.instructions.set(invertedBranch,
+                new JumpInsnNode(Opcodes.IFNE, invertedBranch.label));
+        assertInlinePatchRejected(planetOnly, PrepatcherTransformer.BASE_CAMPAIGN_ENTITY,
+                "planetConditionMarketAdvanceBridge", write(invertedPredicate),
+                "planet-condition predicate branch inversion");
+
+        ClassNode foreignPredicateReceiver = read(entityOriginal);
+        MethodNode foreignReceiverAdvance = method(
+                foreignPredicateReceiver, "advance", "(F)V");
+        MethodInsnNode foreignReceiverCall = uniqueCall(foreignReceiverAdvance,
+                Opcodes.INVOKEINTERFACE, "com/fs/starfarer/api/campaign/econ/MarketAPI",
+                "isPlanetConditionMarketOnly", "()Z");
+        AbstractInsnNode predicateReceiver = previousMeaningful(foreignReceiverCall);
+        require(predicateReceiver instanceof FieldInsnNode,
+                "planet-condition predicate receiver changed in test input");
+        ((FieldInsnNode) predicateReceiver).name = "smo$foreign$market";
+        assertInlinePatchRejected(planetOnly, PrepatcherTransformer.BASE_CAMPAIGN_ENTITY,
+                "planetConditionMarketAdvanceBridge", write(foreignPredicateReceiver),
+                "planet-condition predicate receiver mismatch");
+
+        ClassNode bypassedPredicate = read(entityOriginal);
+        MethodNode bypassedAdvance = method(bypassedPredicate, "advance", "(F)V");
+        MethodInsnNode bypassedMarketCall = uniqueCall(bypassedAdvance,
+                Opcodes.INVOKEINTERFACE, "com/fs/starfarer/api/campaign/econ/MarketAPI",
+                "advance", "(F)V");
+        AbstractInsnNode bypassedOwner = previousMeaningful(
+                previousMeaningful(previousMeaningful(bypassedMarketCall)));
+        require(bypassedOwner instanceof VarInsnNode
+                        && bypassedOwner.getOpcode() == Opcodes.ALOAD,
+                "planet-condition market receiver changed in bypass test input");
+        LabelNode bypass = new LabelNode();
+        bypassedAdvance.instructions.insertBefore(bypassedOwner, bypass);
+        bypassedAdvance.instructions.insert(bypass,
+                new FrameNode(Opcodes.F_SAME, 0, null, 0, null));
+        InsnList bypassJump = new InsnList();
+        bypassJump.add(new InsnNode(Opcodes.ICONST_1));
+        bypassJump.add(new JumpInsnNode(Opcodes.IFNE, bypass));
+        bypassedAdvance.instructions.insertBefore(
+                bypassedAdvance.instructions.getFirst(), bypassJump);
+        assertInlinePatchRejected(planetOnly, PrepatcherTransformer.BASE_CAMPAIGN_ENTITY,
+                "planetConditionMarketAdvanceBridge", write(bypassedPredicate),
+                "planet-condition guard bypass edge");
+
+        ClassNode enteredPredicateBranch = read(entityOriginal);
+        MethodNode enteredBranchAdvance = method(
+                enteredPredicateBranch, "advance", "(F)V");
+        MethodInsnNode enteredBranchPredicate = uniqueCall(enteredBranchAdvance,
+                Opcodes.INVOKEINTERFACE, "com/fs/starfarer/api/campaign/econ/MarketAPI",
+                "isPlanetConditionMarketOnly", "()Z");
+        AbstractInsnNode enteredBranchInsn = nextMeaningful(enteredBranchPredicate);
+        require(enteredBranchInsn instanceof JumpInsnNode
+                        && enteredBranchInsn.getOpcode() == Opcodes.IFEQ,
+                "planet-condition predicate branch changed in branch-entry test input");
+        LabelNode branchEntry = new LabelNode();
+        enteredBranchAdvance.instructions.insertBefore(enteredBranchInsn, branchEntry);
+        enteredBranchAdvance.instructions.insert(branchEntry,
+                new FrameNode(Opcodes.F_SAME1, 0, null, 1,
+                        new Object[] { Opcodes.INTEGER }));
+        InsnList branchEntryJump = new InsnList();
+        branchEntryJump.add(new InsnNode(Opcodes.ICONST_1));
+        branchEntryJump.add(new JumpInsnNode(Opcodes.GOTO, branchEntry));
+        enteredBranchAdvance.instructions.insertBefore(
+                enteredBranchAdvance.instructions.getFirst(), branchEntryJump);
+        assertInlinePatchRejected(planetOnly, PrepatcherTransformer.BASE_CAMPAIGN_ENTITY,
+                "planetConditionMarketAdvanceBridge", write(enteredPredicateBranch),
+                "planet-condition predicate branch external entry");
+
+        ClassNode damagedPatchedPredicate = read(entity);
+        MethodNode damagedPatchedAdvance = method(
+                damagedPatchedPredicate, "advance", "(F)V");
+        MethodInsnNode damagedPatchedCall = uniqueCall(damagedPatchedAdvance,
+                Opcodes.INVOKEINTERFACE, "com/fs/starfarer/api/campaign/econ/MarketAPI",
+                "isPlanetConditionMarketOnly", "()Z");
+        AbstractInsnNode damagedPatchedBranchInsn = nextMeaningful(damagedPatchedCall);
+        require(damagedPatchedBranchInsn instanceof JumpInsnNode
+                        && damagedPatchedBranchInsn.getOpcode() == Opcodes.IFEQ,
+                "patched planet-condition predicate branch changed in test input");
+        JumpInsnNode damagedPatchedBranch = (JumpInsnNode) damagedPatchedBranchInsn;
+        damagedPatchedAdvance.instructions.set(damagedPatchedBranch,
+                new JumpInsnNode(Opcodes.IFNE, damagedPatchedBranch.label));
+        assertInlinePatchRejected(planetOnly, PrepatcherTransformer.BASE_CAMPAIGN_ENTITY,
+                "planetConditionMarketAdvanceBridge", write(damagedPatchedPredicate),
+                "marker-preserved planet-condition predicate branch inversion");
+
+        byte[] save = new PrepatcherTransformer(planetOnly).transform(
+                null, PrepatcherTransformer.CAMPAIGN_GAME_MANAGER, null, null,
+                classBytes(jarPaths, PrepatcherTransformer.CAMPAIGN_GAME_MANAGER));
+        require(save != null && countHook(save, "flushRemoteMarketsBeforeSave") == 1,
+                "planet-condition-only pre-save flush was not applied");
     }
 
     private static void runLoaderGuardTests(PrepatcherConfig config,
@@ -442,9 +597,10 @@ public final class StructuralCompatibilityTest {
     private static void assertInlinePatchRejected(
             PrepatcherConfig config, String className, String patchId,
             byte[] input, String scenario) {
-        byte[] result = new PrepatcherTransformer(config)
+        new PrepatcherTransformer(config)
                 .transform(null, className, null, null, input);
-        require(result == null, scenario + " was patched unexpectedly");
+        // Another independent patch may legitimately transform the same class.
+        // The assertion is patch-local: the malformed target patch must be rejected.
         require("SKIPPED_STRUCTURAL".equals(System.getProperty(
                         "starsector.prepatcher.patchStatus."
                                 + className.replace('/', '.') + "." + patchId)),
@@ -454,6 +610,8 @@ public final class StructuralCompatibilityTest {
     private static void runExp8OwnershipTests(PrepatcherConfig config, List<Path> jarPaths)
             throws Exception {
         Map<String, List<String>> patches = new LinkedHashMap<>();
+        patches.put(PrepatcherTransformer.BASE_CAMPAIGN_ENTITY,
+                List.of("planetConditionMarketAdvanceBridge"));
         patches.put(PrepatcherTransformer.ECONOMY,
                 List.of("economyLocationCache", "economySnapshotReuse"));
         patches.put(PrepatcherTransformer.MARKET, List.of("economySnapshotReuse"));
@@ -514,9 +672,19 @@ public final class StructuralCompatibilityTest {
                             "starsector.prepatcher.patchStatus."
                                     + className.replace('/', '.') + "." + key.patchId)),
                     className + " exp8 hooks without scope were accepted");
+            if (className.equals(PrepatcherTransformer.ECONOMY)) {
+                require("SKIPPED_STRUCTURAL".equals(System.getProperty(
+                                "starsector.prepatcher.patchStatus."
+                                        + className.replace('/', '.')
+                                        + ".remoteMarketScheduler")),
+                        "Economy remote-market scheduler hooks without scope were accepted");
+            }
         }
 
         Map<String, HookTamper> latePostconditions = new LinkedHashMap<>();
+        latePostconditions.put(PrepatcherTransformer.BASE_CAMPAIGN_ENTITY,
+                new HookTamper("advancePlanetConditionMarketScheduled",
+                        "planetConditionMarketAdvanceBridge"));
         latePostconditions.put(PrepatcherTransformer.ECONOMY,
                 new HookTamper("borrowEconomyCollectionSnapshot", "economySnapshotReuse"));
         latePostconditions.put(PrepatcherTransformer.SHIP,
@@ -540,6 +708,33 @@ public final class StructuralCompatibilityTest {
                                     + className.replace('/', '.') + "." + tamper.patchId)),
                     className + " damaged late postcondition was accepted as idempotent");
         }
+
+        byte[] patchedEconomy = new PrepatcherTransformer(config).transform(
+                null, PrepatcherTransformer.ECONOMY, null, null,
+                classBytes(jarPaths, PrepatcherTransformer.ECONOMY));
+        require(patchedEconomy != null,
+                "Economy baseline remote-scheduler operand transform failed");
+        ClassNode damagedScheduledAmount = read(patchedEconomy);
+        MethodNode damagedScheduledAdvance = method(
+                damagedScheduledAmount, "advance", "(F)V");
+        MethodInsnNode scheduled = uniqueHook(
+                damagedScheduledAmount, "advanceMarketScheduled");
+        AbstractInsnNode scheduledAmount = previousMeaningful(scheduled);
+        require(scheduledAmount instanceof VarInsnNode amountLoad
+                        && amountLoad.getOpcode() == Opcodes.FLOAD && amountLoad.var == 1,
+                "Economy scheduled amount changed in test input");
+        damagedScheduledAdvance.instructions.set(
+                scheduledAmount, new InsnNode(Opcodes.FCONST_0));
+        byte[] damagedScheduledResult = new PrepatcherTransformer(config).transform(
+                null, PrepatcherTransformer.ECONOMY, null, null,
+                write(damagedScheduledAmount));
+        require(damagedScheduledResult == null,
+                "Economy scheduler with damaged amount source was modified");
+        require("SKIPPED_STRUCTURAL".equals(System.getProperty(
+                        "starsector.prepatcher.patchStatus."
+                                + PrepatcherTransformer.ECONOMY.replace('/', '.')
+                                + ".remoteMarketScheduler")),
+                "Economy scheduler with damaged amount source was accepted as idempotent");
     }
 
     private static MethodInsnNode uniqueHook(ClassNode node, String name) {
@@ -799,10 +994,14 @@ public final class StructuralCompatibilityTest {
                 expected.put("borrowLocationAdvanceSnapshot", 3);
                 expected.put("borrowPausedLocationSnapshot", 2);
             }
-            case PrepatcherTransformer.BASE_CAMPAIGN_ENTITY,
-                    PrepatcherTransformer.MEMORY -> {
-                // These patches are now fully inline. The previous helper-based
-                // versions were measurable hot paths in real campaign telemetry.
+            case PrepatcherTransformer.BASE_CAMPAIGN_ENTITY -> {
+                // Entity-script empty fast path remains inline. The condition-only
+                // market call site is routed through a marked scheduler/observer hook.
+                expected.put("advancePlanetConditionMarketScheduled", 1);
+            }
+            case PrepatcherTransformer.MEMORY -> {
+                // Fully inline; the previous helper-based version was measurable
+                // in real campaign telemetry.
             }
             case PrepatcherTransformer.ECONOMY -> {
                 expected.put("updateEconomyLocationMapIfNeeded", 1);

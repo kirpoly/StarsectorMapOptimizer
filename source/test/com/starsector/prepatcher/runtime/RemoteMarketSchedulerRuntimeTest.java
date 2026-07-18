@@ -40,11 +40,12 @@ public final class RemoteMarketSchedulerRuntimeTest {
         Global.setSector(sector.proxy);
 
         try {
-            assertIdentityStateMap();
+            assertIdentityStateMaps();
             assertStaggeringAndAmountConservation(sector, currentLocation, remoteLocation);
             assertHotPolicies(sector, currentLocation, remoteLocation);
             assertMemoryOptOut(sector, remoteLocation);
             assertHiddenCadenceAndSaveFlush(sector, remoteLocation);
+            assertPlanetConditionScheduler(sector, currentLocation, remoteLocation);
             assertNestedEconomyFallbackPreservesOuterFrame(sector, remoteLocation);
             assertReentrantFallback(sector, remoteLocation);
             assertDisabledFallback(sector, remoteLocation);
@@ -57,11 +58,19 @@ public final class RemoteMarketSchedulerRuntimeTest {
         System.out.println("OK remote-market-scheduler identity-state"
                 + " stable-phase/staggering amount-conservation"
                 + " current/player/interaction/memory hot policies"
-                + " hidden cadence save-flush nested-economy/reentrant/disabled fallback");
+                + " hidden cadence save-flush"
+                + " planet-condition identity/staggering/current-location/memory/save-flush/reentrant"
+                + " nested-economy/reentrant/disabled fallback");
     }
 
-    private static void assertIdentityStateMap() throws Exception {
-        Field field = StarsectorPrepatcherHooks.class.getDeclaredField("REMOTE_MARKET_STATES");
+    private static void assertIdentityStateMaps() throws Exception {
+        assertIdentityStateMap("REMOTE_MARKET_STATES", "remote market scheduler");
+        assertIdentityStateMap("PLANET_CONDITION_MARKET_STATES",
+                "planet-condition market scheduler");
+    }
+
+    private static void assertIdentityStateMap(String fieldName, String label) throws Exception {
+        Field field = StarsectorPrepatcherHooks.class.getDeclaredField(fieldName);
         field.setAccessible(true);
         Map<?, ?> map = (Map<?, ?>) field.get(null);
         Field delegate = findSynchronizedMapDelegate(map.getClass());
@@ -71,17 +80,16 @@ public final class RemoteMarketSchedulerRuntimeTest {
                 delegate.setAccessible(true);
                 Object backing = delegate.get(map);
                 require(backing instanceof IdentityHashMap,
-                        "remote market scheduler is not identity-keyed");
+                        label + " is not identity-keyed");
                 inspected = true;
             } catch (RuntimeException inaccessibleOnStrongModules) {
                 // The normal Java 17 test JVM does not open java.util. Functional
-                // proxy tests below still prove custom equals/hashCode does not
-                // force the vanilla fallback or alias two market identities.
+                // proxy tests below still prove identity behavior.
             }
         }
         if (!inspected) {
             require(map.getClass().getName().contains("SynchronizedMap"),
-                    "unexpected remote-market state map type: " + map.getClass());
+                    "unexpected " + label + " state map type: " + map.getClass());
         }
     }
 
@@ -244,6 +252,82 @@ public final class RemoteMarketSchedulerRuntimeTest {
                 "save flush replayed already-applied pending time");
     }
 
+    private static void assertPlanetConditionScheduler(
+            SectorContext sector, MutableLocation current, MutableLocation remote) throws Exception {
+        resetSchedulerGeneration();
+        sector.currentLocation = current.proxy;
+        sector.interactionMarket = null;
+
+        Method stablePhase = StarsectorPrepatcherHooks.class.getDeclaredMethod(
+                "stableMarketPhase", MarketAPI.class, int.class);
+        stablePhase.setAccessible(true);
+
+        ArrayList<MutableMarket> remoteMarkets = new ArrayList<>();
+        for (int i = 0; i < 10; i++) {
+            remoteMarkets.add(new MutableMarket("condition-remote-" + i,
+                    remote.proxy, false, false));
+        }
+        MutableMarket local = new MutableMarket(
+                "condition-local", current.proxy, false, false);
+        MutableMarket memoryHot = new MutableMarket(
+                "condition-memory-hot", remote.proxy, false, false);
+        memoryHot.memory.fullRate = true;
+
+        int frames = 13;
+        for (int frame = 1; frame <= frames; frame++) {
+            beginSyntheticEconomyFrame();
+            try {
+                for (MutableMarket market : remoteMarkets) {
+                    StarsectorPrepatcherHooks.advancePlanetConditionMarketScheduled(
+                            market.proxy, 1f);
+                }
+                StarsectorPrepatcherHooks.advancePlanetConditionMarketScheduled(
+                        local.proxy, 0.5f);
+                StarsectorPrepatcherHooks.advancePlanetConditionMarketScheduled(
+                        memoryHot.proxy, 0.25f);
+            } finally {
+                endSyntheticEconomyFrame();
+            }
+        }
+
+        for (MutableMarket market : remoteMarkets) {
+            int phase = (Integer) stablePhase.invoke(null, market.proxy, 4);
+            ArrayList<Integer> expected = new ArrayList<>();
+            expected.add(1);
+            for (int frame = 2; frame <= frames; frame++) {
+                if (Math.floorMod(frame, 4) == phase) expected.add(frame);
+            }
+            require(market.advanceFrames.equals(expected),
+                    "planet-condition cadence diverged for " + market.id
+                            + ": expected=" + expected + " actual=" + market.advanceFrames);
+        }
+        require(local.calls == frames && close(local.totalAmount, frames * 0.5f),
+                "current-location planet-condition market was throttled");
+        require(memoryHot.calls == frames && close(memoryHot.totalAmount, frames * 0.25f),
+                "planet-condition memory opt-out was throttled");
+
+        StarsectorPrepatcherHooks.flushRemoteMarketsBeforeSave();
+        for (MutableMarket market : remoteMarkets) {
+            require(close(market.totalAmount, frames),
+                    "planet-condition save flush lost amount for " + market.id);
+        }
+
+        resetSchedulerGeneration();
+        sector.currentLocation = null;
+        MutableMarket reentrant = new MutableMarket(
+                "condition-reentrant", remote.proxy, false, false);
+        reentrant.reenterPlanetOnce = true;
+        beginSyntheticEconomyFrame();
+        try {
+            StarsectorPrepatcherHooks.advancePlanetConditionMarketScheduled(
+                    reentrant.proxy, 1f);
+        } finally {
+            endSyntheticEconomyFrame();
+        }
+        require(reentrant.calls == 2 && close(reentrant.totalAmount, 1.5f),
+                "planet-condition reentrant call was lost or coalesced");
+    }
+
     private static void assertNestedEconomyFallbackPreservesOuterFrame(
             SectorContext sector, MutableLocation remote) throws Exception {
         resetSchedulerGeneration();
@@ -310,6 +394,20 @@ public final class RemoteMarketSchedulerRuntimeTest {
         }
         require(market.calls == 5 && close(market.totalAmount, 5f),
                 "disabled scheduler did not execute exact immediate fallback");
+
+        MutableMarket condition = new MutableMarket(
+                "condition-disabled", remote.proxy, false, false);
+        for (int i = 0; i < 5; i++) {
+            beginSyntheticEconomyFrame();
+            try {
+                StarsectorPrepatcherHooks.advancePlanetConditionMarketScheduled(
+                        condition.proxy, 0.5f);
+            } finally {
+                endSyntheticEconomyFrame();
+            }
+        }
+        require(condition.calls == 5 && close(condition.totalAmount, 2.5f),
+                "disabled planet-condition scheduler did not execute immediate fallback");
         installConfig(config(true));
         resetSchedulerGeneration();
     }
@@ -326,6 +424,7 @@ public final class RemoteMarketSchedulerRuntimeTest {
     private static PrepatcherConfig config(boolean enabled) throws Exception {
         Properties properties = new Properties();
         properties.setProperty("patch.remoteMarketScheduler", Boolean.toString(enabled));
+        properties.setProperty("patch.planetConditionMarketScheduler", Boolean.toString(enabled));
         properties.setProperty("market.remote.frames", "4");
         properties.setProperty("market.remote.hiddenFrames", "8");
         properties.setProperty("market.remote.maxDeferredFrames", "120");
@@ -336,16 +435,28 @@ public final class RemoteMarketSchedulerRuntimeTest {
         properties.setProperty("market.remote.policyAuditFrames", "1");
         properties.setProperty("market.remote.fullRateMemoryKey",
                 "$starsectorPrepatcher_fullRateMarket");
+        properties.setProperty("market.planetCondition.frames", "4");
+        properties.setProperty("market.planetCondition.currentLocationFrames", "1");
+        properties.setProperty("market.planetCondition.maxDeferredFrames", "120");
+        properties.setProperty("market.planetCondition.maxDeferredGameDays", "0");
+        properties.setProperty("market.planetCondition.policyAuditFrames", "1");
+        properties.setProperty("market.planetCondition.fullRateMemoryKey",
+                "$starsectorPrepatcher_fullRateMarket");
         properties.setProperty("logging.statsIntervalSeconds", "0");
         Constructor<PrepatcherConfig> constructor =
                 PrepatcherConfig.class.getDeclaredConstructor(Properties.class);
         constructor.setAccessible(true);
         PrepatcherConfig config = constructor.newInstance(properties);
         require(config.remoteMarketScheduler == enabled
+                        && config.planetConditionMarketScheduler == enabled
                         && config.remoteMarketFrames == 4
                         && config.remoteMarketHiddenFrames == 8
                         && config.remoteMarketMaxDeferredFrames == 120
-                        && config.remoteMarketMaxDeferredGameDays == 0f,
+                        && config.remoteMarketMaxDeferredGameDays == 0f
+                        && config.planetConditionMarketFrames == 4
+                        && config.planetConditionMarketCurrentLocationFrames == 1
+                        && config.planetConditionMarketMaxDeferredFrames == 120
+                        && config.planetConditionMarketMaxDeferredGameDays == 0f,
                 "scheduler test configuration was not parsed correctly");
         return config;
     }
@@ -454,6 +565,7 @@ public final class RemoteMarketSchedulerRuntimeTest {
         int calls;
         float totalAmount;
         boolean reenterOnce;
+        boolean reenterPlanetOnce;
         boolean inHandler;
 
         MutableMarket(String id, LocationAPI location, boolean playerOwned, boolean hidden) {
@@ -481,11 +593,19 @@ public final class RemoteMarketSchedulerRuntimeTest {
                     calls++;
                     totalAmount += amount;
                     advanceFrames.add(currentSchedulerFrame());
-                    if (reenterOnce && !inHandler) {
+                    if ((reenterOnce || reenterPlanetOnce) && !inHandler) {
+                        boolean planet = reenterPlanetOnce;
                         reenterOnce = false;
+                        reenterPlanetOnce = false;
                         inHandler = true;
                         try {
-                            StarsectorPrepatcherHooks.advanceMarketScheduled(this.proxy, 0.5f);
+                            if (planet) {
+                                StarsectorPrepatcherHooks.advancePlanetConditionMarketScheduled(
+                                        this.proxy, 0.5f);
+                            } else {
+                                StarsectorPrepatcherHooks.advanceMarketScheduled(
+                                        this.proxy, 0.5f);
+                            }
                         } finally {
                             inHandler = false;
                         }

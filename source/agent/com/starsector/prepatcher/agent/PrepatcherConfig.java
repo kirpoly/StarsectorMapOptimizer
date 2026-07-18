@@ -32,6 +32,7 @@ public final class PrepatcherConfig {
     public final boolean economySnapshotReuse;
     public final boolean commodityEventModDirtyCache;
     public final boolean remoteMarketScheduler;
+    public final boolean planetConditionMarketScheduler;
     public final boolean directMarketObservation;
     public final boolean commRelaySystemIndex;
     public final boolean shipAdvanceScratch;
@@ -72,6 +73,12 @@ public final class PrepatcherConfig {
     public final boolean remoteMarketHotInteraction;
     public final int remoteMarketPolicyAuditFrames;
     public final String remoteMarketFullRateMemoryKey;
+    public final int planetConditionMarketFrames;
+    public final int planetConditionMarketCurrentLocationFrames;
+    public final int planetConditionMarketMaxDeferredFrames;
+    public final float planetConditionMarketMaxDeferredGameDays;
+    public final int planetConditionMarketPolicyAuditFrames;
+    public final String planetConditionMarketFullRateMemoryKey;
     public final int directMarketTimingSampleEvery;
     public final int directMarketStackSampleEvery;
     public final int directMarketMaxStacksPerSite;
@@ -106,6 +113,7 @@ public final class PrepatcherConfig {
         economySnapshotReuse = bool("patch.economySnapshotReuse", true);
         commodityEventModDirtyCache = bool("patch.commodityEventModDirtyCache", false);
         remoteMarketScheduler = bool("patch.remoteMarketScheduler", false);
+        planetConditionMarketScheduler = bool("patch.planetConditionMarketScheduler", false);
         directMarketObservation = bool("patch.directMarketObservation", false);
         commRelaySystemIndex = bool("patch.commRelaySystemIndex", true);
         shipAdvanceScratch = bool("patch.shipAdvanceScratch", true);
@@ -149,6 +157,19 @@ public final class PrepatcherConfig {
                 "market.remote.policyAuditFrames", 60, 1, 36_000);
         remoteMarketFullRateMemoryKey = string(
                 "market.remote.fullRateMemoryKey", "$starsectorPrepatcher_fullRateMarket");
+        planetConditionMarketFrames = integer(
+                "market.planetCondition.frames", 4, 1, 240);
+        planetConditionMarketCurrentLocationFrames = integer(
+                "market.planetCondition.currentLocationFrames", 1, 1, 240);
+        planetConditionMarketMaxDeferredFrames = integer(
+                "market.planetCondition.maxDeferredFrames", 8, 1, 240);
+        planetConditionMarketMaxDeferredGameDays = decimal(
+                "market.planetCondition.maxDeferredGameDays", 0.02f, 0f, 30f);
+        planetConditionMarketPolicyAuditFrames = integer(
+                "market.planetCondition.policyAuditFrames", 60, 1, 36_000);
+        planetConditionMarketFullRateMemoryKey = string(
+                "market.planetCondition.fullRateMemoryKey",
+                "$starsectorPrepatcher_fullRateMarket");
         directMarketTimingSampleEvery = integer(
                 "directMarket.timingSampleEvery", 128, 0, 1_000_000);
         directMarketStackSampleEvery = integer(

@@ -170,11 +170,46 @@ operand stack. Wrapper всегда вызывает original market до воз
 - callback cadence;
 - save state.
 
+После успешной bytecode verification transformer немедленно регистрирует metadata site через
+loader-neutral bridge. Поэтому `call-sites.csv` является manifest найденных sites и не зависит от
+того, исполнилась ли соответствующая ветка мода. Если eager registration недоступна, runtime wrapper
+сохраняет прежний lazy fail-open путь.
+
+Entry probe concrete `Market.advance()` отличает central scheduler, planet-condition
+scheduler/immediate, save/direct origins через `ThreadLocal`. Непомеченный вход лишь считает и
+bounded-sample'ит stack. Unknown stack budget обновляется каждый report interval, а signature map
+атомарно отсоединяется при отчёте: ранний частый caller не может исчерпать sampling на весь процесс.
+
 Изменения, которые мод теоретически может наблюдать: дополнительный wrapper frame в stack,
 изменённые class bytes до JVM definition и небольшой sampling overhead. Self-integrity моды могут
 отказаться принимать transformed bytes; structural/loader ошибка в таком классе даёт fail-open и
-оставляет его bytecode vanilla. Reflection/MethodHandle calls не требуют переписывания call site:
-entry probe concrete `Market.advance` классифицирует их как bounded `UNKNOWN_DIRECT` samples.
+оставляет его bytecode vanilla. Reflection/MethodHandle paths остаются синхронными и попадают в
+bounded `UNKNOWN_DIRECT`, если не имеют известного engine origin.
+
+`session.json` schema 2 содержит `sessionOrigin`. Обычная игра использует `game`; startup/FR
+validation smoke получают отдельную метку и префикс каталога. Observer не удерживает ссылки на
+markets, а file/telemetry error не подавляет original call.
+
+## Контракт scheduler `planetConditionMarketOnly`
+
+`patch.planetConditionMarketScheduler` изменяет только подтверждённый call site после
+`MarketAPI.isPlanetConditionMarketOnly()` в `BaseCampaignEntity.advance(float)`. Его state
+identity-keyed и отделён от central remote-market state. Обязательные свойства:
+
+- первый вызов нового market немедленный;
+- пропущенный `amount` суммируется без потери и ограничен frame/day caps;
+- markets в текущей location игрока по умолчанию full-rate;
+- memory opt-out проверяется через bounded policy audit;
+- повторный helper-вызов того же market в frame и reentrant `Market.advance()` уходят в immediate
+  fallback, а внешнее состояние не повреждается;
+- campaign generation reset удаляет все strong references;
+- save boundary сначала flush'ит central и planet-condition debt отдельными origin-вызовами;
+- helper/state/policy exception означает локальный immediate fail-open;
+- если central scheduler отключён, `Economy.advance()` получает только frame-clock boundary и не
+  меняет собственный market-loop.
+
+Cadence удалённых condition-only markets намеренно меняется. Публичный `MarketAPI`, прямые mod calls
+и market plugins не переписываются.
 
 ## Контракт staggered remote-market scheduler
 
@@ -238,7 +273,7 @@ Telemetry schema `0.7.1`: старый `pooledRandom` называется `pool
 Structural proof показывает однозначность site, linkage, no-escape и verifier postconditions, но
 не доказывает величину ускорения. Runtime и performance evidence создаётся в `.build/reports/`, а
 проверенные выводы сохраняются в отчёте выпуска, например
-[`releases/0.9.2.md`](releases/0.9.2.md).
+[`releases/0.9.3.md`](releases/0.9.3.md).
 
 Если несколько javaagent меняют одни и те же классы, располагайте Prepatcher после них:
 transformer увидит bytes, возвращённые ранее зарегистрированными агентами. Installer обеспечивает

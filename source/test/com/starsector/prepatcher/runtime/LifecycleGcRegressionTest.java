@@ -40,6 +40,7 @@ public final class LifecycleGcRegressionTest {
             "ROUTE_SYSTEM_INDEXES",
             "ECONOMY_LOCATION_STATES",
             "REMOTE_MARKET_STATES",
+            "PLANET_CONDITION_MARKET_STATES",
             "COMM_RELAY_SYSTEM_INDEXES");
 
     private LifecycleGcRegressionTest() {}
