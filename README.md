@@ -2,7 +2,7 @@
 
 [English](README.md) | [Русский](README_RU.md)
 
-Current version: **0.9.1**. Supported game build: **Starsector 0.98a-RC8**.
+Current version: **0.9.2**. Supported game build: **Starsector 0.98a-RC8**.
 
 [![Unplayable without Prepatcher versus smooth with Prepatcher](media/smoothness_comparison.gif)](https://github.com/kirpoly/StarsectorPrepatcher/releases/download/v0.8.0/StarsectorPrepatcher-0.8.0-comparison.webm)
 
@@ -20,7 +20,7 @@ The project has a broader direction than map optimization alone:
 - keep version-specific bytecode knowledge inside the prepatcher instead of duplicating it across
   gameplay mods.
 
-The public API is a roadmap item, not a published compatibility surface in `0.9.1`. Its intended
+The public API is a roadmap item, not a published compatibility surface in `0.9.2`. Its intended
 namespace is `com.starsector.prepatcher.api`; API types will only become supported once they are
 documented and covered by compatibility tests.
 
@@ -119,10 +119,10 @@ player-owned markets remain full-rate; an individual market can opt out through 
 `$starsectorPrepatcher_fullRateMarket=true`. Use `profiles/safe.properties` or disable the switch for
 fully conservative callback cadence.
 
-`patch.directMarketObservation` is also enabled in the default/aggressive profile during the 0.9.2
-development cycle. It does not throttle direct mod calls: each call remains synchronous and
-immediate. It writes per-run CSV/stacks under `logs/direct-market-observe/session-*/`. Disable it
-after collecting data to remove the sampling overhead.
+`patch.directMarketObservation` is also enabled in the default/aggressive profile in 0.9.2. It does
+not throttle direct mod calls: each call remains synchronous and immediate. It writes per-run
+CSV/stacks under `logs/direct-market-observe/session-*/`. Disable it after collecting data to remove
+the sampling overhead.
 
 Run `uninstall-agent.bat` for vanilla, `uninstall-agent.bat -Target FasterRendering` for FR, or
 `uninstall-agent.bat -Target Both` to remove both managed entries. Each changed file is backed up.
@@ -155,6 +155,6 @@ Build details are in [`BUILDING.md`](BUILDING.md).
 - [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md) — structural matching and fail-open rules;
 - [`docs/VALIDATION.md`](docs/VALIDATION.md) — regression and performance validation playbook;
 - [`docs/ROADMAP.md`](docs/ROADMAP.md) — structural discovery, architecture, tooling, and platform plan;
-- [`docs/releases/0.9.1.md`](docs/releases/0.9.1.md) — current detailed release report.
+- [`docs/releases/0.9.2.md`](docs/releases/0.9.2.md) — current detailed release report.
 
 StarsectorPrepatcher is distributed under the terms in [`LICENSE`](LICENSE).
