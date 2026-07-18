@@ -30,10 +30,14 @@ public final class PrepatcherConfig {
     public final boolean emptyMemoryAdvanceFastPath;
     public final boolean economyLocationCache;
     public final boolean economySnapshotReuse;
+    public final boolean economyPersistentSnapshots;
     public final boolean commodityEventModDirtyCache;
     public final boolean remoteMarketScheduler;
     public final boolean planetConditionMarketScheduler;
     public final boolean directMarketObservation;
+    public final boolean commodityTemporalFastPath;
+    public final boolean marketNoOpCallbacks;
+    public final boolean tempModExpiryScheduler;
     public final boolean commRelaySystemIndex;
     public final boolean shipAdvanceScratch;
     public final boolean particleCleanup;
@@ -85,6 +89,10 @@ public final class PrepatcherConfig {
     public final int directMarketReportIntervalSeconds;
     public final int directMarketMaxSites;
     public final int directMarketUnknownStackSamples;
+    public final int economyStructureAuditMs;
+    public final int marketStructureAuditFrames;
+    public final int commodityTemporalAuditFrames;
+    public final int marketNoOpIndustryAuditFrames;
     public final int statsLogIntervalSeconds;
     public final int saveLoadProgressHz;
     public final int starfieldRemoveAllThreshold;
@@ -111,10 +119,14 @@ public final class PrepatcherConfig {
         emptyMemoryAdvanceFastPath = bool("patch.emptyMemoryAdvanceFastPath", true);
         economyLocationCache = bool("patch.economyLocationCache", true);
         economySnapshotReuse = bool("patch.economySnapshotReuse", true);
+        economyPersistentSnapshots = bool("patch.economyPersistentSnapshots", false);
         commodityEventModDirtyCache = bool("patch.commodityEventModDirtyCache", false);
         remoteMarketScheduler = bool("patch.remoteMarketScheduler", false);
         planetConditionMarketScheduler = bool("patch.planetConditionMarketScheduler", false);
         directMarketObservation = bool("patch.directMarketObservation", false);
+        commodityTemporalFastPath = bool("patch.commodityTemporalFastPath", false);
+        marketNoOpCallbacks = bool("patch.marketNoOpCallbacks", false);
+        tempModExpiryScheduler = bool("patch.tempModExpiryScheduler", false);
         commRelaySystemIndex = bool("patch.commRelaySystemIndex", true);
         shipAdvanceScratch = bool("patch.shipAdvanceScratch", true);
         particleCleanup = bool("patch.particleCleanup", true);
@@ -182,6 +194,10 @@ public final class PrepatcherConfig {
                 "directMarket.maxSites", 4096, 16, 65_536);
         directMarketUnknownStackSamples = integer(
                 "directMarket.unknownStackSamples", 32, 0, 4096);
+        economyStructureAuditMs = integer("economy.structureAuditMs", 1000, 0, 60_000);
+        marketStructureAuditFrames = integer("market.structureAuditFrames", 120, 1, 100_000);
+        commodityTemporalAuditFrames = integer("commodity.temporalAuditFrames", 60, 1, 100_000);
+        marketNoOpIndustryAuditFrames = integer("market.noOpIndustryAuditFrames", 120, 0, 100_000);
         statsLogIntervalSeconds = integer("logging.statsIntervalSeconds", 30, 0, 3600);
         saveLoadProgressHz = integer("saveLoad.progressHz", 15, 0, 240);
         starfieldRemoveAllThreshold = integer("starfield.removeAllThreshold", 8, 1, 4096);

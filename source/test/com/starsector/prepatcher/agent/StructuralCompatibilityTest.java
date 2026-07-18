@@ -44,6 +44,8 @@ public final class StructuralCompatibilityTest {
             "com/fs/starfarer/api/StarsectorPrepatcherHooks";
     private static final String HYPERSPACE_HOOKS =
             "com/fs/starfarer/api/StarsectorPrepatcherHyperspaceHooks";
+    private static final String TEMP_MOD_HOOKS =
+            "com/fs/starfarer/api/StarsectorPrepatcherTempModHooks";
 
     private StructuralCompatibilityTest() {}
 
@@ -74,6 +76,14 @@ public final class StructuralCompatibilityTest {
                 "planet-condition market scheduler must remain disabled when configuration is missing");
         require(!defaults.directMarketObservation,
                 "direct-market observation must remain disabled when configuration is missing");
+        require(!defaults.commodityTemporalFastPath,
+                "aggressive commodity active set must remain disabled when configuration is missing");
+        require(!defaults.marketNoOpCallbacks,
+                "aggressive dormant-industry fast path must remain disabled when configuration is missing");
+        require(!defaults.tempModExpiryScheduler,
+                "behavior-changing temp-mod scheduler must remain disabled when configuration is missing");
+        require(!defaults.economyPersistentSnapshots,
+                "behavior-changing persistent economy snapshots must remain disabled when configuration is missing");
         PrepatcherConfig config = PrepatcherConfig.load(configPath);
 
         int jars = 0;
@@ -103,6 +113,7 @@ public final class StructuralCompatibilityTest {
                 .map(value -> Path.of(value).toAbsolutePath().normalize()).toList();
         runLoaderGuardTests(config, suppliedJars);
         runPlanetConditionOnlyStructuralTest(suppliedJars);
+        runFallbackEconomySnapshotStructuralTest(suppliedJars);
         runNegativeRetainAllTests(config, Path.of(args[1]).toAbsolutePath().normalize());
         runNegativeLifecycleTests(config, Path.of(args[1]).toAbsolutePath().normalize());
         runExp6OwnershipTests(config, Path.of(args[1]).toAbsolutePath().normalize());
@@ -118,6 +129,7 @@ public final class StructuralCompatibilityTest {
                 + " memory-fastpath-order-placement inline-marker-receiver"
                 + " inline-marker-branch inline-marker-order loader-guard"
                 + " planet-condition-only-frame-clock scheduler-scope-tamper"
+                + " fallback-economy-snapshots fallback-snapshot-scope-tamper"
                 + " planet-condition-predicate-branch/receiver/bypass-edge/branch-entry"
                 + " remote-scheduler-operands"
                 + " safe-missing-config-defaults");
@@ -270,6 +282,80 @@ public final class StructuralCompatibilityTest {
                 classBytes(jarPaths, PrepatcherTransformer.CAMPAIGN_GAME_MANAGER));
         require(save != null && countHook(save, "flushRemoteMarketsBeforeSave") == 1,
                 "planet-condition-only pre-save flush was not applied");
+    }
+
+    /**
+     * Exercises the compatibility fallback hidden by the all-enabled release
+     * profile: reusable scratch snapshots are selected only when persistent
+     * owner-local snapshots are disabled.
+     */
+    private static void runFallbackEconomySnapshotStructuralTest(
+            List<Path> jarPaths) throws Exception {
+        Properties properties = new Properties();
+        properties.setProperty("patch.economyPersistentSnapshots", "false");
+        properties.setProperty("patch.economySnapshotReuse", "true");
+        properties.setProperty("patch.economyLocationCache", "false");
+        properties.setProperty("patch.remoteMarketScheduler", "false");
+        properties.setProperty("patch.planetConditionMarketScheduler", "false");
+        properties.setProperty("patch.directMarketObservation", "false");
+        properties.setProperty("patch.commodityTemporalFastPath", "false");
+        Constructor<PrepatcherConfig> constructor =
+                PrepatcherConfig.class.getDeclaredConstructor(Properties.class);
+        constructor.setAccessible(true);
+        PrepatcherConfig fallbackOnly = constructor.newInstance(properties);
+
+        byte[] economy = new PrepatcherTransformer(fallbackOnly).transform(
+                null, PrepatcherTransformer.ECONOMY, null, null,
+                classBytes(jarPaths, PrepatcherTransformer.ECONOMY));
+        require(economy != null, "fallback Economy snapshots were not applied");
+        require(countHook(economy, "borrowEconomyMarketsSnapshot") == 2
+                        && countHook(economy, "borrowEconomyCollectionSnapshot") == 1
+                        && countHook(economy, "borrowPersistentSnapshotTimed") == 0,
+                "fallback Economy snapshot selection changed");
+        assertScratchScope(economy, "advance", "(F)V");
+        assertScratchScope(economy, "advanceMarketConditionsWhenPaused", "(F)V");
+        byte[] economyAgain = new PrepatcherTransformer(fallbackOnly).transform(
+                null, PrepatcherTransformer.ECONOMY, null, null, economy);
+        require(economyAgain == null, "fallback Economy snapshots are not idempotent");
+
+        ClassNode unscopedEconomy = read(economy);
+        removeScratchScope(method(unscopedEconomy, "advance", "(F)V"));
+        String economyStatus = "starsector.prepatcher.patchStatus."
+                + PrepatcherTransformer.ECONOMY.replace('/', '.')
+                + ".economySnapshotReuse";
+        System.clearProperty(economyStatus);
+        byte[] unscopedEconomyResult = new PrepatcherTransformer(fallbackOnly).transform(
+                null, PrepatcherTransformer.ECONOMY, null, null,
+                write(unscopedEconomy));
+        require(unscopedEconomyResult == null,
+                "fallback Economy snapshots without a scratch scope were modified");
+        require("SKIPPED_STRUCTURAL".equals(System.getProperty(economyStatus)),
+                "fallback Economy snapshots without a scratch scope were accepted");
+
+        byte[] market = new PrepatcherTransformer(fallbackOnly).transform(
+                null, PrepatcherTransformer.MARKET, null, null,
+                classBytes(jarPaths, PrepatcherTransformer.MARKET));
+        require(market != null, "fallback Market snapshots were not applied");
+        require(countHook(market, "borrowEconomyCollectionSnapshot") == 2
+                        && countHook(market, "borrowPersistentSnapshotFrames") == 0,
+                "fallback Market snapshot selection changed");
+        assertScratchScope(market, "advance", "(F)V");
+        byte[] marketAgain = new PrepatcherTransformer(fallbackOnly).transform(
+                null, PrepatcherTransformer.MARKET, null, null, market);
+        require(marketAgain == null, "fallback Market snapshots are not idempotent");
+
+        ClassNode unscopedMarket = read(market);
+        removeScratchScope(method(unscopedMarket, "advance", "(F)V"));
+        String marketStatus = "starsector.prepatcher.patchStatus."
+                + PrepatcherTransformer.MARKET.replace('/', '.')
+                + ".economySnapshotReuse";
+        System.clearProperty(marketStatus);
+        byte[] unscopedMarketResult = new PrepatcherTransformer(fallbackOnly).transform(
+                null, PrepatcherTransformer.MARKET, null, null, write(unscopedMarket));
+        require(unscopedMarketResult == null,
+                "fallback Market snapshots without a scratch scope were modified");
+        require("SKIPPED_STRUCTURAL".equals(System.getProperty(marketStatus)),
+                "fallback Market snapshots without a scratch scope were accepted");
     }
 
     private static void runLoaderGuardTests(PrepatcherConfig config,
@@ -613,8 +699,17 @@ public final class StructuralCompatibilityTest {
         patches.put(PrepatcherTransformer.BASE_CAMPAIGN_ENTITY,
                 List.of("planetConditionMarketAdvanceBridge"));
         patches.put(PrepatcherTransformer.ECONOMY,
-                List.of("economyLocationCache", "economySnapshotReuse"));
-        patches.put(PrepatcherTransformer.MARKET, List.of("economySnapshotReuse"));
+                List.of("economyPersistentSnapshots", "economyLocationCache",
+                        "remoteMarketScheduler"));
+        patches.put(PrepatcherTransformer.MARKET,
+                List.of("economyPersistentSnapshots", "commodityTemporalFastPath",
+                        "directMarketObservation"));
+        patches.put(PrepatcherTransformer.BASE_INDUSTRY,
+                List.of("marketNoOpCallbacks"));
+        patches.put(PrepatcherTransformer.MUTABLE_STAT,
+                List.of("commodityTemporalBinding"));
+        patches.put(PrepatcherTransformer.MUTABLE_STAT_WITH_TEMP_MODS,
+                List.of("tempModExpiryScheduler"));
         patches.put(PrepatcherTransformer.COMMODITY_ON_MARKET,
                 List.of("commodityEventModDirtyCache"));
         patches.put(PrepatcherTransformer.INTEL_MANAGER, List.of("commRelaySystemIndex"));
@@ -644,9 +739,7 @@ public final class StructuralCompatibilityTest {
 
         Map<String, MethodKey> scoped = new LinkedHashMap<>();
         scoped.put(PrepatcherTransformer.ECONOMY, new MethodKey("advance", "(F)V",
-                "economySnapshotReuse"));
-        scoped.put(PrepatcherTransformer.MARKET, new MethodKey("advance", "(F)V",
-                "economySnapshotReuse"));
+                "remoteMarketScheduler"));
         scoped.put(PrepatcherTransformer.INTEL_MANAGER, new MethodKey(
                 "findNearestCommRelayToReceive",
                 "(Lcom/fs/starfarer/api/campaign/SectorEntityToken;)"
@@ -686,7 +779,8 @@ public final class StructuralCompatibilityTest {
                 new HookTamper("advancePlanetConditionMarketScheduled",
                         "planetConditionMarketAdvanceBridge"));
         latePostconditions.put(PrepatcherTransformer.ECONOMY,
-                new HookTamper("borrowEconomyCollectionSnapshot", "economySnapshotReuse"));
+                new HookTamper("borrowPersistentSnapshotTimed",
+                        "economyPersistentSnapshots"));
         latePostconditions.put(PrepatcherTransformer.SHIP,
                 new HookTamper("borrowShipListSnapshot", "shipAdvanceScratch"));
         latePostconditions.put(PrepatcherTransformer.DYNAMIC_PARTICLE_GROUP,
@@ -1004,18 +1098,37 @@ public final class StructuralCompatibilityTest {
                 // in real campaign telemetry.
             }
             case PrepatcherTransformer.ECONOMY -> {
-                expected.put("updateEconomyLocationMapIfNeeded", 1);
-                expected.put("borrowEconomyMarketsSnapshot", 2);
+                expected.put("updateEconomyLocationMapIfNeededPersistent", 1);
+                expected.put("borrowPersistentSnapshotTimed", 1);
                 expected.put("borrowEconomyCollectionSnapshot", 1);
                 expected.put("beginRemoteMarketFrame", 1);
                 expected.put("advanceMarketScheduled", 1);
+                expected.put("newPersistentSnapshotState", 2);
+                expected.put("markPersistentSnapshotStructure", 3);
             }
             case PrepatcherTransformer.MARKET -> {
-                expected.put("borrowEconomyCollectionSnapshot", 2);
+                expected.put("borrowPersistentSnapshotFrames", 2);
+                expected.put("newPersistentSnapshotState", 6);
+                expected.put("markPersistentSnapshotStructure", 6);
+                expected.put("advanceMarketCommodityTemporalState", 1);
                 expected.put("observeMarketAdvanceEntry", 1);
             }
+            case PrepatcherTransformer.BASE_INDUSTRY ->
+                    expected.put("isBaseIndustryDormantFastPathEligible", 1);
+            case PrepatcherTransformer.MUTABLE_STAT ->
+                    expected.put("markCommodityTemporalOwnerDirty", 14);
             case PrepatcherTransformer.COMMODITY_ON_MARKET -> {
                 // Inline dirty cache; no cross-loader hook is required.
+            }
+            case PrepatcherTransformer.MUTABLE_STAT_WITH_TEMP_MODS -> {
+                assertHookCount(bytes, TEMP_MOD_HOOKS, "recordHybridInitialSweep", 1);
+                assertHookCount(bytes, TEMP_MOD_HOOKS, "recordHybridExpirySweep", 1);
+                assertHookCount(bytes, TEMP_MOD_HOOKS, "recordHybridSynchronizationSweep", 1);
+                assertHookCount(bytes, TEMP_MOD_HOOKS, "recordHybridScheduleRebuild", 1);
+                assertHookCount(bytes, TEMP_MOD_HOOKS, "recordHybridExternalExposure", 1);
+                assertHookCount(bytes, TEMP_MOD_HOOKS, "recordHybridSubclassFallback", 1);
+                assertHookCount(bytes, TEMP_MOD_HOOKS, "recordHybridFailureFallback", 1);
+                assertHookCount(bytes, HOOKS, "markCommodityTemporalStatExposed", 2);
             }
             case PrepatcherTransformer.INTEL_MANAGER -> expected.put("commRelayCandidateSystems", 1);
             case PrepatcherTransformer.SHIP -> {
@@ -1109,12 +1222,20 @@ public final class StructuralCompatibilityTest {
         } else if (className.equals(PrepatcherTransformer.MEMORY)) {
             assertMemoryEmptyGuard(bytes);
         } else if (className.equals(PrepatcherTransformer.ECONOMY)) {
+            assertEconomyPersistentSnapshots(bytes);
             assertScratchScope(bytes, "advance", "(F)V");
             assertScratchScope(bytes, "advanceMarketConditionsWhenPaused", "(F)V");
         } else if (className.equals(PrepatcherTransformer.MARKET)) {
-            assertScratchScope(bytes, "advance", "(F)V");
+            assertMarketPersistentSnapshots(bytes);
+            assertMarketCommodityTemporalActiveSet(bytes);
+        } else if (className.equals(PrepatcherTransformer.BASE_INDUSTRY)) {
+            assertBaseIndustryDormantFastPath(bytes);
+        } else if (className.equals(PrepatcherTransformer.MUTABLE_STAT)) {
+            assertCommodityTemporalBinding(bytes);
         } else if (className.equals(PrepatcherTransformer.COMMODITY_ON_MARKET)) {
             assertCommodityEventModDirtyCache(bytes);
+        } else if (className.equals(PrepatcherTransformer.MUTABLE_STAT_WITH_TEMP_MODS)) {
+            assertTempModExpiryScheduler(bytes);
         } else if (className.equals(PrepatcherTransformer.INTEL_MANAGER)) {
             assertScratchScope(bytes, "findNearestCommRelayToReceive",
                     "(Lcom/fs/starfarer/api/campaign/SectorEntityToken;)"
@@ -1124,6 +1245,183 @@ public final class StructuralCompatibilityTest {
         } else if (className.equals(PrepatcherTransformer.DYNAMIC_PARTICLE_GROUP)) {
             assertScratchScope(bytes, "advance", "(F)V");
         }
+    }
+
+    private static void assertBaseIndustryDormantFastPath(byte[] bytes) {
+        ClassNode node = read(bytes);
+        int fieldAccess = Opcodes.ACC_PRIVATE | Opcodes.ACC_TRANSIENT | Opcodes.ACC_SYNTHETIC;
+        FieldNode state = requireField(node, "spp$marketNoOpState", "I");
+        FieldNode countdown = requireField(node, "spp$marketNoOpCountdown", "I");
+        require(state.access == fieldAccess && state.signature == null && state.value == null,
+                "BaseIndustry dormant state field metadata changed");
+        require(countdown.access == fieldAccess && countdown.signature == null
+                        && countdown.value == null,
+                "BaseIndustry dormant countdown field metadata changed");
+
+        MethodNode wrapper = method(node, "advance", "(F)V");
+        MethodNode raw = method(node, "spp$baseIndustryRawAdvance", "(F)V");
+        require((raw.access & (Opcodes.ACC_PRIVATE | Opcodes.ACC_SYNTHETIC))
+                        == (Opcodes.ACC_PRIVATE | Opcodes.ACC_SYNTHETIC),
+                "BaseIndustry raw advance metadata changed");
+        require(countCalls(wrapper, Opcodes.INVOKEVIRTUAL, node.name,
+                        "spp$baseIndustryRawAdvance", "(F)V") == 1,
+                "BaseIndustry wrapper raw call changed");
+        require(countCalls(wrapper, Opcodes.INVOKESTATIC, HOOKS,
+                        "isBaseIndustryDormantFastPathEligible", "(Ljava/lang/Object;)Z") == 1,
+                "BaseIndustry eligibility call changed");
+
+        MethodNode disrupted = method(node, "setDisrupted", "(FZ)V");
+        List<AbstractInsnNode> code = meaningfulInstructions(disrupted);
+        require(code.size() >= 6
+                        && code.get(0) instanceof VarInsnNode a0 && a0.getOpcode() == Opcodes.ALOAD
+                        && a0.var == 0
+                        && code.get(1).getOpcode() == Opcodes.ICONST_0
+                        && code.get(2) instanceof FieldInsnNode s && s.getOpcode() == Opcodes.PUTFIELD
+                        && s.owner.equals(node.name) && s.name.equals("spp$marketNoOpState")
+                        && code.get(3) instanceof VarInsnNode a1 && a1.getOpcode() == Opcodes.ALOAD
+                        && a1.var == 0
+                        && code.get(4).getOpcode() == Opcodes.ICONST_0
+                        && code.get(5) instanceof FieldInsnNode c && c.getOpcode() == Opcodes.PUTFIELD
+                        && c.owner.equals(node.name) && c.name.equals("spp$marketNoOpCountdown"),
+                "BaseIndustry setDisrupted wake prologue changed");
+    }
+
+    private static void assertMarketCommodityTemporalActiveSet(byte[] bytes) {
+        ClassNode node = read(bytes);
+        int fieldAccess = Opcodes.ACC_PRIVATE | Opcodes.ACC_TRANSIENT | Opcodes.ACC_SYNTHETIC;
+        FieldNode state = requireField(node, "smo$commodityTemporalState", "Ljava/lang/Object;");
+        require(state.access == fieldAccess && state.signature == null && state.value == null,
+                "Market commodity temporal state field metadata changed");
+        MethodNode advance = method(node, "advance", "(F)V");
+        require(countCalls(advance, Opcodes.INVOKESTATIC, HOOKS,
+                "advanceMarketCommodityTemporalState",
+                "(Ljava/lang/Object;Ljava/lang/Object;F)Ljava/lang/Object;") == 1,
+                "Market commodity temporal hook count changed");
+        require(countCalls(advance, Opcodes.INVOKEVIRTUAL, node.name,
+                "getCommodities", "()Ljava/util/List;") == 0,
+                "Market commodity temporal loop still calls getCommodities directly");
+    }
+
+    private static void assertCommodityTemporalBinding(byte[] bytes) {
+        ClassNode node = read(bytes);
+        int fieldAccess = Opcodes.ACC_PRIVATE | Opcodes.ACC_TRANSIENT | Opcodes.ACC_SYNTHETIC;
+        FieldNode owner = requireField(node, "spp$commodityTemporalOwner", "Ljava/lang/Object;");
+        FieldNode role = requireField(node, "spp$commodityTemporalRole", "I");
+        require(owner.access == fieldAccess && owner.signature == null && owner.value == null,
+                "MutableStat commodity owner field metadata changed");
+        require(role.access == fieldAccess && role.signature == null && role.value == null,
+                "MutableStat commodity role field metadata changed");
+        require(countHook(bytes, "markCommodityTemporalOwnerDirty") == 14,
+                "MutableStat commodity temporal dirty hook count changed");
+    }
+
+    private static void assertEconomyPersistentSnapshots(byte[] bytes) {
+        ClassNode node = read(bytes);
+        int fieldAccess = Opcodes.ACC_PRIVATE | Opcodes.ACC_TRANSIENT | Opcodes.ACC_SYNTHETIC;
+        FieldNode state = requireField(node, "smo$economyMarketsSnapshotState",
+                "Ljava/lang/Object;");
+        require(state.access == fieldAccess && state.signature == null && state.value == null,
+                "Economy persistent state field metadata changed");
+
+        MethodNode accessor = method(node, "smo$borrowPersistentMarketsSnapshot",
+                "()Ljava/util/List;");
+        require(accessor.access == (Opcodes.ACC_PRIVATE | Opcodes.ACC_SYNTHETIC),
+                "Economy persistent accessor metadata changed");
+        require(countCalls(accessor, Opcodes.INVOKESTATIC, HOOKS,
+                "borrowPersistentSnapshotTimed",
+                "(Ljava/lang/Object;Ljava/util/Collection;II)Ljava/util/ArrayList;") == 1,
+                "Economy persistent accessor hook changed");
+
+        MethodNode advance = method(node, "advance", "(F)V");
+        MethodNode paused = method(node, "advanceMarketConditionsWhenPaused", "(F)V");
+        require(countCalls(advance, Opcodes.INVOKEVIRTUAL, node.name,
+                accessor.name, accessor.desc) == 1,
+                "Economy.advance persistent market snapshot changed");
+        require(countCalls(paused, Opcodes.INVOKEVIRTUAL, node.name,
+                accessor.name, accessor.desc) == 1,
+                "Economy paused persistent market snapshot changed");
+        require(countCalls(advance, Opcodes.INVOKEVIRTUAL, node.name,
+                "getMarketsCopy", "()Ljava/util/List;") == 0
+                        && countCalls(paused, Opcodes.INVOKEVIRTUAL, node.name,
+                        "getMarketsCopy", "()Ljava/util/List;") == 0,
+                "Economy persistent snapshots left getMarketsCopy in a hot path");
+        require(countHook(bytes, "updateEconomyLocationMapIfNeeded") == 0,
+                "Economy retained the per-frame full-fingerprint location hook");
+        require(countHook(bytes, "borrowEconomyMarketsSnapshot") == 0,
+                "Economy retained old clear/addAll market snapshots");
+    }
+
+    private static void assertMarketPersistentSnapshots(byte[] bytes) {
+        ClassNode node = read(bytes);
+        int fieldAccess = Opcodes.ACC_PRIVATE | Opcodes.ACC_TRANSIENT | Opcodes.ACC_SYNTHETIC;
+        for (String fieldName : List.of("smo$marketConditionsSnapshotState",
+                "smo$marketIndustriesSnapshotState")) {
+            FieldNode state = requireField(node, fieldName, "Ljava/lang/Object;");
+            require(state.access == fieldAccess && state.signature == null && state.value == null,
+                    "Market persistent state field metadata changed: " + fieldName);
+        }
+        MethodNode conditions = method(node, "smo$borrowPersistentConditionsSnapshot",
+                "(Ljava/util/Collection;)Ljava/util/ArrayList;");
+        MethodNode industries = method(node, "smo$borrowPersistentIndustriesSnapshot",
+                "(Ljava/util/Collection;)Ljava/util/ArrayList;");
+        for (MethodNode accessor : List.of(conditions, industries)) {
+            require(accessor.access == (Opcodes.ACC_PRIVATE | Opcodes.ACC_SYNTHETIC),
+                    "Market persistent accessor metadata changed: " + accessor.name);
+            require(countCalls(accessor, Opcodes.INVOKESTATIC, HOOKS,
+                    "borrowPersistentSnapshotFrames",
+                    "(Ljava/lang/Object;Ljava/util/Collection;II)Ljava/util/ArrayList;") == 1,
+                    "Market persistent accessor hook changed: " + accessor.name);
+        }
+        MethodNode advance = method(node, "advance", "(F)V");
+        require(countCalls(advance, Opcodes.INVOKEVIRTUAL, node.name,
+                conditions.name, conditions.desc) == 1,
+                "Market conditions snapshot call changed");
+        require(countCalls(advance, Opcodes.INVOKEVIRTUAL, node.name,
+                industries.name, industries.desc) == 1,
+                "Market industries snapshot call changed");
+        require(countHook(bytes, "borrowEconomyCollectionSnapshot") == 0,
+                "Market retained old clear/addAll snapshots");
+    }
+
+    private static void assertTempModExpiryScheduler(byte[] bytes) {
+        ClassNode node = read(bytes);
+        int access = Opcodes.ACC_PRIVATE | Opcodes.ACC_TRANSIENT | Opcodes.ACC_SYNTHETIC;
+        String[][] fields = {
+                {"spp$tempModHybridDeferredDays", "F"},
+                {"spp$tempModHybridTimeToNext", "F"},
+                {"spp$tempModHybridScheduledMin", "F"},
+                {"spp$tempModHybridScheduledMinCount", "I"},
+                {"spp$tempModHybridKnownSize", "I"},
+                {"spp$tempModHybridFlags", "I"}
+        };
+        for (String[] spec : fields) {
+            FieldNode found = null;
+            for (FieldNode field : node.fields) {
+                if (!field.name.equals(spec[0])) continue;
+                require(found == null, "duplicate temp-mod hybrid field " + spec[0]);
+                found = field;
+            }
+            require(found != null, "temp-mod hybrid field missing: " + spec[0]);
+            require(found.access == access && found.desc.equals(spec[1])
+                            && found.signature == null && found.value == null,
+                    "temp-mod hybrid field shape changed: " + spec[0]);
+        }
+        for (FieldNode field : node.fields) {
+            require(!field.name.equals("spp$tempModExpiryState"),
+                    "legacy temp-mod scheduler state remains");
+        }
+        require(method(node, "spp$originalTempModAdvance", "(F)V") != null,
+                "temp-mod original advance missing");
+        require(method(node, "spp$tempModHybridApplyElapsed", "(FZZ)V") != null,
+                "temp-mod direct apply helper missing");
+        require(method(node, "spp$tempModHybridSynchronize", "()V") != null,
+                "temp-mod synchronization helper missing");
+        require(method(node, "spp$tempModHybridAuditForCommodity", "()V") != null,
+                "temp-mod commodity audit helper missing");
+        require(countHook(bytes, TEMP_MOD_HOOKS, "advance") == 0,
+                "legacy per-frame temp-mod hook remains");
+        require(countHook(bytes, TEMP_MOD_HOOKS, "recordHybridExpirySweep") == 1,
+                "hybrid expiry telemetry missing");
     }
 
     private static void assertCommodityEventModDirtyCache(byte[] bytes) {
@@ -1394,13 +1692,17 @@ public final class StructuralCompatibilityTest {
     private static void assertHookTargetsExist(byte[] transformed) {
         Map<String, Integer> hooks = hookMethods(HOOKS);
         Map<String, Integer> hyperspaceHooks = hookMethods(HYPERSPACE_HOOKS);
+        Map<String, Integer> tempModHooks = hookMethods(TEMP_MOD_HOOKS);
         ClassNode node = read(transformed);
         for (MethodNode method : node.methods) {
             for (AbstractInsnNode insn : method.instructions.toArray()) {
                 if (!(insn instanceof MethodInsnNode call)
-                        || (!call.owner.equals(HOOKS) && !call.owner.equals(HYPERSPACE_HOOKS))) continue;
+                        || (!call.owner.equals(HOOKS) && !call.owner.equals(HYPERSPACE_HOOKS)
+                        && !call.owner.equals(TEMP_MOD_HOOKS))) continue;
                 String key = call.name + call.desc;
-                Integer access = (call.owner.equals(HOOKS) ? hooks : hyperspaceHooks).get(key);
+                Map<String, Integer> ownerHooks = call.owner.equals(HOOKS) ? hooks
+                        : call.owner.equals(HYPERSPACE_HOOKS) ? hyperspaceHooks : tempModHooks;
+                Integer access = ownerHooks.get(key);
                 require(access != null, "missing runtime hook target " + key);
                 require(call.getOpcode() == Opcodes.INVOKESTATIC
                                 && (access & (Opcodes.ACC_PUBLIC | Opcodes.ACC_STATIC))
@@ -1454,6 +1756,17 @@ public final class StructuralCompatibilityTest {
         ClassWriter writer = new ClassWriter(ClassWriter.COMPUTE_MAXS);
         node.accept(writer);
         return writer.toByteArray();
+    }
+
+    private static FieldNode requireField(ClassNode node, String name, String desc) {
+        FieldNode found = null;
+        for (FieldNode field : node.fields) {
+            if (!field.name.equals(name) || !field.desc.equals(desc)) continue;
+            require(found == null, "field " + name + desc + " occurs more than once");
+            found = field;
+        }
+        require(found != null, "field " + name + desc + " is missing");
+        return found;
     }
 
     private static MethodNode method(ClassNode node, String name, String desc) {

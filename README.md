@@ -2,7 +2,7 @@
 
 [English](README.md) | [Русский](README_RU.md)
 
-Current version: **0.9.3**. Supported game build: **Starsector 0.98a-RC8**.
+Current version: **0.9.5**. Supported game build: **Starsector 0.98a-RC8**.
 
 [![Unplayable without Prepatcher versus smooth with Prepatcher](media/smoothness_comparison.gif)](https://github.com/kirpoly/StarsectorPrepatcher/releases/download/v0.8.0/StarsectorPrepatcher-0.8.0-comparison.webm)
 
@@ -20,7 +20,7 @@ The project has a broader direction than map optimization alone:
 - keep version-specific bytecode knowledge inside the prepatcher instead of duplicating it across
   gameplay mods.
 
-The public API is a roadmap item, not a published compatibility surface in `0.9.3`. Its intended
+The public API is a roadmap item, not a published compatibility surface in `0.9.5`. Its intended
 namespace is `com.starsector.prepatcher.api`; API types will only become supported once they are
 documented and covered by compatibility tests.
 
@@ -90,8 +90,12 @@ The prepatcher does not modify save data, and its runtime caches are never seria
   entity indexes, nebula metadata, scratch collections, and grid LOD;
 - campaign and economy: lifecycle-bound caches, listener refresh, reusable snapshots, aggressive
   staggered schedulers for central remote markets and planet-condition-only markets, corrected
-  observation of direct mod `Market.advance()` calls, repeated absent commodity event-mod removal
-  suppression, empty-script and empty-memory fast paths, and comm-relay candidates;
+  observation of direct mod `Market.advance()` calls, owner-local persistent copy-on-write
+  market/condition/industry snapshots with structure epochs and bounded audits, an owner-local
+  ReachEconomy fingerprint, an ordered inactive-commodity fast path combined with the direct
+  expiry-aware `MutableStatWithTempMods` scheduler, a guarded dormant inherited-`BaseIndustry`
+  fast path, repeated absent commodity event-mod removal suppression, empty-script and empty-memory
+  fast paths, and comm-relay candidates;
 - routing: ordered jump-point and system indexes with vanilla selection and fallback semantics;
 - combat and particles: internal scratch collections and stable deferred cleanup;
 - loading and save paths: literal parsing, progress redraw, and output-path fixes;
@@ -163,6 +167,6 @@ Build details are in [`BUILDING.md`](BUILDING.md).
 - [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md) — structural matching and fail-open rules;
 - [`docs/VALIDATION.md`](docs/VALIDATION.md) — regression and performance validation playbook;
 - [`docs/ROADMAP.md`](docs/ROADMAP.md) — structural discovery, architecture, tooling, and platform plan;
-- [`docs/releases/0.9.3.md`](docs/releases/0.9.3.md) — current detailed release report.
+- [`docs/releases/0.9.5.md`](docs/releases/0.9.5.md) — current detailed release report.
 
 StarsectorPrepatcher is distributed under the terms in [`LICENSE`](LICENSE).

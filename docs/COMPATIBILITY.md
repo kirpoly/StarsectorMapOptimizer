@@ -28,6 +28,7 @@ system/game loader
 ├─ com.fs.starfarer.api.StarsectorPrepatcherRuntimeBridge
 ├─ com.fs.starfarer.api.StarsectorPrepatcherHooks
 ├─ com.fs.starfarer.api.StarsectorPrepatcherHyperspaceHooks
+├─ com.fs.starfarer.api.StarsectorPrepatcherTempModHooks
 └─ com.fs.*                                transformed targets and argument types
 ```
 
@@ -92,6 +93,37 @@ known-disabled независимо от этого loader-исключения.
 Количество применённых и пропущенных патчей также экспортируется в system properties и
 показывается bootstrap-плагином в `starsector.log`.
 
+## MutableStatWithTempMods: принятая aggressive-семантика
+
+`patch.tempModExpiryScheduler` не меняет публичные methods, descriptors, тип `Map` или save graph.
+Transformer сохраняет exact vanilla bodies как private synthetic methods и добавляет в target только
+private transient scalar state. O(1) hot path не создаёт отдельный State object, не вызывает
+reflection и не обновляет atomic counters.
+
+Ближайший expiry ведётся покадровым `float countdown -= days`. Это намеренно повторяет vanilla
+округление для текущего minimum и исправляет расхождение прежнего double-clock scheduler. Один map
+pass на deadline одновременно materialize'ит survivors, удаляет due entries в `LinkedHashMap` order,
+вызывает `unmodify(source)` и строит следующий minimum/tie count. Условие
+`deferredDays >= scheduledMin` запрещено: оно способно удалить modifier на один frame раньше.
+
+Перед `addTemporaryMod*`, `removeTemporaryMod`, public `getMods` и `writeReplace` deferred state
+синхронизируется. `hasMod()` не materialize'ит survivor fields: deadline sweep уже удалил expired
+entries до возврата из `advance()`. После первого public `getMods()` конкретный stat permanently
+переходит на retained vanilla path, потому что external code может хранить и позже менять live map.
+То же происходит для subclass owner, необычного backing-map, прямой внешней смены размера и runtime
+anomaly. Fail-open локален одному экземпляру.
+
+Мод, который reflection'ом читает `TemporaryStatMod.timeRemaining` без публичного `getMods()`, между
+sync points увидит последнее материализованное значение. Для non-min survivors один aggregate float
+subtraction на sweep может отличаться на несколько ULP от всей последовательности vanilla
+subtractions; полностью устранить это без хранения/replay всей истории frame deltas нельзя. Exact
+float countdown гарантирован для текущего nearest deadline, tied minima и removal order; directed
+ULP fixtures входят в actual-agent regression suite.
+
+Все synthetic fields имеют `private transient synthetic`. `writeReplace()` сначала materialize'ит
+время; XStream smoke подтверждает, что поля scheduler не входят в XML/save, а загруженный object
+заново строит schedule лениво.
+
 ## Основные data-flow контракты
 
 - `H.renderStuff`: `LinkedHashMap.keySet() -> Set.retainAll(entityList)`, результат отбрасывается.
@@ -120,12 +152,31 @@ known-disabled независимо от этого loader-исключения.
   после restore/pause path и до обоих scans; expire iterator предшествует require iterator.
   Inline guard читает те же два поля, стоит после исходного pause-return и до clock conversion.
   Partial/raw-hook mixture, другой map receiver, изменённый порядок и лишние sites отвергаются.
+- Persistent Economy/Market snapshots: synthetic owner fields must be private, transient, and
+  initialized in constructors plus `readResolve`; `Market.clone()` receives independent state.
+  Transformed public mutators mark the exact owner epoch after a confirmed structural mutation.
+  Accessors return concrete `ArrayList` point-in-time snapshots. Rebuild is copy-on-write: an old
+  snapshot is never cleared or reused while an outer/nested callback may still iterate it. Direct
+  mutation of vanilla live lists bypasses epochs and is intentionally visible only at the configured
+  identity/order audit (`economy.structureAuditMs` or `market.structureAuditFrames`). Missing,
+  foreign, disabled, or malformed state fails open to a fresh `new ArrayList(source)`.
 - `CommodityOnMarket.reapplyEventMod`: принимается только точная vanilla-цепочка
   `getCombinedTradeModQuantity -> unmodifyFlat("eMod") -> getModValueForQuantity -> modifyFlat`
   с отдельной zero-quantity веткой и общим `RETURN`. Inline-патч добавляет один private transient
   synthetic known-absent flag. Nonzero-ветка сохраняет исходный порядок remove -> calculate ->
   conditional add; zero-ветка пропускает только повторное удаление после успешного remove.
   Partial/foreign shape отвергается.
+- `MutableStatWithTempMods`: принимаются exact `advance/getMods/getMod/removeTemporaryMod/hasMod/
+  writeReplace`, семь внутренних вызовов `getMods`, один iterator removal и один `unmodify(source)`.
+  Исходные тела переименовываются в private synthetic methods; wrappers обязаны синхронизировать
+  state перед mutation/read/save. Private transient state field, полная wrapper wiring и отсутствие
+  public `getMods` calls внутри raw methods входят в postcondition.
+- `BaseIndustry.advance`: exact base method должен содержать один `isDisrupted`, один
+  `disruptionFinished`, чтение `building/wasDisrupted` и запись `wasDisrupted`. Исходное тело
+  переносится в private synthetic raw method; wrapper допускает skip только после полного вызова,
+  exact class-eligibility и состояния `!building && !wasDisrupted`. `setDisrupted(FZ)` получает
+  branchless wake-prologue. Partial fields/raw method, неизвестный override contract или leaked
+  template owner дают `SKIPPED_STRUCTURAL`/vanilla fallback.
 - `CampaignEngine.setInstance/resetInstance`: существует единственное static поле типа
   `CampaignEngine`; `setInstance` записывает в него argument 0, а `resetInstance` — `null`.
   Begin-hooks с сохранением transition token должны непосредственно предшествовать подтверждённым
@@ -234,6 +285,13 @@ Runtime state keyed по identity `MarketAPI`, потому что vanilla `Mark
 - callback count и RNG sequence удалённых market plugins не считаются совместимым контрактом;
 - save boundary сначала применяет pending debt и только затем продолжает vanilla serialization.
 
+Все frame-count audit-и ниже scheduler-а считаются по реально доставленным callback attempts, а не
+по глобальным кадрам `Economy.advance()`: `commodity.temporalAuditFrames` и
+`market.structureAuditFrames` — по `Market.advance()`, `market.noOpIndustryAuditFrames` — по
+попыткам inherited `BaseIndustry.advance()` внутри него. Следовательно, remote cadence `4` и hidden
+cadence `8` могут увеличить wall-frame задержку этих audit-ов примерно в `4×`/`8×`; hot policy,
+safety caps и pre-save flush сокращают это окно. Это принято только для aggressive scheduler paths.
+
 ## Ограничения
 
 Статический анализ не может доказать намерение произвольного стороннего патча. Если target
@@ -251,6 +309,60 @@ Comm-relay index намеренно использует такой же bounded
 выполняется раз в `commRelay.indexTtlMs`. Владелец релиза явно принимает задержку до TTL для прямого
 перемещения или замены средней системы сторонним модом; vanilla distance/tag/memory/tie loop над
 возвращёнными candidates не меняется. Значение `0` отключает runtime index.
+
+Persistent economy snapshots intentionally accept bounded behavior changes for mods that mutate
+`Economy.getMarkets()`, `Market.getConditions()`, or `Market.getIndustries()` live lists directly
+instead of using the corresponding mutators. Standard transformed mutators and replacement of the
+backing list invalidate immediately; identity/order edits inside the same list may remain invisible
+until the audit. State is private/transient and owner-local, so reflection code that enumerates all
+declared members must ignore synthetic fields/methods. The optimized callbacks still receive the
+same eager ordered objects once a snapshot is rebuilt.
+
+### Dormant inherited BaseIndustry
+
+`patch.marketNoOpCallbacks` является явно aggressive-исключением из общего правила сохранения
+callback cadence. Он не затрагивает `MarketConditionPlugin`, `SubmarketPlugin`, custom Industry
+`advance()` или любой runtime class, который переопределяет `isDisrupted()`/`getDisruptedKey()`.
+Только exact inherited `BaseIndustry.advance()` после полного vanilla-вызова может перейти в dormant
+state.
+
+В dormant state wrapper каждый attempted market tick всё равно читает `building` и `wasDisrupted`.
+Обычный `setDisrupted()` сбрасывает state до выполнения исходного метода. Раз в
+`market.noOpIndustryAuditFrames` выполняется полный raw call, поэтому прямое изменение disruption
+memory в обход API имеет bounded visibility. Это намеренное изменение поведения: число вызовов
+унаследованного base callback уменьшается, а private-memory mutation может задержаться до audit.
+
+Class eligibility кэшируется через `ClassValue`, а per-instance state находится в двух private
+transient synthetic fields; глобальной strong/identity map нет. На fast path нет helper-call,
+reflection, counter или allocation. State не входит в save. Safe profile выключает patch.
+
+### Commodity temporal active set
+
+`patch.commodityTemporalFastPath` применяется только к точным vanilla `Market`,
+`CommodityOnMarket`, `MutableStat` и `MutableStatWithTempMods`. Market-state сохраняет исходный
+identity/order live commodity list; active subset всегда перестраивается в том же порядке.
+Публичные API signatures, callback cadence conditions/industries/submarkets и save graph не
+меняются.
+
+Standard MutableStat mutators немедленно ставят dirty bit через private owner/role binding. Binding
+допускает ровно одного owner: shared stat, повторная роль одного stat внутри commodity, subclass или
+foreign backing map переводят соответствующий entry на полный vanilla loop. Synthetic fields private
+and transient; reflection-код модов должен игнорировать synthetic members.
+
+Прямая mutation live map/list в обход штатного mutator обнаруживается bounded audit, а не
+same-frame. Public `getMods()` materialize'ит direct expiry state и оставляет конкретный stat на
+retained vanilla scheduler; market active set всё равно может исключить пустой exposed stat и снова
+активировать его после audit. Same-size direct replacement в середине deferred interval не содержит
+информации о точном моменте mutation, поэтому audit применяет накопленное elapsed время как
+агрегат. Это принято только в default/aggressive profile; safe profile отключает patch.
+
+Internal `eMod` notification подавляется, потому что это собственная запись
+`CommodityOnMarket.reapplyEventMod()`. Все прочие relevant mutations вызывают оригинальный
+`reapplyEventMod()` перед возвратом entry в inactive state. Если callback одного commodity меняет
+другой inactive commodity, второй допускается обработать на следующем market tick, а не позже в том
+же исходном list pass. Первый full audit staggered между markets; четыре high-volume counters sampled
+раз в 64 calls. Helper exception или lifecycle boundary unbind'ит state и использует vanilla
+fallback; ни один cache не сериализуется.
 
 Commodity event-mod cache предполагает, что vanilla-private source id `eMod` принадлежит
 `CommodityOnMarket.reapplyEventMod`. Прямая запись сторонним модом в `available` stat с тем же id
@@ -273,7 +385,7 @@ Telemetry schema `0.7.1`: старый `pooledRandom` называется `pool
 Structural proof показывает однозначность site, linkage, no-escape и verifier postconditions, но
 не доказывает величину ускорения. Runtime и performance evidence создаётся в `.build/reports/`, а
 проверенные выводы сохраняются в отчёте выпуска, например
-[`releases/0.9.3.md`](releases/0.9.3.md).
+[`releases/0.9.5.md`](releases/0.9.5.md).
 
 Если несколько javaagent меняют одни и те же классы, располагайте Prepatcher после них:
 transformer увидит bytes, возвращённые ранее зарегистрированными агентами. Installer обеспечивает

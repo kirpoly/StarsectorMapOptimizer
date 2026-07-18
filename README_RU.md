@@ -2,7 +2,7 @@
 
 [English](README.md) | [Русский](README_RU.md)
 
-Текущая версия: **0.9.3**. Поддерживаемая версия игры: **Starsector 0.98a-RC8**.
+Текущая версия: **0.9.5**. Поддерживаемая версия игры: **Starsector 0.98a-RC8**.
 
 [![Без препатчера и с ним](media/smoothness_comparison.gif)](https://github.com/kirpoly/StarsectorPrepatcher/releases/download/v0.8.0/StarsectorPrepatcher-0.8.0-comparison.webm)
 
@@ -21,7 +21,7 @@ StarsectorPrepatcher — compatibility-first слой ранних патчей 
 - хранить зависимое от версии игры знание о bytecode внутри prepatcher, а не размножать его по
   игровым модам.
 
-Публичный API в `0.9.3` ещё не выпущен и остаётся пунктом roadmap. Планируемый namespace —
+Публичный API в `0.9.5` ещё не выпущен и остаётся пунктом roadmap. Планируемый namespace —
 `com.starsector.prepatcher.api`; типы станут поддерживаемым контрактом только после появления
 документации и compatibility-тестов.
 
@@ -91,8 +91,12 @@ Prepatcher не изменяет формат сохранений, а его ru
   nebula metadata, scratch collections и grid LOD;
 - campaign и economy: lifecycle-bound кэши, listener refresh, reusable snapshots, агрессивные
   staggered scheduler'ы центральных удалённых рынков и `planetConditionMarketOnly`, исправленное
-  observation прямых mod-вызовов `Market.advance()`, подавление повторного удаления уже
-  отсутствующего commodity event mod, fast paths для пустых scripts/Memory и comm-relay candidates;
+  observation прямых mod-вызовов `Market.advance()`, owner-local persistent copy-on-write snapshots
+  markets/conditions/industries со structure epochs и bounded audit, owner-local ReachEconomy
+  fingerprint, ordered fast path неактивных commodities вместе с direct expiry-aware scheduler
+  `MutableStatWithTempMods`, guarded fast path для dormant-наследников `BaseIndustry`, подавление
+  повторного удаления уже отсутствующего commodity event mod, fast paths для пустых scripts/Memory
+  и comm-relay candidates;
 - routing: упорядоченные jump-point/system indexes с vanilla selection/fallback;
 - combat и particles: внутренние scratch collections и стабильная deferred cleanup;
 - loading/save: literal parsing, progress redraw и исправления output path;
@@ -166,6 +170,6 @@ classloader Faster Rendering. Сборка описана в [`BUILDING.md`](BUI
 - [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md) — structural matching и fail-open правила;
 - [`docs/VALIDATION.md`](docs/VALIDATION.md) — playbook регрессионных и performance-проверок;
 - [`docs/ROADMAP.md`](docs/ROADMAP.md) — план structural discovery, архитектуры, tooling и платформ;
-- [`docs/releases/0.9.3.md`](docs/releases/0.9.3.md) — подробный отчёт текущего выпуска.
+- [`docs/releases/0.9.5.md`](docs/releases/0.9.5.md) — подробный отчёт текущего выпуска.
 
 Условия распространения находятся в [`LICENSE`](LICENSE).

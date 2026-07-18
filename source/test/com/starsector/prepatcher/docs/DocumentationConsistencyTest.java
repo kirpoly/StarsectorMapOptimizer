@@ -408,9 +408,15 @@ public final class DocumentationConsistencyTest {
         List<String> reports = List.of(
                 "documentation-consistency.txt",
                 "structural-verification.txt",
+                "direct-market-transformer.txt",
                 "runtime-regression.txt",
+                "temp-mod-actual-agent-smoke.txt",
+                "commodity-temporal-agent-smoke.txt",
+                "market-noop-actual-agent-smoke.txt",
+                "temp-mod-xstream-save-smoke.txt",
                 "hyperspace-verification.txt",
-                "startup-smoke.txt");
+                "startup-smoke.txt",
+                "faster-rendering-loader-smoke.txt");
         for (Map.Entry<String, String> script : scripts.entrySet()) {
             String text = readUtf8(requiredFile(root.resolve(script.getKey())));
             require(text.contains(script.getValue()),

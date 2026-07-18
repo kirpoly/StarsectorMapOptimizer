@@ -31,7 +31,9 @@ $testCp = @(
     (Join-Path $core 'fs.common_obf.jar'),
     (Join-Path $core 'fs.sound_obf.jar'),
     (Join-Path $core 'lwjgl.jar'),
-    (Join-Path $core 'lwjgl_util.jar')
+    (Join-Path $core 'lwjgl_util.jar'),
+    (Join-Path $core 'xstream-1.4.10.jar'),
+    (Join-Path $core 'jaxb-api-2.4.0-b180830.0359.jar')
 ) -join [IO.Path]::PathSeparator
 $frSmokeSource = Join-Path $modRoot `
     'source\test\com\starsector\prepatcher\fr\FasterRenderingLoaderSmokeTest.java'
@@ -131,7 +133,9 @@ $runtimeCp = @(
     (Join-Path $core 'fs.common_obf.jar'),
     (Join-Path $core 'fs.sound_obf.jar'),
     (Join-Path $core 'lwjgl.jar'),
-    (Join-Path $core 'lwjgl_util.jar')
+    (Join-Path $core 'lwjgl_util.jar'),
+    (Join-Path $core 'xstream-1.4.10.jar'),
+    (Join-Path $core 'jaxb-api-2.4.0-b180830.0359.jar')
 ) -join [IO.Path]::PathSeparator
 $runtimeReport = Join-Path $reportDir 'runtime-regression.txt'
 $runtimeLines = [System.Collections.Generic.List[string]]::new()
@@ -141,6 +145,9 @@ foreach ($test in @(
     'com.starsector.prepatcher.runtime.Exp8RuntimeRegressionTest',
     'com.starsector.prepatcher.runtime.RemoteMarketSchedulerRuntimeTest',
     'com.starsector.prepatcher.runtime.DirectMarketObservationRuntimeTest',
+    'com.starsector.prepatcher.runtime.PersistentEconomyRuntimeRegressionTest',
+    'com.starsector.prepatcher.runtime.MarketNoOpRuntimeRegressionTest',
+    'com.starsector.prepatcher.runtime.TempModExpiryRuntimeRegressionTest',
     'com.starsector.prepatcher.runtime.LoadingSaveRuntimeRegressionTest'
 )) {
     $runtimeLines.Add("== $test ==")
@@ -160,6 +167,116 @@ foreach ($test in @(
 $runtimeLines
 [IO.File]::WriteAllLines($runtimeReport, $runtimeLines, $utf8)
 
+$mainAgentJar = Join-Path $modRoot 'agent\StarsectorPrepatcherAgent.jar'
+$tempModAgentReport = Join-Path $reportDir 'temp-mod-actual-agent-smoke.txt'
+$ErrorActionPreference = 'Continue'
+try {
+    $tempModAgentOutput = @(& java `
+        '-Dstarsector.prepatcher.sessionOrigin=temp-mod-smoke' `
+        "-javaagent:$mainAgentJar" -cp $runtimeCp `
+        com.starsector.prepatcher.runtime.TempModActualAgentSmokeTest 2>&1)
+    $tempModAgentExitCode = $LASTEXITCODE
+} finally {
+    $ErrorActionPreference = $savedErrorActionPreference
+}
+$tempModAgentLines = @($tempModAgentOutput | ForEach-Object { $_.ToString() })
+$tempModAgentLines
+[IO.File]::WriteAllLines($tempModAgentReport, [string[]] $tempModAgentLines, $utf8)
+if ($tempModAgentExitCode -ne 0) { throw 'Temp-mod actual-agent smoke failed.' }
+
+$commoditySmokeConfig = Join-Path $build 'commodity-temporal-agent-smoke.properties'
+$commoditySmokeText = [IO.File]::ReadAllText((Join-Path $modRoot 'prepatcher.properties'))
+$commoditySmokeText = [regex]::Replace(
+    $commoditySmokeText,
+    '(?m)^(patch\.[^=\r\n]+)=.*$',
+    { param($match) $match.Groups[1].Value + '=false' })
+$commoditySmokeText = [regex]::Replace(
+    $commoditySmokeText,
+    '(?m)^patch\.commodityTemporalFastPath=false$',
+    'patch.commodityTemporalFastPath=true')
+$commoditySmokeText = [regex]::Replace(
+    $commoditySmokeText,
+    '(?m)^commodity\.temporalAuditFrames=.*$',
+    'commodity.temporalAuditFrames=7')
+$commoditySmokeText = [regex]::Replace(
+    $commoditySmokeText,
+    '(?m)^logging\.statsIntervalSeconds=.*$',
+    'logging.statsIntervalSeconds=0')
+[IO.File]::WriteAllText($commoditySmokeConfig, $commoditySmokeText, $utf8)
+
+$commodityTemporalAgentReport = Join-Path $reportDir 'commodity-temporal-agent-smoke.txt'
+$ErrorActionPreference = 'Continue'
+try {
+    $commodityTemporalAgentOutput = @(& java `
+        "-javaagent:$mainAgentJar=config=$commoditySmokeConfig" -cp $runtimeCp `
+        com.starsector.prepatcher.runtime.CommodityTemporalAgentSmokeTest 2>&1)
+    $commodityTemporalAgentExitCode = $LASTEXITCODE
+} finally {
+    $ErrorActionPreference = $savedErrorActionPreference
+}
+$commodityTemporalAgentLines = @($commodityTemporalAgentOutput | ForEach-Object { $_.ToString() })
+$commodityTemporalAgentLines
+[IO.File]::WriteAllLines($commodityTemporalAgentReport, [string[]] $commodityTemporalAgentLines, $utf8)
+if ($commodityTemporalAgentExitCode -ne 0) { throw 'Commodity-temporal actual-agent smoke failed.' }
+
+# Exercise the direct dormant BaseIndustry wrapper in isolation. The test
+# expects exactly two skipped callbacks between full vanilla audits.
+$marketNoOpSmokeConfig = Join-Path $build 'market-noop-agent-smoke.properties'
+$marketNoOpSmokeText = [IO.File]::ReadAllText((Join-Path $modRoot 'prepatcher.properties'))
+$marketNoOpSmokeText = [regex]::Replace(
+    $marketNoOpSmokeText,
+    '(?m)^(patch\.[^=\r\n]+)=.*$',
+    { param($match) $match.Groups[1].Value + '=false' })
+$marketNoOpSmokeText = [regex]::Replace(
+    $marketNoOpSmokeText,
+    '(?m)^patch\.marketNoOpCallbacks=false$',
+    'patch.marketNoOpCallbacks=true')
+$marketNoOpSmokeText = [regex]::Replace(
+    $marketNoOpSmokeText,
+    '(?m)^market\.noOpIndustryAuditFrames=.*$',
+    'market.noOpIndustryAuditFrames=2')
+$marketNoOpSmokeText = [regex]::Replace(
+    $marketNoOpSmokeText,
+    '(?m)^logging\.statsIntervalSeconds=.*$',
+    'logging.statsIntervalSeconds=0')
+[IO.File]::WriteAllText($marketNoOpSmokeConfig, $marketNoOpSmokeText, $utf8)
+
+$marketNoOpAgentReport = Join-Path $reportDir 'market-noop-actual-agent-smoke.txt'
+$ErrorActionPreference = 'Continue'
+try {
+    $marketNoOpAgentOutput = @(& java `
+        "-javaagent:$mainAgentJar=config=$marketNoOpSmokeConfig" -cp $runtimeCp `
+        com.starsector.prepatcher.runtime.MarketNoOpActualAgentSmokeTest 2>&1)
+    $marketNoOpAgentExitCode = $LASTEXITCODE
+} finally {
+    $ErrorActionPreference = $savedErrorActionPreference
+}
+$marketNoOpAgentLines = @($marketNoOpAgentOutput | ForEach-Object { $_.ToString() })
+$marketNoOpAgentLines
+[IO.File]::WriteAllLines($marketNoOpAgentReport, [string[]] $marketNoOpAgentLines, $utf8)
+if ($marketNoOpAgentExitCode -ne 0) { throw 'Market no-op actual-agent smoke failed.' }
+
+$tempModXStreamReport = Join-Path $reportDir 'temp-mod-xstream-save-smoke.txt'
+$ErrorActionPreference = 'Continue'
+try {
+    $tempModXStreamOutput = @(& java `
+        '--add-opens=java.base/java.util=ALL-UNNAMED' `
+        '--add-opens=java.base/java.lang.reflect=ALL-UNNAMED' `
+        '--add-opens=java.base/java.text=ALL-UNNAMED' `
+        '--add-opens=java.desktop/java.awt.font=ALL-UNNAMED' `
+        '--add-opens=java.desktop/java.awt=ALL-UNNAMED' `
+        '-Dstarsector.prepatcher.sessionOrigin=temp-mod-xstream' `
+        "-javaagent:$mainAgentJar" -cp $runtimeCp `
+        com.starsector.prepatcher.runtime.TempModXStreamSaveSmokeTest 2>&1)
+    $tempModXStreamExitCode = $LASTEXITCODE
+} finally {
+    $ErrorActionPreference = $savedErrorActionPreference
+}
+$tempModXStreamLines = @($tempModXStreamOutput | ForEach-Object { $_.ToString() })
+$tempModXStreamLines
+[IO.File]::WriteAllLines($tempModXStreamReport, [string[]] $tempModXStreamLines, $utf8)
+if ($tempModXStreamExitCode -ne 0) { throw 'Temp-mod XStream save smoke failed.' }
+
 $hyperReport = Join-Path $reportDir 'hyperspace-verification.txt'
 $ErrorActionPreference = 'Continue'
 try {
@@ -174,7 +291,6 @@ $hyperLines
 if ($hyperExitCode -ne 0) { throw 'Hyperspace offline verification failed.' }
 
 $startupReport = Join-Path $reportDir 'startup-smoke.txt'
-$mainAgentJar = Join-Path $modRoot 'agent\StarsectorPrepatcherAgent.jar'
 $ErrorActionPreference = 'Continue'
 try {
     $startupOutput = @(& java '-Dstarsector.prepatcher.sessionOrigin=startup-smoke' "-javaagent:$mainAgentJar" -version 2>&1)

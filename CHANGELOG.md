@@ -16,7 +16,96 @@
 
 ## [Unreleased]
 
-Пока нет пользовательских изменений после `0.9.3`.
+## [0.9.5] - 2026-07-18
+
+### Объединено
+
+- Параллельная ветка no-op market callbacks объединена с `0.9.4` в один unified transformer и один
+  startup-javaagent. Полная замена `Market.advance()` и отдельный helper-agent не используются.
+- Полезная industry-идея переработана в прямой dormant fast path внутри exact
+  `BaseIndustry.advance(float)`: исходное тело сохранено как private synthetic raw method, а
+  per-instance state хранится в двух private transient synthetic полях.
+
+### Изменено
+
+- После полного vanilla-вызова inherited `BaseIndustry.advance()` может пропускаться, пока
+  `building=false`, `wasDisrupted=false` и не наступил `market.noOpIndustryAuditFrames`.
+- `BaseIndustry.setDisrupted(float, boolean)` немедленно сбрасывает dormant state до выполнения
+  исходного метода. Custom `advance`, `isDisrupted` и `getDisruptedKey` остаются на полном vanilla
+  cadence.
+- Пустые inherited `BaseMarketConditionPlugin.advance()` намеренно не перехватываются: отдельный
+  classifying helper оказался дороже самого пустого virtual callback.
+
+### Совместимость
+
+- Публичный API и save graph не изменены; synthetic state transient. На fast path отсутствуют
+  reflection, global `IdentityHashMap`, helper-call, allocation и per-call telemetry counter.
+- Мод, который меняет private disruption memory в обход `setDisrupted()`, может быть замечен только
+  на bounded audit. Это осознанная aggressive-семантика; safe profile выключает патч.
+- Structural mismatch, partial prior patch или неизвестный override contract оставляют
+  `BaseIndustry` vanilla без отключения других блоков.
+
+### Проверено
+
+- Structural retained-body/postcondition и `setDisrupted` wake-prologue.
+- Actual-javaagent smoke с dormant skip, periodic audit, immediate disruption wake и custom override
+  fallbacks; building guard проверяется structural postcondition.
+- Runtime config/classification suite, API snapshot, ASM `BasicVerifier`, lifecycle/save/hyperspace и
+  startup regressions.
+
+Подробности: [отчёт о выпуске 0.9.5](docs/releases/0.9.5.md).
+
+## [0.9.4] - 2026-07-18
+
+### Объединено
+
+- В unified transformer интегрирована параллельная ветка commodity temporal active set. Она
+  работает поверх одновременно интегрированного direct `MutableStatWithTempMods` hybrid и не устанавливает второй
+  javaagent и не заменяет игровой класс целиком.
+- `Market.advance()` теперь хранит private transient ordered state и не выполняет четыре
+  `MutableStatWithTempMods.advance()` плюс `CommodityOnMarket.reapplyEventMod()` для commodities,
+  у которых нет временных modifiers и не было изменений relevant stats.
+
+### Добавлено
+
+- `patch.commodityTemporalFastPath` с bounded audit `commodity.temporalAuditFrames`.
+- Private transient owner/role binding в точном vanilla `MutableStat`: обычные `modify*`,
+  `unmodify*`, `setBaseValue` и temporary-mod mutators немедленно будят owning commodity.
+- Private audit bridge к direct expiry scheduler: periodic market audit материализует или
+  перестраивает nearest-deadline state и восстанавливает работу после прямых map-изменений,
+  обнаруживаемых без штатного mutator.
+- Первый audit deadline разнесён между markets; high-volume telemetry обновляется выборочно раз в
+  64 market calls, чтобы статистика не стала новым economy hot path.
+- Active set автоматически устанавливает direct temp-mod scheduler как зависимость даже при
+  случайно выключенном отдельном `patch.tempModExpiryScheduler`.
+- Actual-javaagent smoke для совместной загрузки `Market`, `CommodityOnMarket`, `MutableStat` и
+  `MutableStatWithTempMods`, включая stable skip, dirty wake-up, exact expiry и retained-map audit.
+
+### Исправлено
+
+- Переписанный `CommodityOnMarket.reapplyEventMod()` теперь содержит корректные stack-map frames.
+  Ранее offline `BasicVerifier` принимал method, но фактическая JVM могла выдать `VerifyError` при
+  первом определении класса; новый actual-agent smoke закрывает этот пробел.
+- XStream test дополнительно проверяет, что commodity owner/role bindings не попадают в save и не
+  восстанавливаются после load.
+
+### Совместимость
+
+- Порядок live commodities, точный `ArrayList`/`LinkedHashMap` behavior и исходные методы
+  `reapplyEventMod()`/`MutableStatWithTempMods.advance()` сохранены; subclasses, shared stats,
+  неизвестные backing maps и helper failures используют vanilla fallback.
+- Обычные API-mutations видны следующему `Market.advance()` немедленно. Мод, сохраняющий live map
+  из `getMods()` и меняющий её позже в обход API, может быть обнаружен только на bounded audit;
+  это намеренный aggressive-profile компромисс.
+- Safe profile оставляет active set выключенным. Формат сохранений и публичный API не изменены.
+
+### Проверено
+
+- Structural/negative/idempotency suite: 30 transformed classes, 1886 verified concrete methods.
+- Actual-javaagent commodity smoke, direct temp-mod differential/float fixtures, XStream save/load,
+  persistent economy, lifecycle/GC, loading/save, hyperspace и startup suites.
+
+Подробности: [отчёт о выпуске 0.9.4](docs/releases/0.9.4.md).
 
 ## [0.9.3] - 2026-07-18
 

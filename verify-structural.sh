@@ -19,7 +19,7 @@ bash "$MOD_ROOT/build-agent.sh"
 rm -rf "$TEST_CLASSES" "$FR_SMOKE_CLASSES"
 mkdir -p "$TEST_CLASSES" "$FR_SMOKE_CLASSES" "$REPORT_DIR"
 
-TEST_CP="$AGENT_CLASSES:$CORE/starfarer.api.jar:$CORE/starfarer_obf.jar:$CORE/fs.common_obf.jar:$CORE/fs.sound_obf.jar:$CORE/lwjgl.jar:$CORE/lwjgl_util.jar"
+TEST_CP="$AGENT_CLASSES:$CORE/starfarer.api.jar:$CORE/starfarer_obf.jar:$CORE/fs.common_obf.jar:$CORE/fs.sound_obf.jar:$CORE/lwjgl.jar:$CORE/lwjgl_util.jar:$CORE/xstream-1.4.10.jar:$CORE/jaxb-api-2.4.0-b180830.0359.jar"
 FR_SMOKE_SOURCE="$MOD_ROOT/source/test/com/starsector/prepatcher/fr/FasterRenderingLoaderSmokeTest.java"
 find "$MOD_ROOT/source/test" -name '*.java' ! -path "$FR_SMOKE_SOURCE" -print0 | \
   xargs -0 javac -encoding UTF-8 -source 17 -target 17 \
@@ -62,7 +62,7 @@ java "${EXPORTS[@]}" -cp "$TEST_CLASSES:$TEST_CP" \
   com.starsector.prepatcher.agent.DirectMarketObserveTransformerTest \
   2>&1 | tee "$REPORT_DIR/direct-market-transformer.txt"
 
-RUNTIME_CP="$TEST_CLASSES:$MOD_ROOT/agent/StarsectorPrepatcherAgent.jar:$CORE/starfarer.api.jar:$CORE/starfarer_obf.jar:$CORE/fs.common_obf.jar:$CORE/fs.sound_obf.jar:$CORE/lwjgl.jar:$CORE/lwjgl_util.jar"
+RUNTIME_CP="$TEST_CLASSES:$MOD_ROOT/agent/StarsectorPrepatcherAgent.jar:$CORE/starfarer.api.jar:$CORE/starfarer_obf.jar:$CORE/fs.common_obf.jar:$CORE/fs.sound_obf.jar:$CORE/lwjgl.jar:$CORE/lwjgl_util.jar:$CORE/xstream-1.4.10.jar:$CORE/jaxb-api-2.4.0-b180830.0359.jar"
 {
   echo '== LifecycleGcRegressionTest =='
   java -cp "$RUNTIME_CP" com.starsector.prepatcher.runtime.LifecycleGcRegressionTest
@@ -74,9 +74,67 @@ RUNTIME_CP="$TEST_CLASSES:$MOD_ROOT/agent/StarsectorPrepatcherAgent.jar:$CORE/st
   java -cp "$RUNTIME_CP" com.starsector.prepatcher.runtime.RemoteMarketSchedulerRuntimeTest
   echo '== DirectMarketObservationRuntimeTest =='
   java -cp "$RUNTIME_CP" com.starsector.prepatcher.runtime.DirectMarketObservationRuntimeTest
+  echo '== PersistentEconomyRuntimeRegressionTest =='
+  java -cp "$RUNTIME_CP" com.starsector.prepatcher.runtime.PersistentEconomyRuntimeRegressionTest
+  echo '== MarketNoOpRuntimeRegressionTest =='
+  java -cp "$RUNTIME_CP" com.starsector.prepatcher.runtime.MarketNoOpRuntimeRegressionTest
+  echo '== TempModExpiryRuntimeRegressionTest =='
+  java -cp "$RUNTIME_CP" com.starsector.prepatcher.runtime.TempModExpiryRuntimeRegressionTest
   echo '== LoadingSaveRuntimeRegressionTest =='
   java -cp "$RUNTIME_CP" com.starsector.prepatcher.runtime.LoadingSaveRuntimeRegressionTest
 } 2>&1 | tee "$REPORT_DIR/runtime-regression.txt"
+
+java \
+  -Dstarsector.prepatcher.sessionOrigin=temp-mod-smoke \
+  "-javaagent:$MOD_ROOT/agent/StarsectorPrepatcherAgent.jar" \
+  -cp "$RUNTIME_CP" \
+  com.starsector.prepatcher.runtime.TempModActualAgentSmokeTest \
+  2>&1 | tee "$REPORT_DIR/temp-mod-actual-agent-smoke.txt"
+
+# Exercise the active-set dependency contract with every other patch, including
+# the standalone temp-mod switch, disabled. The transformer must still install
+# its direct scheduler because the Market active set depends on it.
+COMMODITY_SMOKE_CONFIG="$BUILD/commodity-temporal-agent-smoke.properties"
+sed -E \
+  -e 's/^(patch\.[^=]+)=.*/\1=false/' \
+  -e 's/^commodity\.temporalAuditFrames=.*/commodity.temporalAuditFrames=7/' \
+  -e 's/^logging\.statsIntervalSeconds=.*/logging.statsIntervalSeconds=0/' \
+  "$MOD_ROOT/prepatcher.properties" | \
+  sed -E 's/^patch\.commodityTemporalFastPath=false/patch.commodityTemporalFastPath=true/' \
+  > "$COMMODITY_SMOKE_CONFIG"
+java \
+  "-javaagent:$MOD_ROOT/agent/StarsectorPrepatcherAgent.jar=config=$COMMODITY_SMOKE_CONFIG" \
+  -cp "$RUNTIME_CP" \
+  com.starsector.prepatcher.runtime.CommodityTemporalAgentSmokeTest \
+  2>&1 | tee "$REPORT_DIR/commodity-temporal-agent-smoke.txt"
+
+# Exercise the direct dormant BaseIndustry wrapper in isolation. The test
+# expects exactly two skipped callbacks between full vanilla audits.
+MARKET_NOOP_SMOKE_CONFIG="$BUILD/market-noop-agent-smoke.properties"
+sed -E \
+  -e 's/^(patch\.[^=]+)=.*/\1=false/' \
+  -e 's/^market\.noOpIndustryAuditFrames=.*/market.noOpIndustryAuditFrames=2/' \
+  -e 's/^logging\.statsIntervalSeconds=.*/logging.statsIntervalSeconds=0/' \
+  "$MOD_ROOT/prepatcher.properties" | \
+  sed -E 's/^patch\.marketNoOpCallbacks=false/patch.marketNoOpCallbacks=true/' \
+  > "$MARKET_NOOP_SMOKE_CONFIG"
+java \
+  "-javaagent:$MOD_ROOT/agent/StarsectorPrepatcherAgent.jar=config=$MARKET_NOOP_SMOKE_CONFIG" \
+  -cp "$RUNTIME_CP" \
+  com.starsector.prepatcher.runtime.MarketNoOpActualAgentSmokeTest \
+  2>&1 | tee "$REPORT_DIR/market-noop-actual-agent-smoke.txt"
+
+java \
+  --add-opens=java.base/java.util=ALL-UNNAMED \
+  --add-opens=java.base/java.lang.reflect=ALL-UNNAMED \
+  --add-opens=java.base/java.text=ALL-UNNAMED \
+  --add-opens=java.desktop/java.awt.font=ALL-UNNAMED \
+  --add-opens=java.desktop/java.awt=ALL-UNNAMED \
+  -Dstarsector.prepatcher.sessionOrigin=temp-mod-xstream \
+  "-javaagent:$MOD_ROOT/agent/StarsectorPrepatcherAgent.jar" \
+  -cp "$RUNTIME_CP" \
+  com.starsector.prepatcher.runtime.TempModXStreamSaveSmokeTest \
+  2>&1 | tee "$REPORT_DIR/temp-mod-xstream-save-smoke.txt"
 
 java "${EXPORTS[@]}" \
   -Dstarsector.prepatcher.sessionOrigin=structural-hyperspace \

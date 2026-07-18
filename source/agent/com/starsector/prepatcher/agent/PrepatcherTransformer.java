@@ -12,12 +12,15 @@ import jdk.internal.org.objectweb.asm.tree.FrameNode;
 import jdk.internal.org.objectweb.asm.tree.InsnList;
 import jdk.internal.org.objectweb.asm.tree.IntInsnNode;
 import jdk.internal.org.objectweb.asm.tree.InsnNode;
+import jdk.internal.org.objectweb.asm.tree.InvokeDynamicInsnNode;
 import jdk.internal.org.objectweb.asm.tree.JumpInsnNode;
 import jdk.internal.org.objectweb.asm.tree.LabelNode;
 import jdk.internal.org.objectweb.asm.tree.LdcInsnNode;
+import jdk.internal.org.objectweb.asm.tree.LocalVariableNode;
 import jdk.internal.org.objectweb.asm.tree.LookupSwitchInsnNode;
 import jdk.internal.org.objectweb.asm.tree.MethodInsnNode;
 import jdk.internal.org.objectweb.asm.tree.MethodNode;
+import jdk.internal.org.objectweb.asm.tree.MultiANewArrayInsnNode;
 import jdk.internal.org.objectweb.asm.tree.TableSwitchInsnNode;
 import jdk.internal.org.objectweb.asm.tree.TypeInsnNode;
 import jdk.internal.org.objectweb.asm.tree.TryCatchBlockNode;
@@ -30,6 +33,8 @@ import jdk.internal.org.objectweb.asm.tree.analysis.Frame;
 import jdk.internal.org.objectweb.asm.tree.analysis.SourceInterpreter;
 import jdk.internal.org.objectweb.asm.tree.analysis.SourceValue;
 
+import java.io.IOException;
+import java.io.InputStream;
 import java.lang.instrument.ClassFileTransformer;
 import java.security.ProtectionDomain;
 import java.util.ArrayList;
@@ -51,6 +56,8 @@ import java.util.concurrent.atomic.AtomicInteger;
 public final class PrepatcherTransformer implements ClassFileTransformer {
     private static final String HOOKS =
             "com/fs/starfarer/api/StarsectorPrepatcherHooks";
+    private static final String TEMP_MOD_HOOKS =
+            "com/fs/starfarer/api/StarsectorPrepatcherTempModHooks";
     static final String H = "com/fs/starfarer/coreui/A/H";
     static final String A = "com/fs/starfarer/coreui/A/A";
     static final String Z = "com/fs/starfarer/coreui/A/Z";
@@ -62,8 +69,27 @@ public final class PrepatcherTransformer implements ClassFileTransformer {
     static final String MEMORY = "com/fs/starfarer/campaign/rules/Memory";
     static final String ECONOMY = "com/fs/starfarer/campaign/econ/Economy";
     static final String MARKET = "com/fs/starfarer/campaign/econ/Market";
+    static final String BASE_INDUSTRY =
+            "com/fs/starfarer/api/impl/campaign/econ/impl/BaseIndustry";
     static final String COMMODITY_ON_MARKET =
             "com/fs/starfarer/campaign/econ/CommodityOnMarket";
+    private static final String ECONOMY_PERSISTENT_STATE_FIELD =
+            "smo$economyMarketsSnapshotState";
+    private static final String ECONOMY_PERSISTENT_ACCESSOR =
+            "smo$borrowPersistentMarketsSnapshot";
+    private static final String MARKET_CONDITIONS_STATE_FIELD =
+            "smo$marketConditionsSnapshotState";
+    private static final String MARKET_INDUSTRIES_STATE_FIELD =
+            "smo$marketIndustriesSnapshotState";
+    private static final String MARKET_CONDITIONS_ACCESSOR =
+            "smo$borrowPersistentConditionsSnapshot";
+    private static final String MARKET_INDUSTRIES_ACCESSOR =
+            "smo$borrowPersistentIndustriesSnapshot";
+    private static final String PERSISTENT_STATE_DESC = "Ljava/lang/Object;";
+    static final String MUTABLE_STAT =
+            "com/fs/starfarer/api/combat/MutableStat";
+    static final String MUTABLE_STAT_WITH_TEMP_MODS =
+            "com/fs/starfarer/api/combat/MutableStatWithTempMods";
     static final String INTEL_MANAGER = "com/fs/starfarer/campaign/comms/v2/IntelManager";
     static final String SHIP = "com/fs/starfarer/combat/entities/Ship";
     static final String DYNAMIC_PARTICLE_GROUP = "com/fs/graphics/particle/DynamicParticleGroup";
@@ -78,7 +104,8 @@ public final class PrepatcherTransformer implements ClassFileTransformer {
     static final String CAMPAIGN_GAME_MANAGER = "com/fs/starfarer/campaign/save/CampaignGameManager";
     static final Set<String> TARGET_CLASSES = Set.of(H, A, Z, EVENTS, CAMPAIGN_ENGINE,
             COURSE_WIDGET, BASE_LOCATION, BASE_CAMPAIGN_ENTITY, MEMORY, ECONOMY,
-            MARKET, COMMODITY_ON_MARKET, INTEL_MANAGER, SHIP,
+            MARKET, BASE_INDUSTRY, COMMODITY_ON_MARKET, MUTABLE_STAT, MUTABLE_STAT_WITH_TEMP_MODS,
+            INTEL_MANAGER, SHIP,
             DYNAMIC_PARTICLE_GROUP, LOADING_UTILS,
             SCRIPT_STORE_RUNNER, RULES, SPEC_STORE, TEXTURE_LOADER, SOUND,
             PROGRESS_INPUT, PROGRESS_OUTPUT, CAMPAIGN_GAME_MANAGER,
@@ -189,9 +216,12 @@ public final class PrepatcherTransformer implements ClassFileTransformer {
             case MEMORY -> apply(state, "emptyMemoryAdvanceFastPath",
                     config.emptyMemoryAdvanceFastPath, this::patchEmptyMemoryAdvanceFastPath);
             case ECONOMY -> {
+                apply(state, "economyPersistentSnapshots", config.economyPersistentSnapshots,
+                        this::patchEconomyPersistentSnapshots);
                 apply(state, "economyLocationCache", config.economyLocationCache,
                         this::patchEconomyLocationCache);
-                apply(state, "economySnapshotReuse", config.economySnapshotReuse,
+                apply(state, "economySnapshotReuse",
+                        config.economySnapshotReuse && !config.economyPersistentSnapshots,
                         this::patchEconomySnapshots);
                 apply(state, "remoteMarketScheduler", config.remoteMarketScheduler,
                         this::patchRemoteMarketScheduler);
@@ -200,14 +230,27 @@ public final class PrepatcherTransformer implements ClassFileTransformer {
                         this::patchPlanetConditionMarketFrameClock);
             }
             case MARKET -> {
-                apply(state, "economySnapshotReuse", config.economySnapshotReuse,
+                apply(state, "economyPersistentSnapshots", config.economyPersistentSnapshots,
+                        this::patchMarketPersistentSnapshots);
+                apply(state, "economySnapshotReuse",
+                        config.economySnapshotReuse && !config.economyPersistentSnapshots,
                         this::patchMarketSnapshots);
+                apply(state, "commodityTemporalFastPath", config.commodityTemporalFastPath,
+                        this::patchMarketCommodityTemporalFastPath);
                 apply(state, "directMarketObservation", config.directMarketObservation,
                         this::patchDirectMarketObservationEntry);
             }
+            case BASE_INDUSTRY -> apply(state, "marketNoOpCallbacks",
+                    config.marketNoOpCallbacks && config.marketNoOpIndustryAuditFrames > 0,
+                    this::patchBaseIndustryDormantFastPath);
             case COMMODITY_ON_MARKET -> apply(state, "commodityEventModDirtyCache",
                     config.commodityEventModDirtyCache,
                     this::patchCommodityEventModDirtyCache);
+            case MUTABLE_STAT -> apply(state, "commodityTemporalBinding",
+                    config.commodityTemporalFastPath, this::patchCommodityTemporalBaseBinding);
+            case MUTABLE_STAT_WITH_TEMP_MODS -> apply(state, "tempModExpiryScheduler",
+                    config.tempModExpiryScheduler || config.commodityTemporalFastPath,
+                    this::patchTempModExpiryScheduler);
             case INTEL_MANAGER -> apply(state, "commRelaySystemIndex", config.commRelaySystemIndex,
                     this::patchCommRelaySystemIndex);
             case SHIP -> apply(state, "shipAdvanceScratch", config.shipAdvanceScratch,
@@ -405,9 +448,16 @@ public final class PrepatcherTransformer implements ClassFileTransformer {
                     || config.planetConditionMarketScheduler || config.directMarketObservation;
             case MEMORY -> config.emptyMemoryAdvanceFastPath;
             case ECONOMY -> config.economyLocationCache || config.economySnapshotReuse
-                    || config.remoteMarketScheduler || config.planetConditionMarketScheduler;
-            case MARKET -> config.economySnapshotReuse || config.directMarketObservation;
+                    || config.economyPersistentSnapshots || config.remoteMarketScheduler
+                    || config.planetConditionMarketScheduler;
+            case MARKET -> config.economySnapshotReuse || config.economyPersistentSnapshots
+                    || config.commodityTemporalFastPath || config.directMarketObservation;
+            case BASE_INDUSTRY -> config.marketNoOpCallbacks
+                    && config.marketNoOpIndustryAuditFrames > 0;
             case COMMODITY_ON_MARKET -> config.commodityEventModDirtyCache;
+            case MUTABLE_STAT -> config.commodityTemporalFastPath;
+            case MUTABLE_STAT_WITH_TEMP_MODS ->
+                    config.tempModExpiryScheduler || config.commodityTemporalFastPath;
             case INTEL_MANAGER -> config.commRelaySystemIndex;
             case SHIP -> config.shipAdvanceScratch;
             case DYNAMIC_PARTICLE_GROUP -> config.particleCleanup;
@@ -433,7 +483,8 @@ public final class PrepatcherTransformer implements ClassFileTransformer {
                 || config.systemNebulaCache || config.sampleCacheClearThrottle
                 || config.campaignListenerThrottle || config.routeJumpPointIndex
                 || config.economyLocationCache || config.remoteMarketScheduler
-                || config.planetConditionMarketScheduler || config.commRelaySystemIndex;
+                || config.planetConditionMarketScheduler || config.commRelaySystemIndex
+                || config.commodityTemporalFastPath;
     }
 
 
@@ -2431,27 +2482,39 @@ public final class PrepatcherTransformer implements ClassFileTransformer {
         MethodNode advance = requireMethod(node, "advance", "(F)V");
         String reach = "com/fs/starfarer/campaign/econ/reach/ReachEconomy";
         String reachDesc = "L" + reach + ";";
-        String hookDesc = "(" + reachDesc + ")V";
+        boolean persistent = hasExactSyntheticField(node, ECONOMY_PERSISTENT_STATE_FIELD,
+                PERSISTENT_STATE_DESC, persistentStateAccess());
+        String hookName = persistent
+                ? "updateEconomyLocationMapIfNeededPersistent"
+                : "updateEconomyLocationMapIfNeeded";
+        String hookDesc = persistent
+                ? "(" + reachDesc + PERSISTENT_STATE_DESC + ")V"
+                : "(" + reachDesc + ")V";
         List<MethodInsnNode> dirtyCalls = calls(advance, Opcodes.INVOKEVIRTUAL,
                 reach, "setLocationCacheNeedsUpdate", "(Z)V");
         List<MethodInsnNode> updateCalls = calls(advance, Opcodes.INVOKEVIRTUAL,
                 reach, "updateLocationMap", "()V");
-        int hooks = countCalls(advance, Opcodes.INVOKESTATIC, HOOKS,
-                "updateEconomyLocationMapIfNeeded", hookDesc);
+        int hooks = countCalls(advance, Opcodes.INVOKESTATIC, HOOKS, hookName, hookDesc);
         boolean original = dirtyCalls.size() == 1 && updateCalls.size() == 1 && hooks == 0;
         boolean patched = dirtyCalls.isEmpty() && updateCalls.isEmpty() && hooks == 1;
         if (patched) {
             MethodInsnNode hook = only(calls(advance, Opcodes.INVOKESTATIC, HOOKS,
-                    "updateEconomyLocationMapIfNeeded", hookDesc),
-                    "Economy.advance location-cache hook");
-            AbstractInsnNode fieldInsn = previousMeaningful(hook);
-            AbstractInsnNode receiver = previousMeaningful(fieldInsn);
-            if (!(fieldInsn instanceof FieldInsnNode field)
-                    || field.getOpcode() != Opcodes.GETFIELD
-                    || !field.owner.equals(node.name) || !field.desc.equals(reachDesc)
-                    || !(receiver instanceof VarInsnNode load)
-                    || load.getOpcode() != Opcodes.ALOAD || load.var != 0) {
-                throw mismatch("Economy.advance location-cache hook argument changed structurally");
+                    hookName, hookDesc), "Economy.advance location-cache hook");
+            Frame<SourceValue>[] frames = sourceFrames(node.name, advance);
+            FieldInsnNode economyField = optionalSourceField(
+                    argumentSource(advance, hook, frames, 0), Opcodes.GETFIELD,
+                    node.name, reachDesc);
+            if (economyField == null) {
+                throw mismatch("Economy.advance location-cache hook economy argument changed");
+            }
+            if (persistent) {
+                FieldInsnNode stateField = optionalSourceField(
+                        argumentSource(advance, hook, frames, 1), Opcodes.GETFIELD,
+                        node.name, PERSISTENT_STATE_DESC);
+                if (stateField == null
+                        || !stateField.name.equals(ECONOMY_PERSISTENT_STATE_FIELD)) {
+                    throw mismatch("Economy.advance persistent location-cache state changed");
+                }
             }
             throw already("Economy.advance location-cache hook and argument postcondition match");
         }
@@ -2486,15 +2549,629 @@ public final class PrepatcherTransformer implements ClassFileTransformer {
         advance.instructions.remove(secondThis);
         advance.instructions.remove(secondFieldInsn);
         advance.instructions.remove(update);
-        makeStatic(dirty, HOOKS, "updateEconomyLocationMapIfNeeded", hookDesc);
+        if (persistent) {
+            InsnList state = new InsnList();
+            state.add(new VarInsnNode(Opcodes.ALOAD, 0));
+            state.add(new FieldInsnNode(Opcodes.GETFIELD, node.name,
+                    ECONOMY_PERSISTENT_STATE_FIELD, PERSISTENT_STATE_DESC));
+            advance.instructions.insertBefore(dirty, state);
+        }
+        makeStatic(dirty, HOOKS, hookName, hookDesc);
         requireCount("Economy location-cache hook",
-                countCalls(advance, Opcodes.INVOKESTATIC, HOOKS,
-                        "updateEconomyLocationMapIfNeeded", hookDesc), 1);
+                countCalls(advance, Opcodes.INVOKESTATIC, HOOKS, hookName, hookDesc), 1);
 
         PatchReport report = new PatchReport();
-        report.add("validated ReachEconomy location-map invalidation", 1);
+        report.add(persistent
+                ? "epoch/audit ReachEconomy location-map invalidation"
+                : "validated ReachEconomy location-map invalidation", 1);
         return report;
     }
+
+    /**
+     * Replaces per-frame clear/addAll scratch snapshots with owner-local,
+     * copy-on-write snapshots. A transformed mutator increments the structure
+     * epoch immediately; direct live-list edits are detected by a periodic
+     * identity/order audit. Old snapshots are never cleared, so a nested advance
+     * cannot invalidate an outer iterator.
+     */
+    private PatchReport patchEconomyPersistentSnapshots(ClassNode node) {
+        MethodNode advance = requireMethod(node, "advance", "(F)V");
+        MethodNode paused = requireMethod(node, "advanceMarketConditionsWhenPaused", "(F)V");
+        MethodNode constructor = requireMethod(node, "<init>", "(Z)V");
+        MethodNode readResolve = requireMethod(node, "readResolve", "()Ljava/lang/Object;");
+        MethodNode addMarket = requireMethod(node, "addMarket",
+                "(Lcom/fs/starfarer/api/campaign/econ/MarketAPI;Z)V");
+        MethodNode removeMarket = requireMethod(node, "removeMarket",
+                "(Lcom/fs/starfarer/api/campaign/econ/MarketAPI;)V");
+        MethodNode setEcon = requireMethod(node, "setEcon",
+                "(Lcom/fs/starfarer/campaign/econ/reach/ReachEconomy;)V");
+
+        boolean fieldPresent = hasExactSyntheticField(node, ECONOMY_PERSISTENT_STATE_FIELD,
+                PERSISTENT_STATE_DESC, persistentStateAccess());
+        boolean accessorPresent = hasExactPersistentAccessor(node, ECONOMY_PERSISTENT_ACCESSOR,
+                "()Ljava/util/List;", true, ECONOMY_PERSISTENT_STATE_FIELD,
+                config.economyStructureAuditMs, 0);
+        boolean any = fieldPresent || accessorPresent
+                || countCalls(advance, Opcodes.INVOKEVIRTUAL, node.name,
+                ECONOMY_PERSISTENT_ACCESSOR, "()Ljava/util/List;") > 0
+                || countCalls(paused, Opcodes.INVOKEVIRTUAL, node.name,
+                ECONOMY_PERSISTENT_ACCESSOR, "()Ljava/util/List;") > 0
+                || countPersistentStateInitializers(constructor, node.name,
+                ECONOMY_PERSISTENT_STATE_FIELD) > 0
+                || countPersistentStateInitializers(readResolve, node.name,
+                ECONOMY_PERSISTENT_STATE_FIELD) > 0
+                || countPersistentMarks(addMarket, node.name,
+                ECONOMY_PERSISTENT_STATE_FIELD) > 0
+                || countPersistentMarks(removeMarket, node.name,
+                ECONOMY_PERSISTENT_STATE_FIELD) > 0
+                || countPersistentMarks(setEcon, node.name,
+                ECONOMY_PERSISTENT_STATE_FIELD) > 0;
+        if (any) {
+            if (!fieldPresent || !accessorPresent) {
+                throw mismatch("Economy persistent snapshot fields/accessor are partial or foreign");
+            }
+            requireCount("Economy.advance persistent market snapshot",
+                    countCalls(advance, Opcodes.INVOKEVIRTUAL, node.name,
+                            ECONOMY_PERSISTENT_ACCESSOR, "()Ljava/util/List;"), 1);
+            requireCount("Economy paused persistent market snapshot",
+                    countCalls(paused, Opcodes.INVOKEVIRTUAL, node.name,
+                            ECONOMY_PERSISTENT_ACCESSOR, "()Ljava/util/List;"), 1);
+            requireCount("Economy.advance retired getMarketsCopy",
+                    countCalls(advance, Opcodes.INVOKEVIRTUAL, node.name,
+                            "getMarketsCopy", "()Ljava/util/List;"), 0);
+            requireCount("Economy paused retired getMarketsCopy",
+                    countCalls(paused, Opcodes.INVOKEVIRTUAL, node.name,
+                            "getMarketsCopy", "()Ljava/util/List;"), 0);
+            requireCount("Economy constructor persistent-state init",
+                    countPersistentStateInitializers(constructor, node.name,
+                            ECONOMY_PERSISTENT_STATE_FIELD), 1);
+            requireCount("Economy readResolve persistent-state init",
+                    countPersistentStateInitializers(readResolve, node.name,
+                            ECONOMY_PERSISTENT_STATE_FIELD), 1);
+            requireCount("Economy addMarket epoch mark",
+                    countPersistentMarks(addMarket, node.name,
+                            ECONOMY_PERSISTENT_STATE_FIELD), 1);
+            requireCount("Economy removeMarket epoch mark",
+                    countPersistentMarks(removeMarket, node.name,
+                            ECONOMY_PERSISTENT_STATE_FIELD), 1);
+            requireCount("Economy setEcon epoch mark",
+                    countPersistentMarks(setEcon, node.name,
+                            ECONOMY_PERSISTENT_STATE_FIELD), 1);
+            PatchState pausedSnapshotState = uniformPatchState(
+                    "Economy persistent paused condition snapshot",
+                    scratchScopeState(node.name, paused,
+                            "Economy.advanceMarketConditionsWhenPaused"),
+                    immediateArrayListIteratorSnapshotState(paused, 1,
+                            "borrowEconomyCollectionSnapshot",
+                            "Economy paused condition snapshot"));
+            if (pausedSnapshotState != PatchState.PATCHED) {
+                throw mismatch("Economy persistent paused condition snapshot is not patched");
+            }
+            throw already("Economy persistent snapshot/epoch postcondition matches");
+        }
+
+        requireOriginalEconomyMarketSnapshot(advance, "Economy.advance market snapshot");
+        requireOriginalEconomyMarketSnapshot(paused, "Economy paused market snapshot");
+        node.fields.add(new FieldNode(Opcodes.ASM8, persistentStateAccess(),
+                ECONOMY_PERSISTENT_STATE_FIELD, PERSISTENT_STATE_DESC, null, null));
+        node.methods.add(newEconomyPersistentAccessor(node.name));
+        initializePersistentStateAfterSuper(node, constructor,
+                ECONOMY_PERSISTENT_STATE_FIELD, "Economy constructor");
+        initializePersistentStateAtEntry(readResolve, node.name,
+                ECONOMY_PERSISTENT_STATE_FIELD, "Economy.readResolve");
+        replaceEconomyMarketSnapshotWithPersistentAccessor(advance, node.name,
+                "Economy.advance market snapshot");
+        replaceEconomyMarketSnapshotWithPersistentAccessor(paused, node.name,
+                "Economy paused market snapshot");
+        boolean pausedScopeInstalled = ensureScratchScope(node.name, paused,
+                "Economy.advanceMarketConditionsWhenPaused");
+        int pausedConditionSnapshots = replaceImmediateArrayListIteratorSnapshots(
+                node.name, paused, 1, "borrowEconomyCollectionSnapshot",
+                pausedScopeInstalled, "Economy paused condition snapshot");
+
+        insertPersistentMarkAfterUniqueCall(addMarket, Opcodes.INVOKEVIRTUAL,
+                "com/fs/starfarer/campaign/econ/reach/ReachEconomy", "addMarket",
+                "(Lcom/fs/starfarer/api/campaign/econ/MarketAPI;)V",
+                node.name, ECONOMY_PERSISTENT_STATE_FIELD, "Economy.addMarket");
+        insertPersistentMarkAfterUniqueCall(removeMarket, Opcodes.INVOKEVIRTUAL,
+                "com/fs/starfarer/campaign/econ/reach/ReachEconomy", "removeMarket",
+                "(Lcom/fs/starfarer/api/campaign/econ/MarketAPI;)V",
+                node.name, ECONOMY_PERSISTENT_STATE_FIELD, "Economy.removeMarket");
+        FieldInsnNode econWrite = onlyField(setEcon, Opcodes.PUTFIELD, node.name,
+                "econ", "Lcom/fs/starfarer/campaign/econ/reach/ReachEconomy;",
+                "Economy.setEcon field write");
+        insertPersistentMarkAfter(setEcon, econWrite, node.name,
+                ECONOMY_PERSISTENT_STATE_FIELD);
+
+        PatchReport report = new PatchReport();
+        report.add("persistent Economy market snapshots, paused condition scratch, and structure epoch",
+                8 + pausedConditionSnapshots);
+        return report;
+    }
+
+    private PatchReport patchMarketPersistentSnapshots(ClassNode node) {
+        MethodNode advance = requireMethod(node, "advance", "(F)V");
+        MethodNode constructor = requireMethod(node, "<init>",
+                "(Ljava/lang/String;Ljava/lang/String;ILcom/fs/starfarer/campaign/econ/Economy;)V");
+        MethodNode readResolve = requireMethod(node, "readResolve", "()Ljava/lang/Object;");
+        MethodNode clone = requireMethod(node, "clone", "()Lcom/fs/starfarer/campaign/econ/Market;");
+
+        boolean conditionsField = hasExactSyntheticField(node, MARKET_CONDITIONS_STATE_FIELD,
+                PERSISTENT_STATE_DESC, persistentStateAccess());
+        boolean industriesField = hasExactSyntheticField(node, MARKET_INDUSTRIES_STATE_FIELD,
+                PERSISTENT_STATE_DESC, persistentStateAccess());
+        boolean conditionsAccessor = hasExactPersistentAccessor(node, MARKET_CONDITIONS_ACCESSOR,
+                "(Ljava/util/Collection;)Ljava/util/ArrayList;", false,
+                MARKET_CONDITIONS_STATE_FIELD, config.marketStructureAuditFrames, 1);
+        boolean industriesAccessor = hasExactPersistentAccessor(node, MARKET_INDUSTRIES_ACCESSOR,
+                "(Ljava/util/Collection;)Ljava/util/ArrayList;", false,
+                MARKET_INDUSTRIES_STATE_FIELD, config.marketStructureAuditFrames, 2);
+        boolean any = conditionsField || industriesField || conditionsAccessor || industriesAccessor
+                || countCalls(advance, Opcodes.INVOKEVIRTUAL, node.name,
+                MARKET_CONDITIONS_ACCESSOR,
+                "(Ljava/util/Collection;)Ljava/util/ArrayList;") > 0
+                || countCalls(advance, Opcodes.INVOKEVIRTUAL, node.name,
+                MARKET_INDUSTRIES_ACCESSOR,
+                "(Ljava/util/Collection;)Ljava/util/ArrayList;") > 0;
+        if (any) {
+            if (!conditionsField || !industriesField || !conditionsAccessor || !industriesAccessor) {
+                throw mismatch("Market persistent snapshot fields/accessors are partial or foreign");
+            }
+            requireCount("Market persistent conditions snapshot call",
+                    countCalls(advance, Opcodes.INVOKEVIRTUAL, node.name,
+                            MARKET_CONDITIONS_ACCESSOR,
+                            "(Ljava/util/Collection;)Ljava/util/ArrayList;"), 1);
+            requireCount("Market persistent industries snapshot call",
+                    countCalls(advance, Opcodes.INVOKEVIRTUAL, node.name,
+                            MARKET_INDUSTRIES_ACCESSOR,
+                            "(Ljava/util/Collection;)Ljava/util/ArrayList;"), 1);
+            requireCount("Market retired ArrayList(Collection) snapshots",
+                    countImmediateArrayListIteratorSnapshots(advance), 0);
+            requireCount("Market constructor persistent-state initializers",
+                    countPersistentStateInitializers(constructor, node.name,
+                            MARKET_CONDITIONS_STATE_FIELD)
+                            + countPersistentStateInitializers(constructor, node.name,
+                            MARKET_INDUSTRIES_STATE_FIELD), 2);
+            requireCount("Market readResolve persistent-state initializers",
+                    countPersistentStateInitializers(readResolve, node.name,
+                            MARKET_CONDITIONS_STATE_FIELD)
+                            + countPersistentStateInitializers(readResolve, node.name,
+                            MARKET_INDUSTRIES_STATE_FIELD), 2);
+            requireCount("Market clone persistent-state initializers",
+                    countPersistentStateInitializers(clone, node.name,
+                            MARKET_CONDITIONS_STATE_FIELD)
+                            + countPersistentStateInitializers(clone, node.name,
+                            MARKET_INDUSTRIES_STATE_FIELD), 2);
+            requireMarketPersistentMutationMarks(node);
+            throw already("Market persistent snapshot/epoch postcondition matches");
+        }
+
+        requireCount("Market original condition/industry snapshots",
+                countImmediateArrayListIteratorSnapshots(advance), 2);
+        node.fields.add(new FieldNode(Opcodes.ASM8, persistentStateAccess(),
+                MARKET_CONDITIONS_STATE_FIELD, PERSISTENT_STATE_DESC, null, null));
+        node.fields.add(new FieldNode(Opcodes.ASM8, persistentStateAccess(),
+                MARKET_INDUSTRIES_STATE_FIELD, PERSISTENT_STATE_DESC, null, null));
+        node.methods.add(newMarketPersistentAccessor(node.name, MARKET_CONDITIONS_ACCESSOR,
+                MARKET_CONDITIONS_STATE_FIELD, config.marketStructureAuditFrames, 1));
+        node.methods.add(newMarketPersistentAccessor(node.name, MARKET_INDUSTRIES_ACCESSOR,
+                MARKET_INDUSTRIES_STATE_FIELD, config.marketStructureAuditFrames, 2));
+        initializePersistentStateAfterSuper(node, constructor,
+                MARKET_CONDITIONS_STATE_FIELD, "Market constructor conditions");
+        initializePersistentStateAfterAnchor(constructor,
+                lastPersistentStateInitializer(constructor, node.name,
+                        MARKET_CONDITIONS_STATE_FIELD), node.name,
+                MARKET_INDUSTRIES_STATE_FIELD);
+        initializePersistentStateAtEntry(readResolve, node.name,
+                MARKET_INDUSTRIES_STATE_FIELD, "Market.readResolve industries");
+        initializePersistentStateAtEntry(readResolve, node.name,
+                MARKET_CONDITIONS_STATE_FIELD, "Market.readResolve conditions");
+        initializeClonePersistentStates(clone, node.name,
+                MARKET_CONDITIONS_STATE_FIELD, MARKET_INDUSTRIES_STATE_FIELD);
+        replaceMarketAdvanceSnapshots(advance, node.name);
+        patchMarketStructureMutators(node);
+
+        PatchReport report = new PatchReport();
+        report.add("persistent Market condition/industry snapshots and epochs", 14);
+        return report;
+    }
+
+    private static int persistentStateAccess() {
+        return Opcodes.ACC_PRIVATE | Opcodes.ACC_TRANSIENT | Opcodes.ACC_SYNTHETIC;
+    }
+
+    private static boolean hasExactSyntheticField(ClassNode node, String name,
+                                                   String desc, int access) {
+        FieldNode found = null;
+        for (FieldNode field : node.fields) {
+            if (!field.name.equals(name)) continue;
+            if (found != null) throw mismatch("duplicate synthetic field " + node.name + "." + name);
+            found = field;
+        }
+        if (found == null) return false;
+        if (!found.desc.equals(desc) || found.access != access
+                || found.signature != null || found.value != null) {
+            throw mismatch("foreign or malformed synthetic field " + node.name + "." + name);
+        }
+        return true;
+    }
+
+    private static boolean hasExactPersistentAccessor(ClassNode node, String name, String desc,
+                                                      boolean timed, String stateField,
+                                                      int auditValue, int kind) {
+        List<MethodNode> methods = methods(node, name, desc);
+        if (methods.isEmpty()) return false;
+        if (methods.size() != 1) throw mismatch("duplicate persistent accessor " + name + desc);
+        MethodNode method = methods.get(0);
+        int expectedAccess = Opcodes.ACC_PRIVATE | Opcodes.ACC_SYNTHETIC;
+        if (method.access != expectedAccess || method.signature != null
+                || (method.exceptions != null && !method.exceptions.isEmpty())) {
+            throw mismatch("foreign persistent accessor metadata " + name + desc);
+        }
+        List<AbstractInsnNode> code = meaningfulInstructions(method);
+        int expected = timed ? 8 : 7;
+        requireCount(name + " instruction count", code.size(), expected);
+        requireVar(code.get(0), Opcodes.ALOAD, 0, name + " state owner");
+        requireField(code.get(1), Opcodes.GETFIELD, node.name, stateField,
+                PERSISTENT_STATE_DESC, name + " state field");
+        int cursor = 2;
+        if (timed) {
+            requireVar(code.get(cursor++), Opcodes.ALOAD, 0, name + " source owner");
+            requireCall(asMethod(code.get(cursor++), name + " source call"),
+                    Opcodes.INVOKEVIRTUAL, node.name, "getMarkets", "()Ljava/util/List;",
+                    name + " source call");
+        } else {
+            requireVar(code.get(cursor++), Opcodes.ALOAD, 1, name + " source argument");
+        }
+        if (!isIntegerLdc(code.get(cursor++), auditValue)
+                || !isIntegerLdc(code.get(cursor++), kind)) {
+            throw mismatch(name + " audit/kind constants changed");
+        }
+        String hookName = timed ? "borrowPersistentSnapshotTimed"
+                : "borrowPersistentSnapshotFrames";
+        requireCall(asMethod(code.get(cursor++), name + " hook"), Opcodes.INVOKESTATIC,
+                HOOKS, hookName,
+                "(Ljava/lang/Object;Ljava/util/Collection;II)Ljava/util/ArrayList;",
+                name + " hook");
+        if (code.get(cursor).getOpcode() != Opcodes.ARETURN) {
+            throw mismatch(name + " no longer returns the persistent snapshot");
+        }
+        return true;
+    }
+
+    private MethodNode newEconomyPersistentAccessor(String owner) {
+        MethodNode method = new MethodNode(Opcodes.ASM8,
+                Opcodes.ACC_PRIVATE | Opcodes.ACC_SYNTHETIC,
+                ECONOMY_PERSISTENT_ACCESSOR, "()Ljava/util/List;", null, null);
+        method.instructions.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        method.instructions.add(new FieldInsnNode(Opcodes.GETFIELD, owner,
+                ECONOMY_PERSISTENT_STATE_FIELD, PERSISTENT_STATE_DESC));
+        method.instructions.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        method.instructions.add(new MethodInsnNode(Opcodes.INVOKEVIRTUAL, owner,
+                "getMarkets", "()Ljava/util/List;", false));
+        method.instructions.add(pushInt(config.economyStructureAuditMs));
+        method.instructions.add(pushInt(0));
+        method.instructions.add(new MethodInsnNode(Opcodes.INVOKESTATIC, HOOKS,
+                "borrowPersistentSnapshotTimed",
+                "(Ljava/lang/Object;Ljava/util/Collection;II)Ljava/util/ArrayList;", false));
+        method.instructions.add(new InsnNode(Opcodes.ARETURN));
+        return method;
+    }
+
+    private static MethodNode newMarketPersistentAccessor(String owner, String name,
+                                                           String stateField,
+                                                           int auditFrames, int kind) {
+        MethodNode method = new MethodNode(Opcodes.ASM8,
+                Opcodes.ACC_PRIVATE | Opcodes.ACC_SYNTHETIC, name,
+                "(Ljava/util/Collection;)Ljava/util/ArrayList;", null, null);
+        method.instructions.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        method.instructions.add(new FieldInsnNode(Opcodes.GETFIELD, owner,
+                stateField, PERSISTENT_STATE_DESC));
+        method.instructions.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        method.instructions.add(pushInt(auditFrames));
+        method.instructions.add(pushInt(kind));
+        method.instructions.add(new MethodInsnNode(Opcodes.INVOKESTATIC, HOOKS,
+                "borrowPersistentSnapshotFrames",
+                "(Ljava/lang/Object;Ljava/util/Collection;II)Ljava/util/ArrayList;", false));
+        method.instructions.add(new InsnNode(Opcodes.ARETURN));
+        return method;
+    }
+
+    private static AbstractInsnNode pushInt(int value) {
+        if (value >= -1 && value <= 5) {
+            return new InsnNode(value == -1 ? Opcodes.ICONST_M1 : Opcodes.ICONST_0 + value);
+        }
+        if (value >= Byte.MIN_VALUE && value <= Byte.MAX_VALUE) {
+            return new IntInsnNode(Opcodes.BIPUSH, value);
+        }
+        if (value >= Short.MIN_VALUE && value <= Short.MAX_VALUE) {
+            return new IntInsnNode(Opcodes.SIPUSH, value);
+        }
+        return new LdcInsnNode(value);
+    }
+
+    private static void requireOriginalEconomyMarketSnapshot(MethodNode method, String label) {
+        List<MethodInsnNode> calls = calls(method, Opcodes.INVOKEVIRTUAL,
+                ECONOMY, "getMarketsCopy", "()Ljava/util/List;");
+        requireCount(label, calls.size(), 1);
+        MethodInsnNode call = calls.get(0);
+        Frame<SourceValue>[] frames = sourceFrames(ECONOMY, method);
+        if (!sourceIsLocal(receiverSource(method, call, frames), Opcodes.ALOAD, 0)) {
+            throw mismatch(label + " receiver is not this");
+        }
+        MethodInsnNode iterator = asMethod(nextMeaningful(call), label + " iterator");
+        requireCall(iterator, Opcodes.INVOKEINTERFACE, "java/util/List", "iterator",
+                "()Ljava/util/Iterator;", label + " iterator");
+    }
+
+    private static void replaceEconomyMarketSnapshotWithPersistentAccessor(
+            MethodNode method, String owner, String label) {
+        MethodInsnNode call = only(calls(method, Opcodes.INVOKEVIRTUAL,
+                owner, "getMarketsCopy", "()Ljava/util/List;"), label);
+        call.owner = owner;
+        call.name = ECONOMY_PERSISTENT_ACCESSOR;
+        call.desc = "()Ljava/util/List;";
+        call.itf = false;
+    }
+
+    private static void initializePersistentStateAfterSuper(ClassNode node,
+                                                            MethodNode constructor,
+                                                            String stateField,
+                                                            String label) {
+        List<MethodInsnNode> supers = calls(constructor, Opcodes.INVOKESPECIAL,
+                node.superName, "<init>", "()V");
+        requireCount(label + " super constructor", supers.size(), 1);
+        initializePersistentStateAfterAnchor(constructor, supers.get(0), node.name, stateField);
+    }
+
+    private static void initializePersistentStateAtEntry(MethodNode method, String owner,
+                                                         String stateField, String label) {
+        AbstractInsnNode first = firstMeaningful(method);
+        if (first == null) throw mismatch(label + " has no executable body");
+        InsnList init = persistentStateInitializer(owner, stateField, 0);
+        method.instructions.insertBefore(first, init);
+    }
+
+    private static void initializePersistentStateAfterAnchor(MethodNode method,
+                                                             AbstractInsnNode anchor,
+                                                             String owner, String stateField) {
+        method.instructions.insert(anchor, persistentStateInitializer(owner, stateField, 0));
+    }
+
+    private static InsnList persistentStateInitializer(String owner, String stateField,
+                                                       int ownerLocal) {
+        InsnList init = new InsnList();
+        init.add(new VarInsnNode(Opcodes.ALOAD, ownerLocal));
+        init.add(new MethodInsnNode(Opcodes.INVOKESTATIC, HOOKS,
+                "newPersistentSnapshotState", "()Ljava/lang/Object;", false));
+        init.add(new FieldInsnNode(Opcodes.PUTFIELD, owner, stateField,
+                PERSISTENT_STATE_DESC));
+        return init;
+    }
+
+    private static FieldInsnNode lastPersistentStateInitializer(MethodNode method,
+                                                                String owner,
+                                                                String stateField) {
+        FieldInsnNode result = null;
+        for (AbstractInsnNode insn : method.instructions.toArray()) {
+            if (insn instanceof FieldInsnNode field && field.getOpcode() == Opcodes.PUTFIELD
+                    && field.owner.equals(owner) && field.name.equals(stateField)
+                    && field.desc.equals(PERSISTENT_STATE_DESC)) result = field;
+        }
+        if (result == null) throw mismatch("missing persistent state initializer " + stateField);
+        return result;
+    }
+
+    private static int countPersistentStateInitializers(MethodNode method,
+                                                        String owner, String stateField) {
+        int count = 0;
+        for (MethodInsnNode call : calls(method, Opcodes.INVOKESTATIC, HOOKS,
+                "newPersistentSnapshotState", "()Ljava/lang/Object;")) {
+            AbstractInsnNode next = nextMeaningful(call);
+            if (next instanceof FieldInsnNode field && field.getOpcode() == Opcodes.PUTFIELD
+                    && field.owner.equals(owner) && field.name.equals(stateField)
+                    && field.desc.equals(PERSISTENT_STATE_DESC)) count++;
+        }
+        return count;
+    }
+
+    private static void insertPersistentMarkAfterUniqueCall(MethodNode method, int opcode,
+                                                            String callOwner, String callName,
+                                                            String callDesc, String owner,
+                                                            String stateField, String label) {
+        MethodInsnNode call = only(calls(method, opcode, callOwner, callName, callDesc), label);
+        AbstractInsnNode anchor = call;
+        AbstractInsnNode next = nextMeaningful(call);
+        if (next != null && next.getOpcode() == Opcodes.POP) anchor = next;
+        insertPersistentMarkAfter(method, anchor, owner, stateField);
+    }
+
+    private static void insertPersistentMarkAfter(MethodNode method, AbstractInsnNode anchor,
+                                                  String owner, String stateField) {
+        InsnList mark = new InsnList();
+        mark.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        mark.add(new FieldInsnNode(Opcodes.GETFIELD, owner, stateField,
+                PERSISTENT_STATE_DESC));
+        mark.add(new MethodInsnNode(Opcodes.INVOKESTATIC, HOOKS,
+                "markPersistentSnapshotStructure", "(Ljava/lang/Object;)V", false));
+        method.instructions.insert(anchor, mark);
+    }
+
+    private static int countPersistentMarks(MethodNode method, String owner,
+                                            String stateField) {
+        Frame<SourceValue>[] frames = sourceFrames(owner, method);
+        int count = 0;
+        for (MethodInsnNode call : calls(method, Opcodes.INVOKESTATIC, HOOKS,
+                "markPersistentSnapshotStructure", "(Ljava/lang/Object;)V")) {
+            FieldInsnNode field = optionalSourceField(argumentSource(method, call, frames, 0),
+                    Opcodes.GETFIELD, owner, PERSISTENT_STATE_DESC);
+            if (field != null && field.name.equals(stateField)) count++;
+        }
+        return count;
+    }
+
+    private static FieldInsnNode onlyField(MethodNode method, int opcode, String owner,
+                                           String name, String desc, String label) {
+        List<FieldInsnNode> result = new ArrayList<>();
+        for (AbstractInsnNode insn : method.instructions.toArray()) {
+            if (insn instanceof FieldInsnNode field && field.getOpcode() == opcode
+                    && field.owner.equals(owner) && field.name.equals(name)
+                    && field.desc.equals(desc)) result.add(field);
+        }
+        if (result.size() != 1) {
+            throw mismatch(label + " expected once, found " + result.size());
+        }
+        return result.get(0);
+    }
+
+    private static int countImmediateArrayListIteratorSnapshots(MethodNode method) {
+        int count = 0;
+        for (MethodInsnNode constructor : calls(method, Opcodes.INVOKESPECIAL,
+                "java/util/ArrayList", "<init>", "(Ljava/util/Collection;)V")) {
+            AbstractInsnNode next = nextMeaningful(constructor);
+            if (next instanceof MethodInsnNode iterator
+                    && callMatches(iterator, Opcodes.INVOKEVIRTUAL,
+                    "java/util/ArrayList", "iterator", "()Ljava/util/Iterator;")) count++;
+        }
+        return count;
+    }
+
+    private static void replaceMarketAdvanceSnapshots(MethodNode method, String owner) {
+        Frame<SourceValue>[] frames = sourceFrames(owner, method);
+        List<PersistentSnapshotPlan> plans = new ArrayList<>();
+        for (MethodInsnNode constructor : calls(method, Opcodes.INVOKESPECIAL,
+                "java/util/ArrayList", "<init>", "(Ljava/util/Collection;)V")) {
+            AbstractInsnNode next = nextMeaningful(constructor);
+            if (!(next instanceof MethodInsnNode iterator)
+                    || !callMatches(iterator, Opcodes.INVOKEVIRTUAL,
+                    "java/util/ArrayList", "iterator", "()Ljava/util/Iterator;")) continue;
+            SourceValue source = argumentSource(method, constructor, frames, 0);
+            String accessor;
+            AbstractInsnNode producer;
+            if (sourceIsMethod(source, Opcodes.INVOKEVIRTUAL, owner,
+                    "getConditions", "()Ljava/util/List;")) {
+                accessor = MARKET_CONDITIONS_ACCESSOR;
+                producer = source.insns.iterator().next();
+            } else {
+                FieldInsnNode field = optionalSourceField(source, Opcodes.GETFIELD,
+                        owner, "Ljava/util/List;");
+                if (field == null || !field.name.equals("industries")) {
+                    throw mismatch("Market.advance snapshot source is not conditions or industries");
+                }
+                accessor = MARKET_INDUSTRIES_ACCESSOR;
+                producer = field;
+            }
+            AbstractInsnNode receiverLoad = previousMeaningful(producer);
+            if (!(receiverLoad instanceof VarInsnNode load)
+                    || load.getOpcode() != Opcodes.ALOAD || load.var != 0) {
+                throw mismatch("Market.advance snapshot source receiver is not this");
+            }
+            plans.add(new PersistentSnapshotPlan(constructor,
+                    allocationPair(method, constructor, frames,
+                            "java/util/ArrayList", "Market.advance persistent snapshot"),
+                    receiverLoad, accessor));
+        }
+        requireCount("Market.advance persistent snapshot plans", plans.size(), 2);
+        Set<String> accessors = new HashSet<>();
+        for (PersistentSnapshotPlan plan : plans) accessors.add(plan.accessor);
+        if (!accessors.equals(Set.of(MARKET_CONDITIONS_ACCESSOR,
+                MARKET_INDUSTRIES_ACCESSOR))) {
+            throw mismatch("Market.advance persistent snapshot kinds are incomplete");
+        }
+        for (PersistentSnapshotPlan plan : plans) {
+            method.instructions.remove(plan.allocation.allocation());
+            method.instructions.remove(plan.allocation.duplicate());
+            method.instructions.insertBefore(plan.sourceReceiver,
+                    new VarInsnNode(Opcodes.ALOAD, 0));
+            MethodInsnNode call = plan.constructor;
+            call.setOpcode(Opcodes.INVOKEVIRTUAL);
+            call.owner = owner;
+            call.name = plan.accessor;
+            call.desc = "(Ljava/util/Collection;)Ljava/util/ArrayList;";
+            call.itf = false;
+        }
+    }
+
+    private static void initializeClonePersistentStates(MethodNode clone, String owner,
+                                                        String conditionsState,
+                                                        String industriesState) {
+        VarInsnNode store = null;
+        for (AbstractInsnNode insn : clone.instructions.toArray()) {
+            if (!(insn instanceof VarInsnNode var) || var.getOpcode() != Opcodes.ASTORE
+                    || var.var != 1) continue;
+            AbstractInsnNode previous = previousMeaningful(var);
+            if (previous instanceof TypeInsnNode cast && cast.getOpcode() == Opcodes.CHECKCAST
+                    && cast.desc.equals(owner)) {
+                store = var;
+                break;
+            }
+        }
+        if (store == null) throw mismatch("Market.clone result local changed");
+        InsnList init = new InsnList();
+        init.add(persistentStateInitializer(owner, conditionsState, 1));
+        init.add(persistentStateInitializer(owner, industriesState, 1));
+        clone.instructions.insert(store, init);
+    }
+
+    private static void patchMarketStructureMutators(ClassNode node) {
+        String list = "java/util/List";
+        String iterator = "java/util/Iterator";
+        MethodNode addConditionWithParam = requireMethod(node, "addCondition",
+                "(Ljava/lang/String;Ljava/lang/Object;)Ljava/lang/String;");
+        MethodNode addConditionObject = requireMethod(node, "addCondition",
+                "(Lcom/fs/starfarer/api/campaign/econ/MarketConditionAPI;)V");
+        MethodNode removeCondition = requireMethod(node, "removeCondition",
+                "(Ljava/lang/String;)V");
+        MethodNode removeSpecific = requireMethod(node, "removeSpecificCondition",
+                "(Ljava/lang/String;)V");
+        MethodNode addIndustry = requireMethod(node, "addIndustry",
+                "(Ljava/lang/String;Ljava/util/List;)V");
+        MethodNode removeIndustry = requireMethod(node, "removeIndustry",
+                "(Ljava/lang/String;Lcom/fs/starfarer/api/campaign/econ/MarketAPI$MarketInteractionMode;Z)V");
+
+        insertPersistentMarkAfterUniqueCall(addConditionWithParam, Opcodes.INVOKEINTERFACE,
+                list, "add", "(Ljava/lang/Object;)Z", node.name,
+                MARKET_CONDITIONS_STATE_FIELD, "Market.addCondition(String,Object)");
+        insertPersistentMarkAfterUniqueCall(addConditionObject, Opcodes.INVOKEINTERFACE,
+                list, "add", "(Ljava/lang/Object;)Z", node.name,
+                MARKET_CONDITIONS_STATE_FIELD, "Market.addCondition(MarketConditionAPI)");
+        insertPersistentMarkAfterUniqueCall(removeCondition, Opcodes.INVOKEINTERFACE,
+                iterator, "remove", "()V", node.name,
+                MARKET_CONDITIONS_STATE_FIELD, "Market.removeCondition");
+        insertPersistentMarkAfterUniqueCall(removeSpecific, Opcodes.INVOKEINTERFACE,
+                iterator, "remove", "()V", node.name,
+                MARKET_CONDITIONS_STATE_FIELD, "Market.removeSpecificCondition");
+        insertPersistentMarkAfterUniqueCall(addIndustry, Opcodes.INVOKEINTERFACE,
+                list, "add", "(Ljava/lang/Object;)Z", node.name,
+                MARKET_INDUSTRIES_STATE_FIELD, "Market.addIndustry");
+        insertPersistentMarkAfterUniqueCall(removeIndustry, Opcodes.INVOKEINTERFACE,
+                iterator, "remove", "()V", node.name,
+                MARKET_INDUSTRIES_STATE_FIELD, "Market.removeIndustry");
+    }
+
+    private static void requireMarketPersistentMutationMarks(ClassNode node) {
+        requireCount("Market condition epoch marks",
+                countPersistentMarks(requireMethod(node, "addCondition",
+                                "(Ljava/lang/String;Ljava/lang/Object;)Ljava/lang/String;"),
+                        node.name, MARKET_CONDITIONS_STATE_FIELD)
+                        + countPersistentMarks(requireMethod(node, "addCondition",
+                                "(Lcom/fs/starfarer/api/campaign/econ/MarketConditionAPI;)V"),
+                        node.name, MARKET_CONDITIONS_STATE_FIELD)
+                        + countPersistentMarks(requireMethod(node, "removeCondition",
+                                "(Ljava/lang/String;)V"),
+                        node.name, MARKET_CONDITIONS_STATE_FIELD)
+                        + countPersistentMarks(requireMethod(node, "removeSpecificCondition",
+                                "(Ljava/lang/String;)V"),
+                        node.name, MARKET_CONDITIONS_STATE_FIELD), 4);
+        requireCount("Market industry epoch marks",
+                countPersistentMarks(requireMethod(node, "addIndustry",
+                                "(Ljava/lang/String;Ljava/util/List;)V"),
+                        node.name, MARKET_INDUSTRIES_STATE_FIELD)
+                        + countPersistentMarks(requireMethod(node, "removeIndustry",
+                                "(Ljava/lang/String;Lcom/fs/starfarer/api/campaign/econ/MarketAPI$MarketInteractionMode;Z)V"),
+                        node.name, MARKET_INDUSTRIES_STATE_FIELD), 2);
+    }
+
 
     private PatchReport patchEconomySnapshots(ClassNode node) {
         MethodNode advance = requireMethod(node, "advance", "(F)V");
@@ -2816,6 +3493,1212 @@ public final class PrepatcherTransformer implements ClassFileTransformer {
         return report;
     }
 
+
+    /**
+     * Replaces Market.advance()'s unconditional full commodity-maintenance loop
+     * with an active-set runtime. The original four stat advances and event-mod
+     * reapplication remain available as a fail-open path in the hook.
+     */
+    private PatchReport patchMarketCommodityTemporalFastPath(ClassNode node) {
+        final String stateField = "smo$commodityTemporalState";
+        final int stateAccess = Opcodes.ACC_PRIVATE | Opcodes.ACC_TRANSIENT
+                | Opcodes.ACC_SYNTHETIC;
+        final String hookDesc = "(Ljava/lang/Object;Ljava/lang/Object;F)Ljava/lang/Object;";
+        MethodNode advance = requireMethod(node, "advance", "(F)V");
+
+        FieldNode existing = null;
+        for (FieldNode field : node.fields) {
+            if (!field.name.equals(stateField)) continue;
+            if (existing != null) throw mismatch("duplicate Market commodity-temporal state field");
+            existing = field;
+        }
+        if (existing != null) {
+            if (!existing.desc.equals("Ljava/lang/Object;") || existing.access != stateAccess
+                    || existing.signature != null || existing.value != null) {
+                throw mismatch("Market commodity-temporal state field is foreign");
+            }
+            requireOptimizedMarketCommodityTemporalShape(node, advance, stateField, hookDesc);
+            throw already("Market commodity temporal fast-path postcondition matches");
+        }
+        if (countCalls(advance, Opcodes.INVOKESTATIC, HOOKS,
+                "advanceMarketCommodityTemporalState", hookDesc) != 0) {
+            throw mismatch("foreign Market commodity-temporal hook without owned state field");
+        }
+
+        MarketCommodityLoop loop = requireOriginalMarketCommodityLoop(node, advance);
+        node.fields.add(new FieldNode(Opcodes.ASM8, stateAccess,
+                stateField, "Ljava/lang/Object;", null, null));
+
+        InsnList replacement = new InsnList();
+        replacement.add(new VarInsnNode(Opcodes.ALOAD, 0)); // PUTFIELD receiver
+        replacement.add(new VarInsnNode(Opcodes.ALOAD, 0)); // hook market
+        replacement.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        replacement.add(new FieldInsnNode(Opcodes.GETFIELD, node.name,
+                stateField, "Ljava/lang/Object;"));
+        replacement.add(new VarInsnNode(Opcodes.FLOAD, loop.daysLocal));
+        replacement.add(new MethodInsnNode(Opcodes.INVOKESTATIC, HOOKS,
+                "advanceMarketCommodityTemporalState", hookDesc, false));
+        replacement.add(new FieldInsnNode(Opcodes.PUTFIELD, node.name,
+                stateField, "Ljava/lang/Object;"));
+        // Keep a cursor into the unchanged industry loop. The first frame after
+        // the removed commodity loop was encoded as SAME relative to the
+        // commodity-loop iterator frame. Once that predecessor disappears it
+        // must become an explicit full frame, or the JVM verifier sees local 5
+        // as TOP at the industry-loop ALOAD.
+        AbstractInsnNode afterLoop = loop.end.getNext();
+        advance.instructions.insertBefore(loop.start, replacement);
+        removeInstructionRange(advance, loop.start, loop.end,
+                "Market commodity temporal loop");
+        repairMarketPostCommodityFrame(node, advance, afterLoop);
+
+        // The removed loop owned local-variable ranges for slots 4/5. They are
+        // debug metadata only, and retaining labels no longer in the method would
+        // produce malformed classfiles. Runtime semantics are unaffected.
+        if (advance.localVariables != null) advance.localVariables.clear();
+        if (advance.visibleLocalVariableAnnotations != null) {
+            advance.visibleLocalVariableAnnotations.clear();
+        }
+        if (advance.invisibleLocalVariableAnnotations != null) {
+            advance.invisibleLocalVariableAnnotations.clear();
+        }
+
+        requireOptimizedMarketCommodityTemporalShape(node, advance, stateField, hookDesc);
+        PatchReport report = new PatchReport();
+        report.add("commodity temporal active-set loop", 1);
+        return report;
+    }
+
+    private static MarketCommodityLoop requireOriginalMarketCommodityLoop(
+            ClassNode node, MethodNode method) {
+        final String commodity = "com/fs/starfarer/campaign/econ/CommodityOnMarket";
+        final String stat = "com/fs/starfarer/api/combat/MutableStatWithTempMods";
+        List<AbstractInsnNode> code = meaningfulInstructions(method);
+        List<Integer> starts = new ArrayList<>();
+        for (int i = 0; i + 29 < code.size(); i++) {
+            if (!(code.get(i + 1) instanceof MethodInsnNode call)
+                    || !callMatches(call, Opcodes.INVOKEVIRTUAL, node.name,
+                    "getCommodities", "()Ljava/util/List;")) continue;
+            starts.add(i);
+        }
+        requireCount("Market commodity-maintenance loop candidates", starts.size(), 1);
+        int i = starts.get(0);
+        requireVar(code.get(i), Opcodes.ALOAD, 0, "commodity-loop Market owner");
+        requireCall(asMethod(code.get(i + 1), "commodity list getter"), Opcodes.INVOKEVIRTUAL,
+                node.name, "getCommodities", "()Ljava/util/List;", "commodity list getter");
+        requireCall(asMethod(code.get(i + 2), "commodity iterator"), Opcodes.INVOKEINTERFACE,
+                "java/util/List", "iterator", "()Ljava/util/Iterator;", "commodity iterator");
+        if (!(code.get(i + 3) instanceof VarInsnNode iteratorStore)
+                || iteratorStore.getOpcode() != Opcodes.ASTORE) {
+            throw mismatch("commodity iterator local changed");
+        }
+        int iteratorLocal = iteratorStore.var;
+        if (!(code.get(i + 4) instanceof JumpInsnNode initialJump)
+                || initialJump.getOpcode() != Opcodes.GOTO) {
+            throw mismatch("commodity loop initial jump changed");
+        }
+        requireVar(code.get(i + 5), Opcodes.ALOAD, iteratorLocal, "commodity next iterator");
+        requireCall(asMethod(code.get(i + 6), "commodity iterator next"), Opcodes.INVOKEINTERFACE,
+                "java/util/Iterator", "next", "()Ljava/lang/Object;",
+                "commodity iterator next");
+        if (!(code.get(i + 7) instanceof TypeInsnNode cast)
+                || cast.getOpcode() != Opcodes.CHECKCAST || !cast.desc.equals(commodity)) {
+            throw mismatch("commodity loop cast changed");
+        }
+        if (!(code.get(i + 8) instanceof VarInsnNode commodityStore)
+                || commodityStore.getOpcode() != Opcodes.ASTORE) {
+            throw mismatch("commodity local changed");
+        }
+        int commodityLocal = commodityStore.var;
+        String[] getters = {"getAvailableStat", "getTradeMod", "getTradeModPlus", "getTradeModMinus"};
+        int daysLocal = -1;
+        int cursor = i + 9;
+        for (String getter : getters) {
+            requireVar(code.get(cursor++), Opcodes.ALOAD, commodityLocal,
+                    "commodity stat owner " + getter);
+            requireCall(asMethod(code.get(cursor++), "commodity stat getter " + getter),
+                    Opcodes.INVOKEVIRTUAL, commodity, getter,
+                    "()L" + stat + ";", "commodity stat getter " + getter);
+            AbstractInsnNode days = code.get(cursor++);
+            if (!(days instanceof VarInsnNode load) || load.getOpcode() != Opcodes.FLOAD) {
+                throw mismatch("commodity stat days local changed for " + getter);
+            }
+            if (daysLocal < 0) daysLocal = load.var;
+            else if (daysLocal != load.var) throw mismatch("commodity stat days locals diverged");
+            requireCall(asMethod(code.get(cursor++), "commodity stat advance " + getter),
+                    Opcodes.INVOKEVIRTUAL, stat, "advance", "(F)V",
+                    "commodity stat advance " + getter);
+        }
+        requireVar(code.get(cursor++), Opcodes.ALOAD, commodityLocal,
+                "commodity event-mod owner");
+        requireCall(asMethod(code.get(cursor++), "commodity event-mod reapply"),
+                Opcodes.INVOKEVIRTUAL, commodity, "reapplyEventMod", "()V",
+                "commodity event-mod reapply");
+        requireVar(code.get(cursor++), Opcodes.ALOAD, iteratorLocal,
+                "commodity hasNext iterator");
+        requireCall(asMethod(code.get(cursor++), "commodity iterator hasNext"),
+                Opcodes.INVOKEINTERFACE, "java/util/Iterator", "hasNext", "()Z",
+                "commodity iterator hasNext");
+        if (!(code.get(cursor) instanceof JumpInsnNode back)
+                || back.getOpcode() != Opcodes.IFNE) {
+            throw mismatch("commodity loop back-edge changed");
+        }
+        requireCount("Market commodity-maintenance instruction count", cursor - i + 1, 30);
+        if (nextMeaningful(initialJump.label) != code.get(i + 27)
+                || nextMeaningful(back.label) != code.get(i + 5)) {
+            throw mismatch("commodity loop control-flow targets changed");
+        }
+        return new MarketCommodityLoop(code.get(i), code.get(cursor), daysLocal);
+    }
+
+    private static void repairMarketPostCommodityFrame(
+            ClassNode node, MethodNode method, AbstractInsnNode cursor) {
+        FrameNode frame = null;
+        for (AbstractInsnNode current = cursor; current != null; current = current.getNext()) {
+            if (current instanceof FrameNode candidate) {
+                frame = candidate;
+                break;
+            }
+        }
+        if (frame == null || frame.type != Opcodes.F_SAME) {
+            throw mismatch("Market post-commodity industry-loop frame changed");
+        }
+        FrameNode full = new FrameNode(Opcodes.F_FULL, 6,
+                new Object[] {node.name, Opcodes.FLOAT, Opcodes.FLOAT,
+                        Opcodes.FLOAT, Opcodes.TOP, "java/util/Iterator"},
+                0, new Object[0]);
+        method.instructions.set(frame, full);
+    }
+
+    private static void requireOptimizedMarketCommodityTemporalShape(
+            ClassNode node, MethodNode method, String stateField, String hookDesc) {
+        requireCount("Market commodity temporal hook",
+                countCalls(method, Opcodes.INVOKESTATIC, HOOKS,
+                        "advanceMarketCommodityTemporalState", hookDesc), 1);
+        requireCount("Market commodity getter after fast path",
+                countCalls(method, Opcodes.INVOKEVIRTUAL, node.name,
+                        "getCommodities", "()Ljava/util/List;"), 0);
+        final String commodity = "com/fs/starfarer/campaign/econ/CommodityOnMarket";
+        final String stat = "com/fs/starfarer/api/combat/MutableStatWithTempMods";
+        for (String getter : List.of("getAvailableStat", "getTradeMod",
+                "getTradeModPlus", "getTradeModMinus")) {
+            requireCount("Market fast path residual " + getter,
+                    countCalls(method, Opcodes.INVOKEVIRTUAL, commodity, getter,
+                            "()L" + stat + ";"), 0);
+        }
+        requireCount("Market fast path residual reapplyEventMod",
+                countCalls(method, Opcodes.INVOKEVIRTUAL, commodity,
+                        "reapplyEventMod", "()V"), 0);
+        // The market power stat remains the one legitimate per-frame stat advance.
+        requireCount("Market fast path remaining MutableStatWithTempMods.advance",
+                countCalls(method, Opcodes.INVOKEVIRTUAL, stat, "advance", "(F)V"), 1);
+
+        MethodInsnNode hook = calls(method, Opcodes.INVOKESTATIC, HOOKS,
+                "advanceMarketCommodityTemporalState", hookDesc).get(0);
+        AbstractInsnNode days = previousMeaningful(hook);
+        AbstractInsnNode stateGet = previousMeaningful(days);
+        AbstractInsnNode stateOwner = previousMeaningful(stateGet);
+        AbstractInsnNode marketArg = previousMeaningful(stateOwner);
+        AbstractInsnNode putOwner = previousMeaningful(marketArg);
+        AbstractInsnNode statePut = nextMeaningful(hook);
+        if (!(days instanceof VarInsnNode daysLoad) || daysLoad.getOpcode() != Opcodes.FLOAD
+                || !(stateOwner instanceof VarInsnNode stateLoad)
+                || stateLoad.getOpcode() != Opcodes.ALOAD || stateLoad.var != 0
+                || !(marketArg instanceof VarInsnNode marketLoad)
+                || marketLoad.getOpcode() != Opcodes.ALOAD || marketLoad.var != 0
+                || !(putOwner instanceof VarInsnNode receiverLoad)
+                || receiverLoad.getOpcode() != Opcodes.ALOAD || receiverLoad.var != 0) {
+            throw mismatch("Market commodity temporal hook argument sequence changed");
+        }
+        requireField(stateGet, Opcodes.GETFIELD, node.name, stateField,
+                "Ljava/lang/Object;", "Market commodity state read");
+        requireField(statePut, Opcodes.PUTFIELD, node.name, stateField,
+                "Ljava/lang/Object;", "Market commodity state write");
+    }
+
+    /**
+     * Adds two private binding fields to MutableStat and guarded dirty notifications
+     * to the concrete mutation methods. Unbound stats pay only one private-field
+     * read and a predicted-null branch; no runtime hook is invoked.
+     */
+    private PatchReport patchCommodityTemporalBaseBinding(ClassNode node) {
+        final String ownerField = "spp$commodityTemporalOwner";
+        final String roleField = "spp$commodityTemporalRole";
+        final int fieldAccess = Opcodes.ACC_PRIVATE | Opcodes.ACC_TRANSIENT
+                | Opcodes.ACC_SYNTHETIC;
+        final String hookName = "markCommodityTemporalOwnerDirty";
+        final String hookDesc = "(Ljava/lang/Object;ILjava/lang/String;)V";
+        List<TemporalDirtyMethod> targets = List.of(
+                new TemporalDirtyMethod("applyMods",
+                        "(Lcom/fs/starfarer/api/combat/MutableStat;)V", -1),
+                new TemporalDirtyMethod("applyMods",
+                        "(Lcom/fs/starfarer/api/combat/StatBonus;)V", -1),
+                new TemporalDirtyMethod("modifyFlat",
+                        "(Ljava/lang/String;FLjava/lang/String;)V", 1),
+                new TemporalDirtyMethod("modifyPercent",
+                        "(Ljava/lang/String;FLjava/lang/String;)V", 1),
+                new TemporalDirtyMethod("modifyPercentAlways",
+                        "(Ljava/lang/String;FLjava/lang/String;)V", 1),
+                new TemporalDirtyMethod("modifyMult",
+                        "(Ljava/lang/String;FLjava/lang/String;)V", 1),
+                new TemporalDirtyMethod("modifyMultAlways",
+                        "(Ljava/lang/String;FLjava/lang/String;)V", 1),
+                new TemporalDirtyMethod("modifyFlatAlways",
+                        "(Ljava/lang/String;FLjava/lang/String;)V", 1),
+                new TemporalDirtyMethod("unmodify", "()V", -1),
+                new TemporalDirtyMethod("unmodify", "(Ljava/lang/String;)V", 1),
+                new TemporalDirtyMethod("unmodifyFlat", "(Ljava/lang/String;)V", 1),
+                new TemporalDirtyMethod("unmodifyPercent", "(Ljava/lang/String;)V", 1),
+                new TemporalDirtyMethod("unmodifyMult", "(Ljava/lang/String;)V", 1),
+                new TemporalDirtyMethod("setBaseValue", "(F)V", -1));
+
+        FieldNode owner = uniqueField(node, ownerField);
+        FieldNode role = uniqueField(node, roleField);
+        if (owner != null || role != null) {
+            requirePrivateSyntheticField(owner, ownerField, "Ljava/lang/Object;", fieldAccess);
+            requirePrivateSyntheticField(role, roleField, "I", fieldAccess);
+            for (TemporalDirtyMethod target : targets) {
+                requireCommodityTemporalBaseDirtyPrologue(node,
+                        requireMethod(node, target.name(), target.desc()), target,
+                        ownerField, roleField, hookName, hookDesc);
+            }
+            throw already("MutableStat temporal binding and dirty postcondition match");
+        }
+        if (uniqueField(node, "smo$commodityTemporalBinding") != null) {
+            throw mismatch("legacy commodity temporal binding field is already present");
+        }
+        for (TemporalDirtyMethod target : targets) {
+            MethodNode method = requireMethod(node, target.name(), target.desc());
+            requireCount(target.name() + target.desc() + " existing temporal dirty hooks",
+                    countCalls(method, Opcodes.INVOKESTATIC, HOOKS, hookName, hookDesc), 0);
+        }
+
+        node.fields.add(new FieldNode(Opcodes.ASM8, fieldAccess,
+                ownerField, "Ljava/lang/Object;", null, null));
+        node.fields.add(new FieldNode(Opcodes.ASM8, fieldAccess,
+                roleField, "I", null, null));
+        for (TemporalDirtyMethod target : targets) {
+            MethodNode method = requireMethod(node, target.name(), target.desc());
+            insertCommodityTemporalBaseDirtyPrologue(node, method, target,
+                    ownerField, roleField, hookName, hookDesc);
+            requireCommodityTemporalBaseDirtyPrologue(node, method, target,
+                    ownerField, roleField, hookName, hookDesc);
+        }
+
+        PatchReport report = new PatchReport();
+        report.add("bound MutableStat mutation notifications", targets.size());
+        report.add("private owner/role binding fields", 2);
+        return report;
+    }
+
+    private static FieldNode uniqueField(ClassNode node, String name) {
+        FieldNode result = null;
+        for (FieldNode field : node.fields) {
+            if (!field.name.equals(name)) continue;
+            if (result != null) throw mismatch("duplicate field " + name);
+            result = field;
+        }
+        return result;
+    }
+
+    private static void requirePrivateSyntheticField(FieldNode field, String name,
+                                                     String desc, int access) {
+        if (field == null || !field.desc.equals(desc) || field.access != access
+                || field.signature != null || field.value != null) {
+            throw mismatch("foreign or incomplete field " + name);
+        }
+    }
+
+    private static void insertCommodityTemporalBaseDirtyPrologue(
+            ClassNode node, MethodNode method, TemporalDirtyMethod target,
+            String ownerField, String roleField, String hookName, String hookDesc) {
+        AbstractInsnNode first = firstExecutable(method);
+        if (first == null) throw mismatch(target.name() + target.desc() + " has no body");
+        LabelNode skip = new LabelNode();
+        InsnList code = new InsnList();
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new FieldInsnNode(Opcodes.GETFIELD, node.name,
+                ownerField, "Ljava/lang/Object;"));
+        code.add(new JumpInsnNode(Opcodes.IFNULL, skip));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new FieldInsnNode(Opcodes.GETFIELD, node.name,
+                ownerField, "Ljava/lang/Object;"));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new FieldInsnNode(Opcodes.GETFIELD, node.name, roleField, "I"));
+        if (target.sourceLocal() >= 0) {
+            code.add(new VarInsnNode(Opcodes.ALOAD, target.sourceLocal()));
+        } else {
+            code.add(new InsnNode(Opcodes.ACONST_NULL));
+        }
+        code.add(new MethodInsnNode(Opcodes.INVOKESTATIC, HOOKS,
+                hookName, hookDesc, false));
+        code.add(skip);
+        code.add(new FrameNode(Opcodes.F_SAME, 0, null, 0, null));
+        method.instructions.insertBefore(first, code);
+    }
+
+    private static void requireCommodityTemporalBaseDirtyPrologue(
+            ClassNode node, MethodNode method, TemporalDirtyMethod target,
+            String ownerField, String roleField, String hookName, String hookDesc) {
+        requireCount(target.name() + target.desc() + " temporal dirty hook",
+                countCalls(method, Opcodes.INVOKESTATIC, HOOKS, hookName, hookDesc), 1);
+        List<AbstractInsnNode> code = meaningfulInstructions(method);
+        if (code.size() < 10) throw mismatch(target.name() + target.desc() + " dirty prologue short");
+        requireVar(code.get(0), Opcodes.ALOAD, 0, "dirty owner receiver");
+        requireField(code.get(1), Opcodes.GETFIELD, node.name, ownerField,
+                "Ljava/lang/Object;", "dirty owner guard");
+        if (!(code.get(2) instanceof JumpInsnNode jump)
+                || jump.getOpcode() != Opcodes.IFNULL) {
+            throw mismatch(target.name() + target.desc() + " dirty null guard changed");
+        }
+        requireVar(code.get(3), Opcodes.ALOAD, 0, "dirty owner receiver 2");
+        requireField(code.get(4), Opcodes.GETFIELD, node.name, ownerField,
+                "Ljava/lang/Object;", "dirty owner value");
+        requireVar(code.get(5), Opcodes.ALOAD, 0, "dirty role receiver");
+        requireField(code.get(6), Opcodes.GETFIELD, node.name, roleField,
+                "I", "dirty role value");
+        if (target.sourceLocal() >= 0) {
+            requireVar(code.get(7), Opcodes.ALOAD, target.sourceLocal(), "dirty source");
+        } else if (code.get(7).getOpcode() != Opcodes.ACONST_NULL) {
+            throw mismatch(target.name() + target.desc() + " null dirty source changed");
+        }
+        requireCall(asMethod(code.get(8), "commodity temporal dirty call"),
+                Opcodes.INVOKESTATIC, HOOKS, hookName, hookDesc,
+                "commodity temporal dirty call");
+        if (nextMeaningful(jump.label) != code.get(9)) {
+            throw mismatch(target.name() + target.desc() + " dirty guard target changed");
+        }
+    }
+
+    private record TemporalDirtyMethod(String name, String desc, int sourceLocal) {}
+
+
+    private static AbstractInsnNode firstExecutable(MethodNode method) {
+        AbstractInsnNode first = method.instructions.getFirst();
+        while (first != null && first.getOpcode() < 0) first = first.getNext();
+        return first;
+    }
+
+
+    private static void removeInstructionRange(MethodNode method, AbstractInsnNode start,
+                                               AbstractInsnNode end, String label) {
+        Set<AbstractInsnNode> removed = new HashSet<>();
+        AbstractInsnNode cursor = start;
+        while (cursor != null) {
+            removed.add(cursor);
+            if (cursor == end) break;
+            cursor = cursor.getNext();
+        }
+        if (cursor == null) throw mismatch(label + " end is not reachable from start");
+        for (AbstractInsnNode insn : method.instructions.toArray()) {
+            if (removed.contains(insn)) continue;
+            if (insn instanceof JumpInsnNode jump && removed.contains(jump.label)) {
+                throw mismatch(label + " has an external jump into the removed range");
+            }
+        }
+        for (TryCatchBlockNode block : method.tryCatchBlocks) {
+            if (removed.contains(block.start) || removed.contains(block.end)
+                    || removed.contains(block.handler)) {
+                throw mismatch(label + " crosses an exception-handler boundary");
+            }
+        }
+        cursor = start;
+        while (cursor != null) {
+            AbstractInsnNode next = cursor.getNext();
+            method.instructions.remove(cursor);
+            if (cursor == end) break;
+            cursor = next;
+        }
+    }
+
+    private record MarketCommodityLoop(AbstractInsnNode start, AbstractInsnNode end,
+                                       int daysLocal) {}
+
+
+    // ---------------------------------------------------------------------
+    // Dormant inherited BaseIndustry.advance() fast path
+    // ---------------------------------------------------------------------
+
+    private static final String BASE_INDUSTRY_STATE_FIELD = "spp$marketNoOpState";
+    private static final String BASE_INDUSTRY_COUNTDOWN_FIELD = "spp$marketNoOpCountdown";
+    private static final String BASE_INDUSTRY_RAW_ADVANCE = "spp$baseIndustryRawAdvance";
+    private static final String BASE_INDUSTRY_TEMPLATE_OWNER =
+            "com/starsector/prepatcher/agent/templates/BaseIndustryDormantTemplate";
+    private static final String BASE_INDUSTRY_TEMPLATE_RESOURCE =
+            "/" + BASE_INDUSTRY_TEMPLATE_OWNER + ".class";
+    private static final int BASE_INDUSTRY_AUDIT_PLACEHOLDER = 0x5A17CAFE;
+
+    /**
+     * Optimizes only the empty inherited BaseIndustry.advance() steady state.
+     * MarketConditionPlugin dispatch is intentionally untouched: benchmarking
+     * showed that classifying an empty condition costs more than the empty
+     * virtual callback itself. The complete original BaseIndustry method is
+     * retained and periodically audited.
+     */
+    private PatchReport patchBaseIndustryDormantFastPath(ClassNode node) {
+        final int fieldAccess = Opcodes.ACC_PRIVATE | Opcodes.ACC_TRANSIENT
+                | Opcodes.ACC_SYNTHETIC;
+        int fieldsPresent = 0;
+        for (String fieldName : List.of(BASE_INDUSTRY_STATE_FIELD,
+                BASE_INDUSTRY_COUNTDOWN_FIELD)) {
+            List<FieldNode> matches = node.fields.stream()
+                    .filter(field -> field.name.equals(fieldName)).toList();
+            if (!matches.isEmpty()) {
+                fieldsPresent++;
+                requireCount("BaseIndustry dormant field " + fieldName, matches.size(), 1);
+                FieldNode field = matches.get(0);
+                if (!field.desc.equals("I") || field.access != fieldAccess
+                        || field.signature != null || field.value != null) {
+                    throw mismatch("foreign BaseIndustry dormant field " + fieldName);
+                }
+            }
+        }
+        if (fieldsPresent != 0) {
+            requireCount("complete BaseIndustry dormant field set", fieldsPresent, 2);
+            requireOptimizedBaseIndustryDormantShape(node);
+            throw already("direct dormant BaseIndustry fast path postcondition matches");
+        }
+
+        requireOriginalBaseIndustryDormantShape(node);
+        node.fields.add(new FieldNode(Opcodes.ASM8, fieldAccess,
+                BASE_INDUSTRY_STATE_FIELD, "I", null, null));
+        node.fields.add(new FieldNode(Opcodes.ASM8, fieldAccess,
+                BASE_INDUSTRY_COUNTDOWN_FIELD, "I", null, null));
+
+        MethodNode original = requireMethod(node, "advance", "(F)V");
+        MethodNode wrapper = renameForPrivateOriginal(node, original,
+                BASE_INDUSTRY_RAW_ADVANCE);
+        ClassNode template = loadBaseIndustryDormantTemplate();
+        installBaseIndustryTemplateBody(template, node.name, wrapper);
+        replaceBaseIndustryAuditPlaceholder(wrapper,
+                config.marketNoOpIndustryAuditFrames);
+
+        MethodNode setDisrupted = requireMethod(node, "setDisrupted", "(FZ)V");
+        AbstractInsnNode first = firstMeaningful(setDisrupted);
+        if (first == null) throw mismatch("BaseIndustry.setDisrupted has no code");
+        InsnList wake = new InsnList();
+        wake.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        wake.add(new InsnNode(Opcodes.ICONST_0));
+        wake.add(new FieldInsnNode(Opcodes.PUTFIELD, node.name,
+                BASE_INDUSTRY_STATE_FIELD, "I"));
+        wake.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        wake.add(new InsnNode(Opcodes.ICONST_0));
+        wake.add(new FieldInsnNode(Opcodes.PUTFIELD, node.name,
+                BASE_INDUSTRY_COUNTDOWN_FIELD, "I"));
+        setDisrupted.instructions.insertBefore(first, wake);
+
+        requireOptimizedBaseIndustryDormantShape(node);
+        PatchReport report = new PatchReport();
+        report.add("direct dormant inherited BaseIndustry fast path", 1);
+        return report;
+    }
+
+    private static void requireOriginalBaseIndustryDormantShape(ClassNode node) {
+        for (FieldNode field : node.fields) {
+            if (field.name.startsWith("spp$marketNoOp")) {
+                throw mismatch("foreign/partial BaseIndustry dormant field " + field.name);
+            }
+        }
+        requireCount("foreign BaseIndustry raw advance method",
+                (int) node.methods.stream().filter(method ->
+                        method.name.equals(BASE_INDUSTRY_RAW_ADVANCE)
+                                && method.desc.equals("(F)V")).count(), 0);
+        MethodNode advance = requireMethod(node, "advance", "(F)V");
+        requireCount("BaseIndustry.advance isDisrupted", countCalls(advance,
+                Opcodes.INVOKEVIRTUAL, node.name, "isDisrupted", "()Z"), 1);
+        requireCount("BaseIndustry.advance disruptionFinished", countCalls(advance,
+                Opcodes.INVOKEVIRTUAL, node.name, "disruptionFinished", "()V"), 1);
+        requireCount("BaseIndustry.advance building reads", countFields(advance,
+                Opcodes.GETFIELD, node.name, "building", "Z"), 1);
+        requireCount("BaseIndustry.advance wasDisrupted reads", countFields(advance,
+                Opcodes.GETFIELD, node.name, "wasDisrupted", "Z"), 1);
+        requireCount("BaseIndustry.advance wasDisrupted writes", countFields(advance,
+                Opcodes.PUTFIELD, node.name, "wasDisrupted", "Z"), 1);
+
+        MethodNode setDisrupted = requireMethod(node, "setDisrupted", "(FZ)V");
+        requireCount("BaseIndustry.setDisrupted canBeDisrupted", countCalls(setDisrupted,
+                Opcodes.INVOKEVIRTUAL, node.name, "canBeDisrupted", "()Z"), 1);
+        requireCount("BaseIndustry.setDisrupted dormant state writes", countFields(setDisrupted,
+                Opcodes.PUTFIELD, node.name, BASE_INDUSTRY_STATE_FIELD, "I"), 0);
+        requireCount("BaseIndustry.setDisrupted dormant countdown writes", countFields(setDisrupted,
+                Opcodes.PUTFIELD, node.name, BASE_INDUSTRY_COUNTDOWN_FIELD, "I"), 0);
+    }
+
+    private static void requireOptimizedBaseIndustryDormantShape(ClassNode node) {
+        final int fieldAccess = Opcodes.ACC_PRIVATE | Opcodes.ACC_TRANSIENT
+                | Opcodes.ACC_SYNTHETIC;
+        FieldNode state = requireField(node, BASE_INDUSTRY_STATE_FIELD, "I");
+        FieldNode countdown = requireField(node, BASE_INDUSTRY_COUNTDOWN_FIELD, "I");
+        if (state.access != fieldAccess || state.signature != null || state.value != null
+                || countdown.access != fieldAccess || countdown.signature != null
+                || countdown.value != null) {
+            throw mismatch("BaseIndustry dormant field metadata changed");
+        }
+
+        MethodNode wrapper = requireMethod(node, "advance", "(F)V");
+        MethodNode raw = requireMethod(node, BASE_INDUSTRY_RAW_ADVANCE, "(F)V");
+        int rawAccess = Opcodes.ACC_PRIVATE | Opcodes.ACC_SYNTHETIC;
+        if ((raw.access & (Opcodes.ACC_PUBLIC | Opcodes.ACC_PROTECTED
+                | Opcodes.ACC_PRIVATE | Opcodes.ACC_SYNTHETIC)) != rawAccess) {
+            throw mismatch("BaseIndustry raw advance access changed");
+        }
+        requireCount("BaseIndustry wrapper raw call", countCalls(wrapper,
+                -1, node.name, BASE_INDUSTRY_RAW_ADVANCE, "(F)V"), 1);
+        requireCount("BaseIndustry wrapper eligibility call", countCalls(wrapper,
+                Opcodes.INVOKESTATIC, HOOKS,
+                "isBaseIndustryDormantFastPathEligible", "(Ljava/lang/Object;)Z"), 1);
+        requireCount("BaseIndustry raw isDisrupted", countCalls(raw,
+                Opcodes.INVOKEVIRTUAL, node.name, "isDisrupted", "()Z"), 1);
+        requireCount("BaseIndustry raw disruptionFinished", countCalls(raw,
+                Opcodes.INVOKEVIRTUAL, node.name, "disruptionFinished", "()V"), 1);
+
+        for (AbstractInsnNode insn : wrapper.instructions.toArray()) {
+            if (insn instanceof LdcInsnNode ldc
+                    && Integer.valueOf(BASE_INDUSTRY_AUDIT_PLACEHOLDER).equals(ldc.cst)) {
+                throw mismatch("BaseIndustry audit placeholder leaked into target");
+            }
+        }
+
+        MethodNode setDisrupted = requireMethod(node, "setDisrupted", "(FZ)V");
+        List<AbstractInsnNode> code = meaningfulInstructions(setDisrupted);
+        if (code.size() < 6) throw mismatch("BaseIndustry.setDisrupted wake prologue is short");
+        requireVar(code.get(0), Opcodes.ALOAD, 0, "BaseIndustry wake receiver 1");
+        if (code.get(1).getOpcode() != Opcodes.ICONST_0) {
+            throw mismatch("BaseIndustry wake state constant changed");
+        }
+        requireField(code.get(2), Opcodes.PUTFIELD, node.name,
+                BASE_INDUSTRY_STATE_FIELD, "I", "BaseIndustry wake state");
+        requireVar(code.get(3), Opcodes.ALOAD, 0, "BaseIndustry wake receiver 2");
+        if (code.get(4).getOpcode() != Opcodes.ICONST_0) {
+            throw mismatch("BaseIndustry wake countdown constant changed");
+        }
+        requireField(code.get(5), Opcodes.PUTFIELD, node.name,
+                BASE_INDUSTRY_COUNTDOWN_FIELD, "I", "BaseIndustry wake countdown");
+        requireNoBaseIndustryTemplateReferences(node);
+    }
+
+    private static ClassNode loadBaseIndustryDormantTemplate() {
+        try (InputStream input = PrepatcherTransformer.class
+                .getResourceAsStream(BASE_INDUSTRY_TEMPLATE_RESOURCE)) {
+            if (input == null) throw mismatch("missing BaseIndustry dormant template resource");
+            ClassNode template = new ClassNode(Opcodes.ASM8);
+            new ClassReader(input).accept(template, 0);
+            if (!template.name.equals(BASE_INDUSTRY_TEMPLATE_OWNER)) {
+                throw mismatch("BaseIndustry dormant template owner changed: " + template.name);
+            }
+            return template;
+        } catch (IOException ex) {
+            throw mismatch("unable to read BaseIndustry dormant template: " + ex.getMessage());
+        }
+    }
+
+    private static void installBaseIndustryTemplateBody(ClassNode template,
+                                                         String targetOwner,
+                                                         MethodNode target) {
+        MethodNode source = requireMethod(template, "advance", "(F)V");
+        MethodNode copy = cloneAndRemapBaseIndustryTemplateMethod(source, targetOwner);
+        target.instructions.clear();
+        target.instructions.add(copy.instructions);
+        target.tryCatchBlocks.clear();
+        target.tryCatchBlocks.addAll(copy.tryCatchBlocks);
+        target.localVariables = copy.localVariables;
+        target.visibleLocalVariableAnnotations = copy.visibleLocalVariableAnnotations;
+        target.invisibleLocalVariableAnnotations = copy.invisibleLocalVariableAnnotations;
+        target.maxLocals = copy.maxLocals;
+        target.maxStack = copy.maxStack;
+    }
+
+    private static MethodNode cloneAndRemapBaseIndustryTemplateMethod(MethodNode source,
+                                                                       String targetOwner) {
+        MethodNode copy = new MethodNode(Opcodes.ASM8, source.access, source.name,
+                source.desc, source.signature, exceptions(source));
+        source.accept(copy);
+        remapBaseIndustryTemplateMethod(copy, targetOwner);
+        return copy;
+    }
+
+    private static void remapBaseIndustryTemplateMethod(MethodNode method,
+                                                         String targetOwner) {
+        method.desc = remapBaseIndustryTemplateText(method.desc, targetOwner);
+        method.signature = remapBaseIndustryTemplateText(method.signature, targetOwner);
+        if (method.exceptions != null) {
+            for (int i = 0; i < method.exceptions.size(); i++) {
+                method.exceptions.set(i,
+                        remapBaseIndustryTemplateText(method.exceptions.get(i), targetOwner));
+            }
+        }
+        for (AbstractInsnNode insn : method.instructions.toArray()) {
+            if (insn instanceof FieldInsnNode field) {
+                field.owner = remapBaseIndustryTemplateText(field.owner, targetOwner);
+                field.desc = remapBaseIndustryTemplateText(field.desc, targetOwner);
+            } else if (insn instanceof MethodInsnNode call) {
+                call.owner = remapBaseIndustryTemplateText(call.owner, targetOwner);
+                call.desc = remapBaseIndustryTemplateText(call.desc, targetOwner);
+            } else if (insn instanceof TypeInsnNode type) {
+                type.desc = remapBaseIndustryTemplateText(type.desc, targetOwner);
+            } else if (insn instanceof LdcInsnNode ldc && ldc.cst instanceof Type type) {
+                ldc.cst = Type.getType(remapBaseIndustryTemplateText(
+                        type.getDescriptor(), targetOwner));
+            } else if (insn instanceof MultiANewArrayInsnNode array) {
+                array.desc = remapBaseIndustryTemplateText(array.desc, targetOwner);
+            } else if (insn instanceof FrameNode frame) {
+                remapBaseIndustryFrameValues(frame.local, targetOwner);
+                remapBaseIndustryFrameValues(frame.stack, targetOwner);
+            } else if (insn instanceof InvokeDynamicInsnNode) {
+                throw mismatch("unexpected invokedynamic in BaseIndustry dormant template");
+            }
+        }
+        for (TryCatchBlockNode block : method.tryCatchBlocks) {
+            block.type = remapBaseIndustryTemplateText(block.type, targetOwner);
+        }
+        if (method.localVariables != null) {
+            for (LocalVariableNode local : method.localVariables) {
+                local.desc = remapBaseIndustryTemplateText(local.desc, targetOwner);
+                local.signature = remapBaseIndustryTemplateText(local.signature, targetOwner);
+            }
+        }
+    }
+
+    private static void remapBaseIndustryFrameValues(List<Object> values,
+                                                       String targetOwner) {
+        if (values == null) return;
+        for (int i = 0; i < values.size(); i++) {
+            Object value = values.get(i);
+            if (value instanceof String text) {
+                values.set(i, remapBaseIndustryTemplateText(text, targetOwner));
+            }
+        }
+    }
+
+    private static String remapBaseIndustryTemplateText(String value,
+                                                         String targetOwner) {
+        if (value == null) return null;
+        return value.replace(BASE_INDUSTRY_TEMPLATE_OWNER, targetOwner);
+    }
+
+    private static void replaceBaseIndustryAuditPlaceholder(MethodNode method,
+                                                             int auditFrames) {
+        int replacements = 0;
+        for (AbstractInsnNode insn : method.instructions.toArray()) {
+            if (insn instanceof LdcInsnNode ldc
+                    && Integer.valueOf(BASE_INDUSTRY_AUDIT_PLACEHOLDER).equals(ldc.cst)) {
+                ldc.cst = Integer.valueOf(auditFrames);
+                replacements++;
+            }
+        }
+        requireCount("BaseIndustry audit-frame placeholder", replacements, 1);
+    }
+
+    private static void requireNoBaseIndustryTemplateReferences(ClassNode node) {
+        for (FieldNode field : node.fields) {
+            if ((field.desc != null && field.desc.contains(BASE_INDUSTRY_TEMPLATE_OWNER))
+                    || (field.signature != null
+                    && field.signature.contains(BASE_INDUSTRY_TEMPLATE_OWNER))) {
+                throw mismatch("BaseIndustry template field reference leaked into target");
+            }
+        }
+        for (MethodNode method : node.methods) {
+            if ((method.desc != null && method.desc.contains(BASE_INDUSTRY_TEMPLATE_OWNER))
+                    || (method.signature != null
+                    && method.signature.contains(BASE_INDUSTRY_TEMPLATE_OWNER))) {
+                throw mismatch("BaseIndustry template method signature leaked into target");
+            }
+            for (AbstractInsnNode insn : method.instructions.toArray()) {
+                if (insn instanceof FieldInsnNode field
+                        && (field.owner.contains(BASE_INDUSTRY_TEMPLATE_OWNER)
+                        || field.desc.contains(BASE_INDUSTRY_TEMPLATE_OWNER))) {
+                    throw mismatch("BaseIndustry template field instruction leaked into target");
+                }
+                if (insn instanceof MethodInsnNode call
+                        && (call.owner.contains(BASE_INDUSTRY_TEMPLATE_OWNER)
+                        || call.desc.contains(BASE_INDUSTRY_TEMPLATE_OWNER))) {
+                    throw mismatch("BaseIndustry template method instruction leaked into target");
+                }
+                if (insn instanceof TypeInsnNode type
+                        && type.desc.contains(BASE_INDUSTRY_TEMPLATE_OWNER)) {
+                    throw mismatch("BaseIndustry template type instruction leaked into target");
+                }
+                if (insn instanceof LdcInsnNode ldc && ldc.cst instanceof Type type
+                        && type.getDescriptor().contains(BASE_INDUSTRY_TEMPLATE_OWNER)) {
+                    throw mismatch("BaseIndustry template class literal leaked into target");
+                }
+            }
+        }
+    }
+
+
+    // ---------------------------------------------------------------------
+    // MutableStatWithTempMods direct expiry-aware hybrid scheduler
+    // ---------------------------------------------------------------------
+
+    private static final String TEMP_MOD_LEGACY_STATE_FIELD = "spp$tempModExpiryState";
+    private static final String TEMP_MOD_TEMPLATE_OWNER =
+            "com/fs/starfarer/api/combat/StarsectorPrepatcherTempModHybridTemplate";
+    private static final String TEMP_MOD_TEMPLATE_RESOURCE =
+            "/" + TEMP_MOD_TEMPLATE_OWNER + ".class";
+    private static final String TEMP_MOD_RAW_ADVANCE = "spp$originalTempModAdvance";
+    private static final String TEMP_MOD_RAW_GET_MODS = "spp$rawGetMods";
+    private static final String TEMP_MOD_RAW_GET_MOD = "spp$rawGetMod";
+    private static final String TEMP_MOD_RAW_REMOVE = "spp$rawRemoveTemporaryMod";
+    private static final String TEMP_MOD_RAW_HAS = "spp$rawHasMod";
+    private static final String TEMP_MOD_RAW_WRITE = "spp$rawWriteReplace";
+
+    private static final String[][] TEMP_MOD_HYBRID_FIELDS = {
+            {"spp$tempModHybridDeferredDays", "F"},
+            {"spp$tempModHybridTimeToNext", "F"},
+            {"spp$tempModHybridScheduledMin", "F"},
+            {"spp$tempModHybridScheduledMinCount", "I"},
+            {"spp$tempModHybridKnownSize", "I"},
+            {"spp$tempModHybridFlags", "I"}
+    };
+
+    private static final String[][] TEMP_MOD_HYBRID_HELPERS = {
+            {"spp$tempModHybridUseVanilla", "()Z"},
+            {"spp$tempModHybridSynchronize", "()V"},
+            {"spp$tempModHybridAuditForCommodity", "()V"},
+            {"spp$tempModHybridDisableAndFlush", "()V"},
+            {"spp$tempModHybridApplyElapsed", "(FZZ)V"},
+            {"spp$tempModHybridRecomputeSchedule", "()V"},
+            {"spp$tempModHybridAfterSet", "(ZFF)V"},
+            {"spp$tempModHybridAfterRemoval", "(F)V"},
+            {"spp$tempModHybridSetSoleMinimum", "(F)V"},
+            {"spp$tempModHybridResetForEmpty", "()V"},
+            {"spp$tempModHybridTrackable", "(F)Z"}
+    };
+
+    /**
+     * Keeps the unified transform/guard/fail-open architecture, but moves the hot scheduler state
+     * directly into the game class. The nearest expiry is driven by repeated float subtraction,
+     * matching vanilla's frame of expiry, while all surviving modifiers are materialized only at
+     * a deadline or an externally observable mutation/read/save boundary.
+     */
+    private PatchReport patchTempModExpiryScheduler(ClassNode node) {
+        final int fieldAccess = Opcodes.ACC_PRIVATE | Opcodes.ACC_TRANSIENT
+                | Opcodes.ACC_SYNTHETIC;
+        for (FieldNode field : node.fields) {
+            if (field.name.equals(TEMP_MOD_LEGACY_STATE_FIELD)) {
+                throw mismatch("legacy 0.9.1 temp-mod state field is already present");
+            }
+        }
+
+        int hybridFieldsPresent = 0;
+        for (String[] spec : TEMP_MOD_HYBRID_FIELDS) {
+            List<FieldNode> matches = new ArrayList<>();
+            for (FieldNode field : node.fields) {
+                if (field.name.equals(spec[0])) matches.add(field);
+            }
+            if (!matches.isEmpty()) {
+                hybridFieldsPresent++;
+                requireCount("temp-mod hybrid field " + spec[0], matches.size(), 1);
+                FieldNode field = matches.get(0);
+                if (!field.desc.equals(spec[1]) || field.access != fieldAccess
+                        || field.signature != null || field.value != null) {
+                    throw mismatch("foreign temp-mod hybrid field " + spec[0]);
+                }
+            }
+        }
+        if (hybridFieldsPresent != 0) {
+            requireCount("complete temp-mod hybrid field set", hybridFieldsPresent,
+                    TEMP_MOD_HYBRID_FIELDS.length);
+            requireOptimizedTempModSchedulerShape(node);
+            throw already("direct temp-mod hybrid scheduler postcondition matches");
+        }
+
+        requireOriginalTempModSchedulerShape(node);
+        for (String[] spec : TEMP_MOD_HYBRID_FIELDS) {
+            node.fields.add(new FieldNode(Opcodes.ASM8, fieldAccess,
+                    spec[0], spec[1], null, null));
+        }
+
+        MethodNode advance = requireMethod(node, "advance", "(F)V");
+        MethodNode getMods = requireMethod(node, "getMods", "()Ljava/util/Map;");
+        MethodNode getMod = requireMethod(node, "getMod",
+                "(Ljava/lang/String;F)Lcom/fs/starfarer/api/combat/MutableStatWithTempMods$TemporaryStatMod;");
+        MethodNode remove = requireMethod(node, "removeTemporaryMod", "(Ljava/lang/String;)V");
+        MethodNode has = requireMethod(node, "hasMod", "(Ljava/lang/String;)Z");
+        MethodNode write = requireMethod(node, "writeReplace", "()Ljava/lang/Object;");
+
+        MethodNode advanceWrapper = renameForPrivateOriginal(node, advance, TEMP_MOD_RAW_ADVANCE);
+        MethodNode getModsWrapper = renameForPrivateOriginal(node, getMods, TEMP_MOD_RAW_GET_MODS);
+        MethodNode getModWrapper = renameForPrivateOriginal(node, getMod, TEMP_MOD_RAW_GET_MOD);
+        MethodNode removeWrapper = renameForPrivateOriginal(node, remove, TEMP_MOD_RAW_REMOVE);
+        MethodNode hasWrapper = renameForPrivateOriginal(node, has, TEMP_MOD_RAW_HAS);
+        MethodNode writeWrapper = renameForPrivateOriginal(node, write, TEMP_MOD_RAW_WRITE);
+
+        int rawGetModsCalls = 0;
+        for (MethodNode raw : List.of(advance, getMod, remove, has, write)) {
+            for (AbstractInsnNode insn : raw.instructions.toArray()) {
+                if (!(insn instanceof MethodInsnNode call)
+                        || !call.owner.equals(node.name)
+                        || !call.name.equals("getMods")
+                        || !call.desc.equals("()Ljava/util/Map;")) continue;
+                call.name = TEMP_MOD_RAW_GET_MODS;
+                call.setOpcode(Opcodes.INVOKESPECIAL);
+                call.itf = false;
+                rawGetModsCalls++;
+            }
+        }
+        requireCount("MutableStatWithTempMods raw getMods rewrites", rawGetModsCalls, 7);
+
+        ClassNode template = loadTempModHybridTemplate();
+        installTempModTemplateBody(template, node.name, "advance", "(F)V", advanceWrapper);
+        installTempModTemplateBody(template, node.name, "getMods", "()Ljava/util/Map;",
+                getModsWrapper);
+        installTempModTemplateBody(template, node.name, "getMod",
+                "(Ljava/lang/String;F)Lcom/fs/starfarer/api/combat/MutableStatWithTempMods$TemporaryStatMod;",
+                getModWrapper);
+        installTempModTemplateBody(template, node.name, "removeTemporaryMod",
+                "(Ljava/lang/String;)V", removeWrapper);
+        installTempModTemplateBody(template, node.name, "hasMod",
+                "(Ljava/lang/String;)Z", hasWrapper);
+        installTempModTemplateBody(template, node.name, "writeReplace",
+                "()Ljava/lang/Object;", writeWrapper);
+        for (String[] helper : TEMP_MOD_HYBRID_HELPERS) {
+            node.methods.add(copyTempModTemplateMethod(template, node.name, helper[0], helper[1]));
+        }
+
+        requireOptimizedTempModSchedulerShape(node);
+        PatchReport report = new PatchReport();
+        report.add("direct float-countdown MutableStatWithTempMods hybrid scheduler", 1);
+        return report;
+    }
+
+    private static void requireOriginalTempModSchedulerShape(ClassNode node) {
+        requireField(node, "tempMods", "Ljava/util/LinkedHashMap;");
+        for (FieldNode field : node.fields) {
+            if (field.name.startsWith("spp$tempModHybrid")
+                    || field.name.equals(TEMP_MOD_LEGACY_STATE_FIELD)) {
+                throw mismatch("foreign/partial temp-mod scheduler field " + field.name);
+            }
+        }
+        for (String raw : List.of(TEMP_MOD_RAW_ADVANCE, TEMP_MOD_RAW_GET_MODS,
+                TEMP_MOD_RAW_GET_MOD, TEMP_MOD_RAW_REMOVE, TEMP_MOD_RAW_HAS,
+                TEMP_MOD_RAW_WRITE)) {
+            for (MethodNode method : node.methods) {
+                if (method.name.equals(raw)) {
+                    throw mismatch("foreign/partial temp-mod scheduler method " + raw);
+                }
+            }
+        }
+        for (String[] helper : TEMP_MOD_HYBRID_HELPERS) {
+            if (!methods(node, helper[0], helper[1]).isEmpty()) {
+                throw mismatch("foreign/partial temp-mod hybrid helper " + helper[0]);
+            }
+        }
+
+        MethodNode advance = requireMethod(node, "advance", "(F)V");
+        MethodNode getMods = requireMethod(node, "getMods", "()Ljava/util/Map;");
+        MethodNode getMod = requireMethod(node, "getMod",
+                "(Ljava/lang/String;F)Lcom/fs/starfarer/api/combat/MutableStatWithTempMods$TemporaryStatMod;");
+        MethodNode remove = requireMethod(node, "removeTemporaryMod", "(Ljava/lang/String;)V");
+        MethodNode has = requireMethod(node, "hasMod", "(Ljava/lang/String;)Z");
+        MethodNode write = requireMethod(node, "writeReplace", "()Ljava/lang/Object;");
+
+        requireCount("MutableStatWithTempMods.advance getMods calls",
+                countCalls(advance, -1, node.name, "getMods", "()Ljava/util/Map;"), 2);
+        requireCount("MutableStatWithTempMods.advance iterator removals",
+                countCalls(advance, Opcodes.INVOKEINTERFACE, "java/util/Iterator",
+                        "remove", "()V"), 1);
+        requireCount("MutableStatWithTempMods.advance unmodify calls",
+                countCalls(advance, Opcodes.INVOKEVIRTUAL,
+                        null, "unmodify", "(Ljava/lang/String;)V"), 1);
+        requireCount("MutableStatWithTempMods.getMods map construction",
+                countNew(getMods, "java/util/LinkedHashMap"), 1);
+        requireCount("MutableStatWithTempMods.getMod getMods calls",
+                countCalls(getMod, -1, node.name, "getMods", "()Ljava/util/Map;"), 2);
+        requireCount("MutableStatWithTempMods.remove getMods calls",
+                countCalls(remove, -1, node.name, "getMods", "()Ljava/util/Map;"), 1);
+        requireCount("MutableStatWithTempMods.has getMods calls",
+                countCalls(has, -1, node.name, "getMods", "()Ljava/util/Map;"), 1);
+        requireCount("MutableStatWithTempMods.write getMods calls",
+                countCalls(write, -1, node.name, "getMods", "()Ljava/util/Map;"), 1);
+    }
+
+    private static void requireOptimizedTempModSchedulerShape(ClassNode node) {
+        final int fieldAccess = Opcodes.ACC_PRIVATE | Opcodes.ACC_TRANSIENT
+                | Opcodes.ACC_SYNTHETIC;
+        for (String[] spec : TEMP_MOD_HYBRID_FIELDS) {
+            FieldNode field = requireField(node, spec[0], spec[1]);
+            if (field.access != fieldAccess || field.signature != null || field.value != null) {
+                throw mismatch("temp-mod hybrid field shape changed: " + spec[0]);
+            }
+        }
+        for (FieldNode field : node.fields) {
+            if (field.name.equals(TEMP_MOD_LEGACY_STATE_FIELD)) {
+                throw mismatch("legacy temp-mod scheduler field coexists with hybrid");
+            }
+        }
+
+        requireCount("temp-mod public advance wrapper", methods(node, "advance", "(F)V").size(), 1);
+        requireCount("temp-mod raw advance", methods(node, TEMP_MOD_RAW_ADVANCE, "(F)V").size(), 1);
+        requireCount("temp-mod public getMods wrapper",
+                methods(node, "getMods", "()Ljava/util/Map;").size(), 1);
+        requireCount("temp-mod raw getMods",
+                methods(node, TEMP_MOD_RAW_GET_MODS, "()Ljava/util/Map;").size(), 1);
+        requireCount("temp-mod private getMod wrapper", methods(node, "getMod",
+                "(Ljava/lang/String;F)Lcom/fs/starfarer/api/combat/MutableStatWithTempMods$TemporaryStatMod;").size(), 1);
+        requireCount("temp-mod raw getMod", methods(node, TEMP_MOD_RAW_GET_MOD,
+                "(Ljava/lang/String;F)Lcom/fs/starfarer/api/combat/MutableStatWithTempMods$TemporaryStatMod;").size(), 1);
+        requireCount("temp-mod remove wrapper",
+                methods(node, "removeTemporaryMod", "(Ljava/lang/String;)V").size(), 1);
+        requireCount("temp-mod raw remove",
+                methods(node, TEMP_MOD_RAW_REMOVE, "(Ljava/lang/String;)V").size(), 1);
+        requireCount("temp-mod has wrapper",
+                methods(node, "hasMod", "(Ljava/lang/String;)Z").size(), 1);
+        requireCount("temp-mod raw has",
+                methods(node, TEMP_MOD_RAW_HAS, "(Ljava/lang/String;)Z").size(), 1);
+        requireCount("temp-mod write wrapper",
+                methods(node, "writeReplace", "()Ljava/lang/Object;").size(), 1);
+        requireCount("temp-mod raw write",
+                methods(node, TEMP_MOD_RAW_WRITE, "()Ljava/lang/Object;").size(), 1);
+        for (String[] helper : TEMP_MOD_HYBRID_HELPERS) {
+            MethodNode method = requireMethod(node, helper[0], helper[1]);
+            if ((method.access & Opcodes.ACC_PRIVATE) == 0
+                    || (method.access & Opcodes.ACC_SYNTHETIC) == 0) {
+                throw mismatch("temp-mod hybrid helper access changed: " + helper[0]);
+            }
+        }
+
+        MethodNode advance = requireMethod(node, "advance", "(F)V");
+        MethodNode getMods = requireMethod(node, "getMods", "()Ljava/util/Map;");
+        MethodNode getMod = requireMethod(node, "getMod",
+                "(Ljava/lang/String;F)Lcom/fs/starfarer/api/combat/MutableStatWithTempMods$TemporaryStatMod;");
+        MethodNode remove = requireMethod(node, "removeTemporaryMod", "(Ljava/lang/String;)V");
+        MethodNode has = requireMethod(node, "hasMod", "(Ljava/lang/String;)Z");
+        MethodNode write = requireMethod(node, "writeReplace", "()Ljava/lang/Object;");
+        MethodNode apply = requireMethod(node, "spp$tempModHybridApplyElapsed", "(FZZ)V");
+
+        requireCountAtLeast("temp-mod advance raw fallback",
+                countCalls(advance, -1, node.name, TEMP_MOD_RAW_ADVANCE, "(F)V"), 1);
+        requireCountAtLeast("temp-mod advance direct apply",
+                countCalls(advance, -1, node.name, "spp$tempModHybridApplyElapsed", "(FZZ)V"), 2);
+        requireCountAtLeast("temp-mod getMods raw path",
+                countCalls(getMods, -1, node.name, TEMP_MOD_RAW_GET_MODS, "()Ljava/util/Map;"), 1);
+        requireCountAtLeast("temp-mod getMod raw path",
+                countCalls(getMod, -1, node.name, TEMP_MOD_RAW_GET_MOD,
+                        "(Ljava/lang/String;F)Lcom/fs/starfarer/api/combat/MutableStatWithTempMods$TemporaryStatMod;"), 1);
+        requireCountAtLeast("temp-mod remove raw path",
+                countCalls(remove, -1, node.name, TEMP_MOD_RAW_REMOVE, "(Ljava/lang/String;)V"), 1);
+        requireCount("temp-mod has direct raw path",
+                countCalls(has, -1, node.name, TEMP_MOD_RAW_HAS, "(Ljava/lang/String;)Z"), 1);
+        requireCountAtLeast("temp-mod write raw path",
+                countCalls(write, -1, node.name, TEMP_MOD_RAW_WRITE, "()Ljava/lang/Object;"), 1);
+        requireCount("temp-mod direct iterator removal",
+                countCalls(apply, Opcodes.INVOKEINTERFACE, "java/util/Iterator", "remove", "()V"), 1);
+        requireCount("temp-mod direct unmodify",
+                countCalls(apply, Opcodes.INVOKEVIRTUAL, null, "unmodify", "(Ljava/lang/String;)V"), 1);
+
+        requireCount("temp-mod hybrid initial telemetry", countCallsInClass(node,
+                TEMP_MOD_HOOKS, "recordHybridInitialSweep", "(II)V"), 1);
+        requireCount("temp-mod hybrid expiry telemetry", countCallsInClass(node,
+                TEMP_MOD_HOOKS, "recordHybridExpirySweep", "(II)V"), 1);
+        requireCount("temp-mod hybrid synchronization telemetry", countCallsInClass(node,
+                TEMP_MOD_HOOKS, "recordHybridSynchronizationSweep", "(II)V"), 1);
+        requireCount("temp-mod hybrid rebuild telemetry", countCallsInClass(node,
+                TEMP_MOD_HOOKS, "recordHybridScheduleRebuild", "(I)V"), 1);
+        requireCount("temp-mod hybrid exposure telemetry", countCallsInClass(node,
+                TEMP_MOD_HOOKS, "recordHybridExternalExposure", "()V"), 1);
+        requireCount("temp-mod hybrid subclass telemetry", countCallsInClass(node,
+                TEMP_MOD_HOOKS, "recordHybridSubclassFallback", "()V"), 1);
+        requireCount("temp-mod hybrid failure telemetry", countCallsInClass(node,
+                TEMP_MOD_HOOKS, "recordHybridFailureFallback", "()V"), 1);
+        requireCount("legacy per-frame temp-mod hook removed", countCallsInClass(node,
+                TEMP_MOD_HOOKS, "advance", null), 0);
+
+        MethodNode rawAdvance = requireMethod(node, TEMP_MOD_RAW_ADVANCE, "(F)V");
+        MethodNode rawGetMod = requireMethod(node, TEMP_MOD_RAW_GET_MOD,
+                "(Ljava/lang/String;F)Lcom/fs/starfarer/api/combat/MutableStatWithTempMods$TemporaryStatMod;");
+        MethodNode rawRemove = requireMethod(node, TEMP_MOD_RAW_REMOVE, "(Ljava/lang/String;)V");
+        MethodNode rawHas = requireMethod(node, TEMP_MOD_RAW_HAS, "(Ljava/lang/String;)Z");
+        MethodNode rawWrite = requireMethod(node, TEMP_MOD_RAW_WRITE, "()Ljava/lang/Object;");
+        int rawCalls = 0;
+        for (MethodNode raw : List.of(rawAdvance, rawGetMod, rawRemove, rawHas, rawWrite)) {
+            rawCalls += countCalls(raw, -1, node.name,
+                    TEMP_MOD_RAW_GET_MODS, "()Ljava/util/Map;");
+            requireCount("raw temp-mod method calls public getMods",
+                    countCalls(raw, -1, node.name, "getMods", "()Ljava/util/Map;"), 0);
+        }
+        requireCount("raw temp-mod getMods call count", rawCalls, 7);
+        requireNoTempModTemplateReferences(node);
+    }
+
+    private static int countCallsInClass(ClassNode node, String owner, String name, String desc) {
+        int count = 0;
+        for (MethodNode method : node.methods) {
+            count += countCalls(method, -1, owner, name, desc);
+        }
+        return count;
+    }
+
+    private static MethodNode renameForPrivateOriginal(ClassNode node, MethodNode original,
+                                                        String rawName) {
+        String wrapperName = original.name;
+        MethodNode wrapper = new MethodNode(Opcodes.ASM8, original.access, wrapperName,
+                original.desc, original.signature, exceptions(original));
+        moveWrapperMetadata(original, wrapper, node.name + "." + wrapperName + original.desc);
+        original.name = rawName;
+        makePrivateSynthetic(original);
+        node.methods.add(wrapper);
+        return wrapper;
+    }
+
+    private static ClassNode loadTempModHybridTemplate() {
+        try (InputStream input = PrepatcherTransformer.class
+                .getResourceAsStream(TEMP_MOD_TEMPLATE_RESOURCE)) {
+            if (input == null) throw mismatch("missing temp-mod hybrid template resource");
+            ClassNode template = new ClassNode(Opcodes.ASM8);
+            new ClassReader(input).accept(template, 0);
+            if (!template.name.equals(TEMP_MOD_TEMPLATE_OWNER)) {
+                throw mismatch("temp-mod hybrid template owner changed: " + template.name);
+            }
+            return template;
+        } catch (IOException ex) {
+            throw mismatch("unable to read temp-mod hybrid template: " + ex.getMessage());
+        }
+    }
+
+    private static void installTempModTemplateBody(ClassNode template, String targetOwner,
+                                                    String name, String desc, MethodNode target) {
+        MethodNode source = requireMethod(template, name, desc);
+        MethodNode copy = cloneAndRemapTempModTemplateMethod(source, targetOwner);
+        target.instructions.clear();
+        target.instructions.add(copy.instructions);
+        target.tryCatchBlocks.clear();
+        target.tryCatchBlocks.addAll(copy.tryCatchBlocks);
+        target.localVariables = copy.localVariables;
+        target.visibleLocalVariableAnnotations = copy.visibleLocalVariableAnnotations;
+        target.invisibleLocalVariableAnnotations = copy.invisibleLocalVariableAnnotations;
+        target.maxLocals = copy.maxLocals;
+        target.maxStack = copy.maxStack;
+    }
+
+    private static MethodNode copyTempModTemplateMethod(ClassNode template, String targetOwner,
+                                                         String name, String desc) {
+        MethodNode source = requireMethod(template, name, desc);
+        MethodNode copy = cloneAndRemapTempModTemplateMethod(source, targetOwner);
+        copy.access = (copy.access & Opcodes.ACC_STATIC)
+                | Opcodes.ACC_PRIVATE | Opcodes.ACC_SYNTHETIC;
+        return copy;
+    }
+
+    private static MethodNode cloneAndRemapTempModTemplateMethod(MethodNode source,
+                                                                  String targetOwner) {
+        MethodNode copy = new MethodNode(Opcodes.ASM8, source.access, source.name,
+                source.desc, source.signature, exceptions(source));
+        source.accept(copy);
+        remapTempModTemplateMethod(copy, targetOwner);
+        return copy;
+    }
+
+    private static void remapTempModTemplateMethod(MethodNode method, String targetOwner) {
+        method.desc = remapTempModTemplateText(method.desc, targetOwner);
+        method.signature = remapTempModTemplateText(method.signature, targetOwner);
+        if (method.exceptions != null) {
+            for (int i = 0; i < method.exceptions.size(); i++) {
+                method.exceptions.set(i, remapTempModTemplateText(method.exceptions.get(i), targetOwner));
+            }
+        }
+        for (AbstractInsnNode insn : method.instructions.toArray()) {
+            if (insn instanceof FieldInsnNode field) {
+                field.owner = remapTempModTemplateText(field.owner, targetOwner);
+                field.desc = remapTempModTemplateText(field.desc, targetOwner);
+            } else if (insn instanceof MethodInsnNode call) {
+                call.owner = remapTempModTemplateText(call.owner, targetOwner);
+                call.desc = remapTempModTemplateText(call.desc, targetOwner);
+            } else if (insn instanceof TypeInsnNode type) {
+                type.desc = remapTempModTemplateText(type.desc, targetOwner);
+            } else if (insn instanceof LdcInsnNode ldc && ldc.cst instanceof Type type) {
+                ldc.cst = Type.getType(remapTempModTemplateText(type.getDescriptor(), targetOwner));
+            } else if (insn instanceof MultiANewArrayInsnNode array) {
+                array.desc = remapTempModTemplateText(array.desc, targetOwner);
+            } else if (insn instanceof FrameNode frame) {
+                remapTempModFrameValues(frame.local, targetOwner);
+                remapTempModFrameValues(frame.stack, targetOwner);
+            } else if (insn instanceof InvokeDynamicInsnNode) {
+                throw mismatch("unexpected invokedynamic in temp-mod hybrid template");
+            }
+        }
+        for (TryCatchBlockNode block : method.tryCatchBlocks) {
+            block.type = remapTempModTemplateText(block.type, targetOwner);
+        }
+        if (method.localVariables != null) {
+            for (LocalVariableNode local : method.localVariables) {
+                local.desc = remapTempModTemplateText(local.desc, targetOwner);
+                local.signature = remapTempModTemplateText(local.signature, targetOwner);
+            }
+        }
+    }
+
+    private static void remapTempModFrameValues(List<Object> values, String targetOwner) {
+        if (values == null) return;
+        for (int i = 0; i < values.size(); i++) {
+            Object value = values.get(i);
+            if (value instanceof String text) {
+                values.set(i, remapTempModTemplateText(text, targetOwner));
+            }
+        }
+    }
+
+    private static String remapTempModTemplateText(String value, String targetOwner) {
+        if (value == null) return null;
+        return value.replace(TEMP_MOD_TEMPLATE_OWNER, targetOwner);
+    }
+
+    private static void requireNoTempModTemplateReferences(ClassNode node) {
+        for (FieldNode field : node.fields) {
+            if ((field.desc != null && field.desc.contains(TEMP_MOD_TEMPLATE_OWNER))
+                    || (field.signature != null && field.signature.contains(TEMP_MOD_TEMPLATE_OWNER))) {
+                throw mismatch("temp-mod template field reference leaked into target");
+            }
+        }
+        for (MethodNode method : node.methods) {
+            if ((method.desc != null && method.desc.contains(TEMP_MOD_TEMPLATE_OWNER))
+                    || (method.signature != null && method.signature.contains(TEMP_MOD_TEMPLATE_OWNER))) {
+                throw mismatch("temp-mod template method signature leaked into target");
+            }
+            for (AbstractInsnNode insn : method.instructions.toArray()) {
+                if (insn instanceof FieldInsnNode field
+                        && (field.owner.contains(TEMP_MOD_TEMPLATE_OWNER)
+                        || field.desc.contains(TEMP_MOD_TEMPLATE_OWNER))) {
+                    throw mismatch("temp-mod template field instruction leaked into target");
+                }
+                if (insn instanceof MethodInsnNode call
+                        && (call.owner.contains(TEMP_MOD_TEMPLATE_OWNER)
+                        || call.desc.contains(TEMP_MOD_TEMPLATE_OWNER))) {
+                    throw mismatch("temp-mod template method instruction leaked into target");
+                }
+                if (insn instanceof TypeInsnNode type
+                        && type.desc.contains(TEMP_MOD_TEMPLATE_OWNER)) {
+                    throw mismatch("temp-mod template type instruction leaked into target");
+                }
+                if (insn instanceof LdcInsnNode ldc && ldc.cst instanceof Type type
+                        && type.getDescriptor().contains(TEMP_MOD_TEMPLATE_OWNER)) {
+                    throw mismatch("temp-mod template class literal leaked into target");
+                }
+            }
+        }
+    }
+
+
+    private static void replaceMethodBody(MethodNode method, InsnList code, int maxLocals) {
+        method.instructions.clear();
+        method.instructions.add(code);
+        method.tryCatchBlocks.clear();
+        if (method.localVariables != null) method.localVariables.clear();
+        if (method.visibleLocalVariableAnnotations != null) method.visibleLocalVariableAnnotations.clear();
+        if (method.invisibleLocalVariableAnnotations != null) method.invisibleLocalVariableAnnotations.clear();
+        method.maxLocals = maxLocals;
+        method.maxStack = 8;
+    }
+
+    private static int countNew(MethodNode method, String type) {
+        int count = 0;
+        for (AbstractInsnNode insn : method.instructions.toArray()) {
+            if (insn instanceof TypeInsnNode allocation && allocation.getOpcode() == Opcodes.NEW
+                    && allocation.desc.equals(type)) count++;
+        }
+        return count;
+    }
+
     /**
      * CommodityOnMarket.reapplyEventMod() normally calls unmodifyFlat("eMod")
      * for every commodity every campaign frame, including the overwhelmingly
@@ -2981,11 +4864,15 @@ public final class PrepatcherTransformer implements ClassFileTransformer {
         // removal established that invariant, repeated absent HashMap.remove()
         // calls are unnecessary until a nonzero quantity clears the proof.
         code.add(zeroQuantity);
+        code.add(new FrameNode(Opcodes.F_FULL, 2,
+                new Object[]{owner, Opcodes.FLOAT}, 0, null));
         code.add(new VarInsnNode(Opcodes.ALOAD, 0));
         code.add(new FieldInsnNode(Opcodes.GETFIELD, owner, knownAbsentField, "Z"));
         code.add(new JumpInsnNode(Opcodes.IFEQ, applyZeroRemoval));
         code.add(new InsnNode(Opcodes.RETURN));
         code.add(applyZeroRemoval);
+        code.add(new FrameNode(Opcodes.F_FULL, 2,
+                new Object[]{owner, Opcodes.FLOAT}, 0, null));
         code.add(new VarInsnNode(Opcodes.ALOAD, 0));
         code.add(new FieldInsnNode(Opcodes.GETFIELD, owner, availableField, "L" + stat + ";"));
         code.add(new LdcInsnNode("eMod"));
@@ -2995,6 +4882,8 @@ public final class PrepatcherTransformer implements ClassFileTransformer {
         code.add(new InsnNode(Opcodes.ICONST_1));
         code.add(new FieldInsnNode(Opcodes.PUTFIELD, owner, knownAbsentField, "Z"));
         code.add(done);
+        code.add(new FrameNode(Opcodes.F_FULL, 2,
+                new Object[]{owner, Opcodes.FLOAT}, 0, null));
         code.add(new InsnNode(Opcodes.RETURN));
 
         method.instructions.clear();
@@ -5107,6 +6996,8 @@ public final class PrepatcherTransformer implements ClassFileTransformer {
 
     private record SnapshotHookPlan(MethodInsnNode hook, VarInsnNode store) {}
     private record AllocationPair(TypeInsnNode allocation, AbstractInsnNode duplicate) {}
+    private record PersistentSnapshotPlan(MethodInsnNode constructor, AllocationPair allocation,
+                                          AbstractInsnNode sourceReceiver, String accessor) {}
 
     private enum PatchState { ORIGINAL, PATCHED }
 

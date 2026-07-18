@@ -12,7 +12,7 @@ import java.util.Map;
 import java.util.Set;
 
 public final class PrepatcherAgent {
-    public static final String VERSION = "0.9.3";
+    public static final String VERSION = "0.9.5";
     private PrepatcherAgent() {}
 
     public static void premain(String agentArgs, Instrumentation instrumentation) {

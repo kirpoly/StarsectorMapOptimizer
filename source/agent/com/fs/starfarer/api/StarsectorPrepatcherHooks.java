@@ -10,8 +10,12 @@ import com.fs.starfarer.api.campaign.StarSystemAPI;
 import com.fs.starfarer.api.campaign.comm.IntelInfoPlugin;
 import com.fs.starfarer.api.campaign.econ.MarketAPI;
 import com.fs.starfarer.api.campaign.rules.MemoryAPI;
+import com.fs.starfarer.api.impl.campaign.econ.impl.BaseIndustry;
+import com.fs.starfarer.api.combat.MutableStatWithTempMods;
 import com.fs.starfarer.campaign.CampaignEngine;
+import com.fs.starfarer.campaign.econ.CommodityOnMarket;
 import com.fs.starfarer.campaign.econ.Economy;
+import com.fs.starfarer.campaign.econ.Market;
 import com.fs.starfarer.campaign.econ.reach.ReachEconomy;
 import com.fs.starfarer.api.impl.campaign.procgen.Constellation;
 import com.fs.starfarer.api.impl.campaign.procgen.StarSystemGenerator;
@@ -23,6 +27,10 @@ import com.starsector.prepatcher.agent.PrepatcherLog;
 import org.lwjgl.util.vector.Vector2f;
 
 import java.lang.ref.WeakReference;
+import java.lang.invoke.MethodHandle;
+import java.lang.invoke.MethodHandles;
+import java.lang.invoke.MethodType;
+import java.lang.invoke.VarHandle;
 import java.lang.reflect.Field;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
@@ -179,6 +187,50 @@ public final class StarsectorPrepatcherHooks {
     private static final LongAdder PLANET_CONDITION_MARKET_HOT_ADVANCES = new LongAdder();
     private static final LongAdder PLANET_CONDITION_MARKET_SAVE_FLUSHES = new LongAdder();
     private static final LongAdder PLANET_CONDITION_MARKET_FALLBACKS = new LongAdder();
+    // Aggregate persistent-snapshot counters are retained for backward-compatible logs.
+    private static final LongAdder ECONOMY_PERSISTENT_SNAPSHOT_REBUILDS = new LongAdder();
+    private static final LongAdder ECONOMY_PERSISTENT_SNAPSHOT_AUDITS = new LongAdder();
+    private static final LongAdder ECONOMY_PERSISTENT_SNAPSHOT_MISMATCHES = new LongAdder();
+    private static final LongAdder ECONOMY_PERSISTENT_SNAPSHOT_ELEMENTS = new LongAdder();
+    // Split counters make it possible to tell whether markets, conditions, or industries
+    // still dominate after the owner-local snapshot path is enabled.
+    private static final LongAdder ECONOMY_MARKET_PERSISTENT_HITS = new LongAdder();
+    private static final LongAdder ECONOMY_MARKET_PERSISTENT_REBUILDS = new LongAdder();
+    private static final LongAdder ECONOMY_MARKET_PERSISTENT_AUDITS = new LongAdder();
+    private static final LongAdder ECONOMY_MARKET_PERSISTENT_MISMATCHES = new LongAdder();
+    private static final LongAdder ECONOMY_MARKET_PERSISTENT_ELEMENTS = new LongAdder();
+    private static final LongAdder MARKET_CONDITION_PERSISTENT_HITS = new LongAdder();
+    private static final LongAdder MARKET_CONDITION_PERSISTENT_REBUILDS = new LongAdder();
+    private static final LongAdder MARKET_CONDITION_PERSISTENT_AUDITS = new LongAdder();
+    private static final LongAdder MARKET_CONDITION_PERSISTENT_MISMATCHES = new LongAdder();
+    private static final LongAdder MARKET_CONDITION_PERSISTENT_ELEMENTS = new LongAdder();
+    private static final LongAdder MARKET_INDUSTRY_PERSISTENT_HITS = new LongAdder();
+    private static final LongAdder MARKET_INDUSTRY_PERSISTENT_REBUILDS = new LongAdder();
+    private static final LongAdder MARKET_INDUSTRY_PERSISTENT_AUDITS = new LongAdder();
+    private static final LongAdder MARKET_INDUSTRY_PERSISTENT_MISMATCHES = new LongAdder();
+    private static final LongAdder MARKET_INDUSTRY_PERSISTENT_ELEMENTS = new LongAdder();
+    private static final LongAdder COMMODITY_TEMPORAL_MARKET_CALLS = new LongAdder();
+    private static final LongAdder COMMODITY_TEMPORAL_ENTRIES = new LongAdder();
+    private static final LongAdder COMMODITY_TEMPORAL_ACTIVE_ADVANCES = new LongAdder();
+    private static final LongAdder COMMODITY_TEMPORAL_INACTIVE_SKIPS = new LongAdder();
+    private static final LongAdder COMMODITY_TEMPORAL_REAPPLIES = new LongAdder();
+    private static final LongAdder COMMODITY_TEMPORAL_AVAILABLE_REAPPLIES = new LongAdder();
+    private static final LongAdder COMMODITY_TEMPORAL_DIRTY_SIGNALS = new LongAdder();
+    private static final LongAdder COMMODITY_TEMPORAL_EXPOSURES = new LongAdder();
+    private static final LongAdder COMMODITY_TEMPORAL_AUDITS = new LongAdder();
+    private static final LongAdder COMMODITY_TEMPORAL_REBUILDS = new LongAdder();
+    private static final LongAdder COMMODITY_TEMPORAL_FALLBACKS = new LongAdder();
+    // The four high-volume market counters are sampled once per 64 calls. Exact
+    // counters remain only on rare state transitions/fallbacks so observability
+    // cannot become a new economy hot path.
+    private static final int COMMODITY_TEMPORAL_METRIC_SAMPLE_SHIFT = 6;
+    private static final int COMMODITY_TEMPORAL_METRIC_SAMPLE_MASK =
+            (1 << COMMODITY_TEMPORAL_METRIC_SAMPLE_SHIFT) - 1;
+    private static int commodityTemporalMetricsTick;
+    private static final LongAdder PERSISTENT_STRUCTURE_EPOCHS = new LongAdder();
+    private static final LongAdder ECONOMY_LOCATION_EPOCH_HITS = new LongAdder();
+    private static final LongAdder ECONOMY_LOCATION_AUDITS = new LongAdder();
+    private static final LongAdder ECONOMY_LOCATION_SEQUENCE_MISMATCHES = new LongAdder();
     private static final LongAdder SHIP_SCRATCH_LISTS = new LongAdder();
     private static final LongAdder SHIP_SCRATCH_SETS = new LongAdder();
     private static final LongAdder PARTICLE_GROUPS = new LongAdder();
@@ -702,6 +754,37 @@ public final class StarsectorPrepatcherHooks {
         }
     };
 
+
+    /**
+     * One-time per-runtime-class eligibility check for the direct dormant
+     * BaseIndustry fast path. The per-frame wrapper never reflects or touches a
+     * global identity map. Subclasses that override advance(), isDisrupted(), or
+     * getDisruptedKey() retain the exact vanilla callback path.
+     */
+    private static final ClassValue<Boolean> BASE_INDUSTRY_DORMANT_ELIGIBLE =
+            new ClassValue<>() {
+                @Override
+                protected Boolean computeValue(Class<?> type) {
+                    try {
+                        if (!BaseIndustry.class.isAssignableFrom(type)) return Boolean.FALSE;
+                        return type.getMethod("advance", float.class).getDeclaringClass()
+                                        == BaseIndustry.class
+                                && type.getMethod("isDisrupted").getDeclaringClass()
+                                        == BaseIndustry.class
+                                && type.getMethod("getDisruptedKey").getDeclaringClass()
+                                        == BaseIndustry.class;
+                    } catch (ReflectiveOperationException | SecurityException ex) {
+                        return Boolean.FALSE;
+                    }
+                }
+            };
+
+    /** Called only on the first full BaseIndustry.advance() for an instance. */
+    public static boolean isBaseIndustryDormantFastPathEligible(Object industry) {
+        return industry != null
+                && BASE_INDUSTRY_DORMANT_ELIGIBLE.get(industry.getClass());
+    }
+
     @SuppressWarnings({"rawtypes", "unchecked"})
     public static ArrayList borrowEntityList(Collection source) {
         PrepatcherConfig c = config;
@@ -781,13 +864,27 @@ public final class StarsectorPrepatcherHooks {
     // ---------------------------------------------------------------------
 
     /**
-     * Replaces Economy.advance()'s unconditional dirty mark while still invoking
-     * the original ReachEconomy.updateLocationMap() every frame. Explicit dirty
-     * marks made by mods therefore remain authoritative and are processed in the
-     * same frame. The optimizer only omits the redundant automatic dirty mark
-     * when the exact ordered market/location/id fingerprint is unchanged.
+     * Compatibility path used when persistent structure epochs are disabled.
+     * It retains the original every-frame ordered fingerprint comparison.
      */
     public static void updateEconomyLocationMapIfNeeded(ReachEconomy economy) {
+        updateEconomyLocationMapIfNeeded0(economy, null, false);
+    }
+
+    /**
+     * Epoch-aware location-index invalidation. Explicit dirty marks made by mods
+     * remain authoritative because ReachEconomy.updateLocationMap() is still
+     * invoked every frame. The epoch suppresses only the optimizer's own full
+     * market fingerprint scan; a periodic audit catches direct live-list, market
+     * id, and containing-location mutations that bypass transformed mutators.
+     */
+    public static void updateEconomyLocationMapIfNeededPersistent(
+            ReachEconomy economy, Object persistentState) {
+        updateEconomyLocationMapIfNeeded0(economy, persistentState, true);
+    }
+
+    private static void updateEconomyLocationMapIfNeeded0(
+            ReachEconomy economy, Object persistentState, boolean persistentRequested) {
         PrepatcherConfig c = config;
         long generation = campaignCacheGeneration;
         if (economy == null || c == null || !c.economyLocationCache
@@ -799,50 +896,75 @@ public final class StarsectorPrepatcherHooks {
             return;
         }
 
+        PersistentSnapshotState ownerState = persistentRequested
+                && c.economyPersistentSnapshots
+                && persistentState instanceof PersistentSnapshotState candidate
+                && candidate.acceptKind(0)
+                ? candidate : null;
         boolean forceDirty = true;
         List<MarketAPI> markets = null;
         EconomyLocationState previous = null;
+        long now = System.nanoTime();
+        long auditNs = Math.max(0L, c.economyStructureAuditMs) * 1_000_000L;
+
         try {
             markets = economy.getMarkets();
-            Map<ReachEconomy, EconomyLocationState> states = ECONOMY_LOCATION_STATES;
-            synchronized (states) {
-                if (states == ECONOMY_LOCATION_STATES
-                        && campaignCachesReady(generation, economy)) {
-                    previous = states.get(economy);
+            if (ownerState != null) {
+                long observedEpoch = ownerState.epoch;
+                previous = ownerState.locationState;
+                boolean epochChanged = ownerState.locationEpoch != observedEpoch;
+                boolean sourceChanged = previous != null && ownerState.locationSourceIdentity != markets;
+                boolean audit = previous == null || epochChanged || sourceChanged
+                        || auditNs <= 0L || now >= ownerState.nextLocationAuditNanos;
+                if (!audit) {
+                    forceDirty = false;
+                    ECONOMY_LOCATION_EPOCH_HITS.increment();
+                } else {
+                    ECONOMY_LOCATION_AUDITS.increment();
+                    int mismatch = previous == null
+                            ? EconomyLocationState.SEQUENCE_MISMATCH
+                            : previous.mismatchKind(markets);
+                    // A direct replacement/reorder/add/remove that bypassed Economy mutators
+                    // must also invalidate the persistent market snapshot. Location/id-only
+                    // changes rebuild ReachEconomy indexes but do not require a new list snapshot.
+                    boolean sequenceChanged = sourceChanged
+                            || mismatch == EconomyLocationState.SEQUENCE_MISMATCH;
+                    if (!epochChanged && sequenceChanged) {
+                        ownerState.epoch++;
+                        observedEpoch = ownerState.epoch;
+                        persistentEpoch(ownerState.kind);
+                        persistentMismatch(0);
+                        ECONOMY_LOCATION_SEQUENCE_MISMATCHES.increment();
+                    }
+                    forceDirty = previous == null || epochChanged || sourceChanged
+                            || mismatch != EconomyLocationState.MATCH;
+                    if (!forceDirty) {
+                        ownerState.locationEpoch = observedEpoch;
+                        ownerState.nextLocationAuditNanos = nextAuditNanos(now, auditNs);
+                    }
                 }
+            } else {
+                Map<ReachEconomy, EconomyLocationState> states = ECONOMY_LOCATION_STATES;
+                synchronized (states) {
+                    if (states == ECONOMY_LOCATION_STATES
+                            && campaignCachesReady(generation, economy)) {
+                        previous = states.get(economy);
+                    }
+                }
+                forceDirty = previous == null
+                        || previous.mismatchKind(markets) != EconomyLocationState.MATCH;
             }
-            forceDirty = previous == null || !previous.matches(markets);
             ECONOMY_LOCATION_CHECKS.increment();
             if (forceDirty) ECONOMY_LOCATION_DIRTY.increment();
             else ECONOMY_LOCATION_SKIPS.increment();
         } catch (Throwable ignored) {
             forceDirty = true;
-            Map<ReachEconomy, EconomyLocationState> states = ECONOMY_LOCATION_STATES;
-            synchronized (states) {
-                if (states == ECONOMY_LOCATION_STATES
-                        && campaignCachesReady(generation, economy)) {
-                    states.remove(economy);
-                }
-            }
-        }
-
-        if (forceDirty) economy.setLocationCacheNeedsUpdate(true);
-        // Always call the original method. If a mod explicitly dirtied the cache,
-        // the vanilla private flag triggers the rebuild even when our fingerprint
-        // itself did not change.
-        economy.updateLocationMap();
-
-        if (forceDirty && markets != null && campaignCachesReady(generation, economy)) {
-            try {
-                EconomyLocationState captured = EconomyLocationState.capture(markets);
-                Map<ReachEconomy, EconomyLocationState> states = ECONOMY_LOCATION_STATES;
-                synchronized (states) {
-                    if (states == ECONOMY_LOCATION_STATES
-                            && campaignCachesReady(generation, economy)) {
-                        states.put(economy, captured);
-                    }
-                }
-            } catch (Throwable ignored) {
+            if (ownerState != null) {
+                ownerState.locationState = null;
+                ownerState.locationSourceIdentity = null;
+                ownerState.locationEpoch = Long.MIN_VALUE;
+                ownerState.nextLocationAuditNanos = 0L;
+            } else {
                 Map<ReachEconomy, EconomyLocationState> states = ECONOMY_LOCATION_STATES;
                 synchronized (states) {
                     if (states == ECONOMY_LOCATION_STATES
@@ -852,6 +974,54 @@ public final class StarsectorPrepatcherHooks {
                 }
             }
         }
+
+        if (forceDirty) economy.setLocationCacheNeedsUpdate(true);
+        // Explicit mod dirtiness stays authoritative: the original updater is always
+        // invoked even when the owner-local epoch/fingerprint says nothing changed.
+        economy.updateLocationMap();
+
+        if (forceDirty && markets != null && campaignCachesReady(generation, economy)) {
+            try {
+                if (ownerState != null) {
+                    ownerState.locationState = EconomyLocationState.capture(markets,
+                            ownerState.epoch, now);
+                    ownerState.locationSourceIdentity = markets;
+                    ownerState.locationEpoch = ownerState.epoch;
+                    ownerState.nextLocationAuditNanos = nextAuditNanos(now, auditNs);
+                } else {
+                    EconomyLocationState captured = EconomyLocationState.capture(
+                            markets, Long.MIN_VALUE, now);
+                    Map<ReachEconomy, EconomyLocationState> states = ECONOMY_LOCATION_STATES;
+                    synchronized (states) {
+                        if (states == ECONOMY_LOCATION_STATES
+                                && campaignCachesReady(generation, economy)) {
+                            states.put(economy, captured);
+                        }
+                    }
+                }
+            } catch (Throwable ignored) {
+                if (ownerState != null) {
+                    ownerState.locationState = null;
+                    ownerState.locationSourceIdentity = null;
+                    ownerState.locationEpoch = Long.MIN_VALUE;
+                    ownerState.nextLocationAuditNanos = 0L;
+                } else {
+                    Map<ReachEconomy, EconomyLocationState> states = ECONOMY_LOCATION_STATES;
+                    synchronized (states) {
+                        if (states == ECONOMY_LOCATION_STATES
+                                && campaignCachesReady(generation, economy)) {
+                            states.remove(economy);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private static long nextAuditNanos(long now, long interval) {
+        if (interval <= 0L) return now;
+        long next = now + interval;
+        return next < now ? Long.MAX_VALUE : next;
     }
 
     /** Point-in-time market snapshot for Economy.advance()/paused advance only. */
@@ -1483,6 +1653,589 @@ public final class StarsectorPrepatcherHooks {
         } catch (Throwable ignored) {
             return market == null ? "null" : market.getClass().getName();
         }
+    }
+
+    /** Allocates owner-local transient state used by persistent economy snapshots. */
+    public static Object newPersistentSnapshotState() {
+        return new PersistentSnapshotState();
+    }
+
+    /** Marks a transformed Economy/Market structure as changed. Deliberately noexcept. */
+    public static void markPersistentSnapshotStructure(Object rawState) {
+        try {
+            if (rawState instanceof PersistentSnapshotState state) {
+                state.epoch++;
+                persistentEpoch(state.kind);
+            }
+        } catch (Throwable ignored) {
+            // A missing/foreign state only degrades to the audit/fallback path.
+        }
+    }
+
+    /** Exposed only to transformed Economy bytecode, tests and the location-cache hook. */
+    public static long persistentSnapshotEpoch(Object rawState) {
+        return rawState instanceof PersistentSnapshotState state
+                ? state.epoch : Long.MIN_VALUE;
+    }
+
+    /** Persistent point-in-time snapshot with a wall-clock audit cadence. */
+    @SuppressWarnings({"rawtypes", "unchecked"})
+    public static ArrayList borrowPersistentSnapshotTimed(
+            Object rawState, Collection source, int auditMs, int kind) {
+        PrepatcherConfig c = config;
+        if (c == null || !c.economyPersistentSnapshots
+                || !(rawState instanceof PersistentSnapshotState state)
+                || !state.acceptKind(kind)) {
+            return new ArrayList(source);
+        }
+        try {
+            return state.borrowTimed(source, Math.max(0, auditMs), kind);
+        } catch (Throwable ignored) {
+            state.invalidateSnapshot();
+            return new ArrayList(source);
+        }
+    }
+
+    /** Persistent point-in-time snapshot with a call/frame-count audit cadence. */
+    @SuppressWarnings({"rawtypes", "unchecked"})
+    public static ArrayList borrowPersistentSnapshotFrames(
+            Object rawState, Collection source, int auditFrames, int kind) {
+        PrepatcherConfig c = config;
+        if (c == null || !c.economyPersistentSnapshots
+                || !(rawState instanceof PersistentSnapshotState state)
+                || !state.acceptKind(kind)) {
+            return new ArrayList(source);
+        }
+        try {
+            return state.borrowFrames(source, Math.max(1, auditFrames), kind);
+        } catch (Throwable ignored) {
+            state.invalidateSnapshot();
+            return new ArrayList(source);
+        }
+    }
+
+
+    // ---------------------------------------------------------------------
+    // Aggressive economy: ordered commodity active set
+    // ---------------------------------------------------------------------
+
+    private static final int COMMODITY_DIRTY_AVAILABLE = 1;
+    private static final int COMMODITY_DIRTY_TRADE = 2;
+    private static final int COMMODITY_DIRTY_ALL =
+            COMMODITY_DIRTY_AVAILABLE | COMMODITY_DIRTY_TRADE;
+
+    /**
+     * Called only after transformed MutableStat bytecode observed a non-null
+     * private owner binding. Unbound stats never enter this hook.
+     */
+    public static void markCommodityTemporalOwnerDirty(
+            Object rawOwner, int role, String source) {
+        PrepatcherConfig c = config;
+        if (c == null || !c.commodityTemporalFastPath
+                || !(rawOwner instanceof CommodityTemporalEntry entry)) return;
+        // CommodityOnMarket.reapplyEventMod() owns this internal availability key.
+        // Waking the entry for its own remove/add cycle would keep it permanently hot.
+        if (role == COMMODITY_DIRTY_AVAILABLE && "eMod".equals(source)) return;
+        entry.markDirty(role);
+        COMMODITY_TEMPORAL_DIRTY_SIGNALS.increment();
+    }
+
+    /** Wakes a bound commodity when public getMods() exposes a live mutable map. */
+    public static void markCommodityTemporalStatExposed(Object rawStat) {
+        PrepatcherConfig c = config;
+        if (c == null || !c.commodityTemporalFastPath
+                || !(rawStat instanceof MutableStatWithTempMods stat)
+                || stat.getClass() != MutableStatWithTempMods.class) return;
+        CommodityTemporalStatAccess access =
+                COMMODITY_TEMPORAL_STAT_ACCESS.get(stat.getClass());
+        if (!access.supported) return;
+        access.markExposure(stat);
+    }
+
+    /** Whole-loop replacement for Market.advance() commodity maintenance. */
+    @SuppressWarnings("unchecked")
+    public static Object advanceMarketCommodityTemporalState(
+            Object rawMarket, Object rawState, float days) {
+        PrepatcherConfig c = config;
+        if (!(rawMarket instanceof Market market)) return rawState;
+        if (c == null || !c.commodityTemporalFastPath
+                || market.getClass() != Market.class) {
+            vanillaAdvanceMarketCommodities(market, days);
+            COMMODITY_TEMPORAL_FALLBACKS.increment();
+            return rawState;
+        }
+        long generation = campaignCacheGeneration;
+        if (!campaignCachesReady(generation)) {
+            vanillaAdvanceMarketCommodities(market, days);
+            COMMODITY_TEMPORAL_FALLBACKS.increment();
+            return rawState;
+        }
+
+        List<CommodityOnMarket> commodities;
+        try {
+            commodities = market.getCommodities();
+        } catch (Throwable ex) {
+            vanillaAdvanceMarketCommodities(market, days);
+            COMMODITY_TEMPORAL_FALLBACKS.increment();
+            return null;
+        }
+        if (commodities == null) {
+            vanillaAdvanceMarketCommodities(market, days);
+            COMMODITY_TEMPORAL_FALLBACKS.increment();
+            return null;
+        }
+
+        CommodityTemporalMarketState state;
+        if (rawState instanceof CommodityTemporalMarketState existing
+                && existing.owner == market && existing.generation == generation) {
+            state = existing;
+        } else {
+            if (rawState instanceof CommodityTemporalMarketState existing) {
+                existing.unbindAll();
+            }
+            state = new CommodityTemporalMarketState(market, generation);
+        }
+        if (!state.prepare(commodities, c.commodityTemporalAuditFrames)) {
+            state.unbindAll();
+            vanillaAdvanceMarketCommodities(market, days);
+            COMMODITY_TEMPORAL_FALLBACKS.increment();
+            return null;
+        }
+
+        // Once an original stat/commodity method has executed, replaying the whole
+        // vanilla loop on failure would double-advance earlier entries. Propagate.
+        int activeBefore = state.active.size();
+        state.advancePrepared(days);
+        sampleCommodityTemporalMarketMetrics(state.entries.size(), activeBefore);
+        return state;
+    }
+
+    private static void sampleCommodityTemporalMarketMetrics(int entries, int active) {
+        int tick = ++commodityTemporalMetricsTick;
+        if ((tick & COMMODITY_TEMPORAL_METRIC_SAMPLE_MASK) != 0) return;
+        long scale = 1L << COMMODITY_TEMPORAL_METRIC_SAMPLE_SHIFT;
+        COMMODITY_TEMPORAL_MARKET_CALLS.add(scale);
+        COMMODITY_TEMPORAL_ENTRIES.add((long) entries * scale);
+        COMMODITY_TEMPORAL_ACTIVE_ADVANCES.add((long) active * scale);
+        COMMODITY_TEMPORAL_INACTIVE_SKIPS.add(
+                (long) Math.max(0, entries - active) * scale);
+    }
+
+    private static void vanillaAdvanceMarketCommodities(Market market, float days) {
+        Iterator<?> iterator = market.getCommodities().iterator();
+        while (iterator.hasNext()) {
+            CommodityOnMarket commodity = (CommodityOnMarket) iterator.next();
+            vanillaAdvanceCommodity(commodity, days);
+        }
+    }
+
+    private static void vanillaAdvanceCommodity(CommodityOnMarket commodity, float days) {
+        commodity.getAvailableStat().advance(days);
+        commodity.getTradeMod().advance(days);
+        commodity.getTradeModPlus().advance(days);
+        commodity.getTradeModMinus().advance(days);
+        commodity.reapplyEventMod();
+    }
+
+    private static final ClassValue<CommodityTemporalStatAccess>
+            COMMODITY_TEMPORAL_STAT_ACCESS = new ClassValue<>() {
+        @Override
+        protected CommodityTemporalStatAccess computeValue(Class<?> type) {
+            if (type != MutableStatWithTempMods.class) {
+                return CommodityTemporalStatAccess.unsupported();
+            }
+            try {
+                return CommodityTemporalStatAccess.create(type);
+            } catch (Throwable ignored) {
+                return CommodityTemporalStatAccess.unsupported();
+            }
+        }
+    };
+
+    private static final class CommodityTemporalStatAccess {
+        final VarHandle tempMods;
+        final VarHandle owner;
+        final VarHandle role;
+        final MethodHandle auditForCommodity;
+        final boolean supported;
+
+        private CommodityTemporalStatAccess(
+                VarHandle tempMods, VarHandle owner, VarHandle role,
+                MethodHandle auditForCommodity, boolean supported) {
+            this.tempMods = tempMods;
+            this.owner = owner;
+            this.role = role;
+            this.auditForCommodity = auditForCommodity;
+            this.supported = supported;
+        }
+
+        static CommodityTemporalStatAccess create(Class<?> type) throws Exception {
+            MethodHandles.Lookup lookup = MethodHandles.privateLookupIn(
+                    type, MethodHandles.lookup());
+            MethodHandle audit = lookup.findVirtual(type,
+                    "spp$tempModHybridAuditForCommodity",
+                    MethodType.methodType(void.class));
+            return new CommodityTemporalStatAccess(
+                    privateVarHandle(type, "tempMods"),
+                    privateVarHandle(type, "spp$commodityTemporalOwner"),
+                    privateVarHandle(type, "spp$commodityTemporalRole"),
+                    audit, true);
+        }
+
+        static CommodityTemporalStatAccess unsupported() {
+            return new CommodityTemporalStatAccess(null, null, null, null, false);
+        }
+
+        @SuppressWarnings("unchecked")
+        LinkedHashMap<?, ?> map(MutableStatWithTempMods stat) {
+            return (LinkedHashMap<?, ?>) tempMods.get(stat);
+        }
+
+        boolean hasMods(MutableStatWithTempMods stat) {
+            LinkedHashMap<?, ?> map = map(stat);
+            return map != null && !map.isEmpty();
+        }
+
+        boolean bind(MutableStatWithTempMods stat, Object entry, int entryRole) {
+            if (!supported || stat == null) return false;
+            Object existing = owner.get(stat);
+            if (existing != null && existing != entry) {
+                if (existing instanceof CommodityTemporalEntry other) {
+                    other.vanillaOnly = true;
+                    other.active = true;
+                    other.owner.dirtyPending = true;
+                    other.unbind();
+                }
+                return false;
+            }
+            owner.set(stat, entry);
+            role.set(stat, entryRole);
+            return owner.get(stat) == entry && (int) role.get(stat) == entryRole;
+        }
+
+        void unbind(MutableStatWithTempMods stat, Object expected) {
+            if (!supported || stat == null) return;
+            if (owner.get(stat) == expected) {
+                owner.set(stat, null);
+                role.set(stat, 0);
+            }
+        }
+
+        void markExposure(MutableStatWithTempMods stat) {
+            Object raw = owner.get(stat);
+            if (raw instanceof CommodityTemporalEntry entry) {
+                entry.markExposed((int) role.get(stat));
+            }
+        }
+
+        boolean audit(MutableStatWithTempMods stat) {
+            if (!supported || auditForCommodity == null || stat == null) return false;
+            try {
+                auditForCommodity.invokeExact(stat);
+                return true;
+            } catch (Throwable ignored) {
+                return false;
+            }
+        }
+    }
+
+    private static VarHandle privateVarHandle(Class<?> type, String name) throws Exception {
+        Field field = findField(type, name);
+        field.setAccessible(true);
+        MethodHandles.Lookup lookup = MethodHandles.privateLookupIn(
+                field.getDeclaringClass(), MethodHandles.lookup());
+        return lookup.unreflectVarHandle(field);
+    }
+
+    private static final class CommodityTemporalEntry {
+        final CommodityTemporalMarketState owner;
+        final CommodityOnMarket commodity;
+        final MutableStatWithTempMods available;
+        final MutableStatWithTempMods trade;
+        final MutableStatWithTempMods tradePlus;
+        final MutableStatWithTempMods tradeMinus;
+        int dirtyMask = COMMODITY_DIRTY_ALL;
+        boolean active = true;
+        boolean forceAudit = true;
+        boolean vanillaOnly;
+
+        CommodityTemporalEntry(CommodityTemporalMarketState owner,
+                               CommodityOnMarket commodity) {
+            this.owner = owner;
+            this.commodity = commodity;
+            if (commodity == null || commodity.getClass() != CommodityOnMarket.class) {
+                available = trade = tradePlus = tradeMinus = null;
+                vanillaOnly = true;
+                return;
+            }
+            MutableStatWithTempMods a;
+            MutableStatWithTempMods t;
+            MutableStatWithTempMods p;
+            MutableStatWithTempMods m;
+            try {
+                a = commodity.getAvailableStat();
+                t = commodity.getTradeMod();
+                p = commodity.getTradeModPlus();
+                m = commodity.getTradeModMinus();
+            } catch (Throwable ex) {
+                available = trade = tradePlus = tradeMinus = null;
+                vanillaOnly = true;
+                return;
+            }
+            available = a;
+            trade = t;
+            tradePlus = p;
+            tradeMinus = m;
+            vanillaOnly = !isSupportedStat(a) || !isSupportedStat(t)
+                    || !isSupportedStat(p) || !isSupportedStat(m);
+        }
+
+        private static boolean isSupportedStat(MutableStatWithTempMods stat) {
+            return stat != null && stat.getClass() == MutableStatWithTempMods.class
+                    && COMMODITY_TEMPORAL_STAT_ACCESS.get(stat.getClass()).supported;
+        }
+
+        void markDirty(int role) {
+            dirtyMask |= role;
+            active = true;
+            owner.dirtyPending = true;
+        }
+
+        void markExposed(int role) {
+            forceAudit = true;
+            markDirty(role);
+            COMMODITY_TEMPORAL_EXPOSURES.increment();
+        }
+
+        void bind() {
+            if (vanillaOnly) return;
+            CommodityTemporalStatAccess access =
+                    COMMODITY_TEMPORAL_STAT_ACCESS.get(MutableStatWithTempMods.class);
+            boolean ok = access.bind(available, this, COMMODITY_DIRTY_AVAILABLE)
+                    && access.bind(trade, this, COMMODITY_DIRTY_TRADE)
+                    && access.bind(tradePlus, this, COMMODITY_DIRTY_TRADE)
+                    && access.bind(tradeMinus, this, COMMODITY_DIRTY_TRADE);
+            if (!ok) {
+                unbind();
+                vanillaOnly = true;
+                active = true;
+            }
+        }
+
+        void unbind() {
+            CommodityTemporalStatAccess access =
+                    COMMODITY_TEMPORAL_STAT_ACCESS.get(MutableStatWithTempMods.class);
+            access.unbind(available, this);
+            access.unbind(trade, this);
+            access.unbind(tradePlus, this);
+            access.unbind(tradeMinus, this);
+        }
+
+        boolean process(float days) {
+            if (vanillaOnly) {
+                vanillaAdvanceCommodity(commodity, days);
+                active = true;
+                return true;
+            }
+            CommodityTemporalStatAccess access =
+                    COMMODITY_TEMPORAL_STAT_ACCESS.get(MutableStatWithTempMods.class);
+
+            int changed = dirtyMask;
+            dirtyMask = 0;
+            if (forceAudit) {
+                forceAudit = false;
+                boolean audited = access.audit(available)
+                        && access.audit(trade)
+                        && access.audit(tradePlus)
+                        && access.audit(tradeMinus);
+                if (!audited) {
+                    unbind();
+                    vanillaOnly = true;
+                    vanillaAdvanceCommodity(commodity, days);
+                    active = true;
+                    return true;
+                }
+                // The audit also covers direct changes through MutableStat's live
+                // modifier maps, for which no mutator notification exists.
+                changed |= COMMODITY_DIRTY_ALL;
+            }
+
+            // Read each map once on the common path. Only stats that were active
+            // before advance can need a post-expiry emptiness check; the exact
+            // CommodityOnMarket.reapplyEventMod() path never creates temp mods.
+            boolean availableActive = access.hasMods(available);
+            boolean tradeActive = access.hasMods(trade);
+            boolean tradePlusActive = access.hasMods(tradePlus);
+            boolean tradeMinusActive = access.hasMods(tradeMinus);
+            if (availableActive) available.advance(days);
+            if (tradeActive) trade.advance(days);
+            if (tradePlusActive) tradePlus.advance(days);
+            if (tradeMinusActive) tradeMinus.advance(days);
+
+            // Expiry invokes MutableStat.unmodify(), whose bound prologue may have
+            // marked this entry dirty while the four stats advanced.
+            changed |= dirtyMask;
+            dirtyMask = 0;
+
+            if ((changed & COMMODITY_DIRTY_ALL) != 0) {
+                commodity.reapplyEventMod();
+                COMMODITY_TEMPORAL_REAPPLIES.increment();
+                if ((changed & COMMODITY_DIRTY_AVAILABLE) != 0) {
+                    COMMODITY_TEMPORAL_AVAILABLE_REAPPLIES.increment();
+                }
+            }
+
+            active = (availableActive && access.hasMods(available))
+                    || (tradeActive && access.hasMods(trade))
+                    || (tradePlusActive && access.hasMods(tradePlus))
+                    || (tradeMinusActive && access.hasMods(tradeMinus))
+                    || dirtyMask != 0 || forceAudit;
+            return active;
+        }
+    }
+
+    private static final class CommodityTemporalMarketState {
+        final Market owner;
+        final long generation;
+        final ArrayList<CommodityTemporalEntry> entries = new ArrayList<>(32);
+        final ArrayList<CommodityTemporalEntry> active = new ArrayList<>(8);
+        List<?> source;
+        int sourceSize = -1;
+        Object first;
+        Object last;
+        int auditCountdown;
+        boolean dirtyPending;
+
+        CommodityTemporalMarketState(Market owner, long generation) {
+            this.owner = owner;
+            this.generation = generation;
+        }
+
+        boolean prepare(List<CommodityOnMarket> live, int auditFrames) {
+            try {
+                boolean rebuild = source != live || sourceSize != live.size();
+                if (!rebuild && sourceSize > 0) {
+                    rebuild = first != live.get(0) || last != live.get(sourceSize - 1);
+                }
+                if (rebuild) {
+                    if (!rebuild(live, auditFrames)) return false;
+                } else if (--auditCountdown <= 0) {
+                    COMMODITY_TEMPORAL_AUDITS.increment();
+                    if (!matches(live)) {
+                        if (!rebuild(live, auditFrames)) return false;
+                    } else {
+                        auditCountdown = normalizedCommodityAuditFrames(auditFrames);
+                        for (CommodityTemporalEntry entry : entries) {
+                            entry.dirtyMask |= COMMODITY_DIRTY_ALL;
+                            entry.forceAudit = true;
+                            entry.active = true;
+                        }
+                        dirtyPending = true;
+                    }
+                }
+                if (dirtyPending) rebuildActive();
+                return true;
+            } catch (Throwable ignored) {
+                return false;
+            }
+        }
+
+        private boolean matches(List<CommodityOnMarket> live) {
+            if (live.size() != entries.size()) return false;
+            for (int i = 0; i < entries.size(); i++) {
+                if (live.get(i) != entries.get(i).commodity) return false;
+            }
+            return true;
+        }
+
+        private boolean rebuild(List<CommodityOnMarket> live, int auditFrames) {
+            unbindAll();
+            entries.clear();
+            active.clear();
+            IdentityHashMap<MutableStatWithTempMods, CommodityTemporalEntry> owners =
+                    new IdentityHashMap<>();
+            for (int i = 0; i < live.size(); i++) {
+                CommodityOnMarket commodity = live.get(i);
+                CommodityTemporalEntry entry = new CommodityTemporalEntry(this, commodity);
+                entries.add(entry);
+                if (!entry.vanillaOnly) registerStats(entry, owners);
+            }
+            for (CommodityTemporalEntry entry : entries) entry.bind();
+            source = live;
+            sourceSize = live.size();
+            first = sourceSize == 0 ? null : live.get(0);
+            last = sourceSize == 0 ? null : live.get(sourceSize - 1);
+            auditCountdown = initialCommodityAuditCountdown(
+                    owner, generation, auditFrames);
+            dirtyPending = true;
+            rebuildActive();
+            COMMODITY_TEMPORAL_REBUILDS.increment();
+            return true;
+        }
+
+        private static void registerStats(
+                CommodityTemporalEntry entry,
+                IdentityHashMap<MutableStatWithTempMods, CommodityTemporalEntry> owners) {
+            registerStat(entry.available, entry, owners);
+            registerStat(entry.trade, entry, owners);
+            registerStat(entry.tradePlus, entry, owners);
+            registerStat(entry.tradeMinus, entry, owners);
+        }
+
+        private static void registerStat(
+                MutableStatWithTempMods stat, CommodityTemporalEntry entry,
+                IdentityHashMap<MutableStatWithTempMods, CommodityTemporalEntry> owners) {
+            CommodityTemporalEntry previous = owners.put(stat, entry);
+            if (previous != null && previous != entry) {
+                previous.vanillaOnly = true;
+                entry.vanillaOnly = true;
+            } else if (previous == entry) {
+                entry.vanillaOnly = true;
+            }
+        }
+
+        private void rebuildActive() {
+            active.clear();
+            for (CommodityTemporalEntry entry : entries) {
+                if (entry.vanillaOnly || entry.active || entry.dirtyMask != 0
+                        || entry.forceAudit) {
+                    active.add(entry);
+                }
+            }
+            dirtyPending = false;
+        }
+
+        void advancePrepared(float days) {
+            int write = 0;
+            int size = active.size();
+            for (int read = 0; read < size; read++) {
+                CommodityTemporalEntry entry = active.get(read);
+                if (entry.process(days)) {
+                    if (write != read) active.set(write, entry);
+                    write++;
+                }
+            }
+            while (active.size() > write) active.remove(active.size() - 1);
+        }
+
+        void unbindAll() {
+            for (CommodityTemporalEntry entry : entries) entry.unbind();
+        }
+    }
+
+    private static int normalizedCommodityAuditFrames(int frames) {
+        return Math.max(1, frames);
+    }
+
+    private static int initialCommodityAuditCountdown(
+            Object owner, long generation, int frames) {
+        int interval = normalizedCommodityAuditFrames(frames);
+        if (interval == 1) return 1;
+        int hash = System.identityHashCode(owner);
+        hash ^= (int) generation;
+        hash ^= (int) (generation >>> 32);
+        hash ^= hash >>> 16;
+        return 1 + Math.floorMod(hash, interval);
     }
 
     /** Three frame-local command/group lists in Ship.advance(). */
@@ -2698,24 +3451,42 @@ public final class StarsectorPrepatcherHooks {
 
 
     /** Exact ordered fingerprint used only to decide whether Economy.advance()
-     * needs to set ReachEconomy\'s private dirty flag automatically. */
+     * needs to set ReachEconomy's private dirty flag automatically. */
     private static final class EconomyLocationState {
+        static final int MATCH = 0;
+        static final int SEQUENCE_MISMATCH = 1;
+        static final int DETAILS_MISMATCH = 2;
+
+        final WeakReference<Object> sourceIdentity;
         final WeakReference<MarketAPI>[] markets;
         final WeakReference<LocationAPI>[] locations;
         final String[] marketIds;
         final String[] locationIds;
+        final long structureEpoch;
+        volatile long auditedAtNanos;
 
-        EconomyLocationState(WeakReference<MarketAPI>[] markets,
+        EconomyLocationState(Object sourceIdentity,
+                             WeakReference<MarketAPI>[] markets,
                              WeakReference<LocationAPI>[] locations,
-                             String[] marketIds, String[] locationIds) {
+                             String[] marketIds, String[] locationIds,
+                             long structureEpoch, long auditedAtNanos) {
+            this.sourceIdentity = new WeakReference<>(sourceIdentity);
             this.markets = markets;
             this.locations = locations;
             this.marketIds = marketIds;
             this.locationIds = locationIds;
+            this.structureEpoch = structureEpoch;
+            this.auditedAtNanos = auditedAtNanos;
+        }
+
+        static EconomyLocationState capture(List<MarketAPI> live) {
+            return capture(live, Long.MIN_VALUE, System.nanoTime());
         }
 
         @SuppressWarnings("unchecked")
-        static EconomyLocationState capture(List<MarketAPI> live) {
+        static EconomyLocationState capture(List<MarketAPI> live,
+                                            long structureEpoch,
+                                            long auditedAtNanos) {
             int size = live.size();
             WeakReference<MarketAPI>[] markets =
                     (WeakReference<MarketAPI>[]) new WeakReference<?>[size];
@@ -2734,21 +3505,225 @@ public final class StarsectorPrepatcherHooks {
                 marketIds[i] = market.getId();
                 locationIds[i] = location == null ? null : location.getId();
             }
-            return new EconomyLocationState(markets, locations, marketIds, locationIds);
+            return new EconomyLocationState(live, markets, locations, marketIds, locationIds,
+                    structureEpoch, auditedAtNanos);
+        }
+
+        int mismatchKind(List<MarketAPI> live) {
+            try {
+                int size = live.size();
+                if (sourceIdentity.get() != live || markets.length != size) return SEQUENCE_MISMATCH;
+                boolean detailsMismatch = false;
+                for (int i = 0; i < size; i++) {
+                    MarketAPI market = live.get(i);
+                    if (market != markets[i].get()) return SEQUENCE_MISMATCH;
+                    LocationAPI location = market == null ? null : market.getContainingLocation();
+                    if (location != locations[i].get()
+                            || !Objects.equals(market == null ? null : market.getId(), marketIds[i])
+                            || !Objects.equals(location == null ? null : location.getId(), locationIds[i])) {
+                        detailsMismatch = true;
+                    }
+                }
+                return detailsMismatch ? DETAILS_MISMATCH : MATCH;
+            } catch (Throwable ignored) {
+                return SEQUENCE_MISMATCH;
+            }
         }
 
         boolean matches(List<MarketAPI> live) {
-            int size = live.size();
-            if (markets.length != size) return false;
-            for (int i = 0; i < size; i++) {
-                MarketAPI market = live.get(i);
-                if (market != markets[i].get()) return false;
-                LocationAPI location = market == null ? null : market.getContainingLocation();
-                if (location != locations[i].get()) return false;
-                if (!Objects.equals(market == null ? null : market.getId(), marketIds[i])) return false;
-                if (!Objects.equals(location == null ? null : location.getId(), locationIds[i])) return false;
+            return mismatchKind(live) == MATCH;
+        }
+    }
+
+    private static void persistentHit(int kind) {
+        switch (kind) {
+            case 0 -> ECONOMY_MARKET_PERSISTENT_HITS.increment();
+            case 1 -> MARKET_CONDITION_PERSISTENT_HITS.increment();
+            case 2 -> MARKET_INDUSTRY_PERSISTENT_HITS.increment();
+            default -> { }
+        }
+    }
+
+    private static void persistentAudit(int kind) {
+        ECONOMY_PERSISTENT_SNAPSHOT_AUDITS.increment();
+        switch (kind) {
+            case 0 -> ECONOMY_MARKET_PERSISTENT_AUDITS.increment();
+            case 1 -> MARKET_CONDITION_PERSISTENT_AUDITS.increment();
+            case 2 -> MARKET_INDUSTRY_PERSISTENT_AUDITS.increment();
+            default -> { }
+        }
+    }
+
+    private static void persistentMismatch(int kind) {
+        ECONOMY_PERSISTENT_SNAPSHOT_MISMATCHES.increment();
+        switch (kind) {
+            case 0 -> ECONOMY_MARKET_PERSISTENT_MISMATCHES.increment();
+            case 1 -> MARKET_CONDITION_PERSISTENT_MISMATCHES.increment();
+            case 2 -> MARKET_INDUSTRY_PERSISTENT_MISMATCHES.increment();
+            default -> { }
+        }
+    }
+
+    private static void persistentRebuild(int kind, int elements) {
+        ECONOMY_PERSISTENT_SNAPSHOT_REBUILDS.increment();
+        ECONOMY_PERSISTENT_SNAPSHOT_ELEMENTS.add(elements);
+        switch (kind) {
+            case 0 -> {
+                ECONOMY_MARKET_PERSISTENT_REBUILDS.increment();
+                ECONOMY_MARKET_PERSISTENT_ELEMENTS.add(elements);
             }
-            return true;
+            case 1 -> {
+                MARKET_CONDITION_PERSISTENT_REBUILDS.increment();
+                MARKET_CONDITION_PERSISTENT_ELEMENTS.add(elements);
+            }
+            case 2 -> {
+                MARKET_INDUSTRY_PERSISTENT_REBUILDS.increment();
+                MARKET_INDUSTRY_PERSISTENT_ELEMENTS.add(elements);
+            }
+            default -> { }
+        }
+    }
+
+    private static void persistentEpoch(int kind) {
+        PERSISTENT_STRUCTURE_EPOCHS.increment();
+    }
+
+    /**
+     * Owner-local copy-on-write snapshot state. Snapshots are never mutated after
+     * publication, so a nested/re-entrant advance may rebuild the field without
+     * invalidating an iterator held by the outer call. The Economy instance also
+     * stores its ReachEconomy location fingerprint here, removing the synchronized
+     * WeakHashMap lookup from the persistent hot path.
+     */
+    @SuppressWarnings({"rawtypes", "unchecked"})
+    private static final class PersistentSnapshotState {
+        long epoch;
+        long snapshotEpoch = Long.MIN_VALUE;
+        ArrayList snapshot;
+        Object sourceIdentity;
+        int auditCountdown;
+        long nextAuditNanos;
+        int kind = -1;
+
+        EconomyLocationState locationState;
+        Object locationSourceIdentity;
+        long locationEpoch = Long.MIN_VALUE;
+        long nextLocationAuditNanos;
+
+        boolean acceptKind(int requestedKind) {
+            if (requestedKind < 0 || requestedKind > 2) return false;
+            int current = kind;
+            if (current == -1) {
+                kind = requestedKind;
+                return true;
+            }
+            return current == requestedKind;
+        }
+
+        ArrayList borrowTimed(Collection source, int auditMs, int requestedKind) {
+            ArrayList current = snapshot;
+            long observedEpoch = epoch;
+            if (current == null || snapshotEpoch != observedEpoch) {
+                return rebuild(source, observedEpoch, auditMs, true, requestedKind);
+            }
+            if (sourceIdentity != source) {
+                persistentMismatch(requestedKind);
+                long changedEpoch = ++epoch;
+                persistentEpoch(requestedKind);
+                return rebuild(source, changedEpoch, auditMs, true, requestedKind);
+            }
+            long now = System.nanoTime();
+            long interval = (long) auditMs * 1_000_000L;
+            if (interval > 0L && now < nextAuditNanos) {
+                persistentHit(requestedKind);
+                return current;
+            }
+            persistentAudit(requestedKind);
+            if (identityMatches(current, source)) {
+                nextAuditNanos = nextAuditNanos(now, interval);
+                persistentHit(requestedKind);
+                return current;
+            }
+            persistentMismatch(requestedKind);
+            long changedEpoch = ++epoch;
+            persistentEpoch(requestedKind);
+            return rebuild(source, changedEpoch, auditMs, true, requestedKind);
+        }
+
+        ArrayList borrowFrames(Collection source, int auditFrames, int requestedKind) {
+            ArrayList current = snapshot;
+            long observedEpoch = epoch;
+            if (current == null || snapshotEpoch != observedEpoch) {
+                return rebuild(source, observedEpoch, auditFrames, false, requestedKind);
+            }
+            if (sourceIdentity != source) {
+                persistentMismatch(requestedKind);
+                long changedEpoch = ++epoch;
+                persistentEpoch(requestedKind);
+                return rebuild(source, changedEpoch, auditFrames, false, requestedKind);
+            }
+            int remaining = auditCountdown - 1;
+            auditCountdown = remaining;
+            if (remaining > 0) {
+                persistentHit(requestedKind);
+                return current;
+            }
+            persistentAudit(requestedKind);
+            if (identityMatches(current, source)) {
+                auditCountdown = Math.max(1, auditFrames);
+                persistentHit(requestedKind);
+                return current;
+            }
+            persistentMismatch(requestedKind);
+            long changedEpoch = ++epoch;
+            persistentEpoch(requestedKind);
+            return rebuild(source, changedEpoch, auditFrames, false, requestedKind);
+        }
+
+        private ArrayList rebuild(Collection source, long observedEpoch,
+                                  int audit, boolean timed, int requestedKind) {
+            // Copy-on-write is essential: never clear a snapshot that an outer
+            // re-entrant callback may still be iterating.
+            ArrayList fresh = new ArrayList(source);
+            snapshot = fresh;
+            sourceIdentity = source;
+            snapshotEpoch = observedEpoch;
+            if (timed) {
+                long now = System.nanoTime();
+                long interval = (long) Math.max(0, audit) * 1_000_000L;
+                nextAuditNanos = nextAuditNanos(now, interval);
+            } else {
+                auditCountdown = Math.max(1, audit);
+            }
+            persistentRebuild(requestedKind, fresh.size());
+            return fresh;
+        }
+
+        void invalidateSnapshot() {
+            snapshot = null;
+            sourceIdentity = null;
+            snapshotEpoch = Long.MIN_VALUE;
+            auditCountdown = 0;
+            nextAuditNanos = 0L;
+        }
+
+        private static boolean identityMatches(List snapshot, Collection source) {
+            try {
+                if (snapshot.size() != source.size()) return false;
+                if (source instanceof List list && source instanceof RandomAccess) {
+                    for (int i = 0; i < snapshot.size(); i++) {
+                        if (snapshot.get(i) != list.get(i)) return false;
+                    }
+                    return true;
+                }
+                Iterator iterator = source.iterator();
+                for (int i = 0; i < snapshot.size(); i++) {
+                    if (!iterator.hasNext() || snapshot.get(i) != iterator.next()) return false;
+                }
+                return !iterator.hasNext();
+            } catch (Throwable ignored) {
+                return false;
+            }
         }
     }
 
@@ -3433,6 +4408,40 @@ public final class StarsectorPrepatcherHooks {
                         + PLANET_CONDITION_MARKET_SAVE_FLUSHES.sumThenReset()
                         + ", planetConditionMarketFallbacks="
                         + PLANET_CONDITION_MARKET_FALLBACKS.sumThenReset()
+                        + ", economyPersistentRebuilds=" + ECONOMY_PERSISTENT_SNAPSHOT_REBUILDS.sumThenReset()
+                        + ", economyPersistentAudits=" + ECONOMY_PERSISTENT_SNAPSHOT_AUDITS.sumThenReset()
+                        + ", economyPersistentMismatches=" + ECONOMY_PERSISTENT_SNAPSHOT_MISMATCHES.sumThenReset()
+                        + ", economyPersistentElements=" + ECONOMY_PERSISTENT_SNAPSHOT_ELEMENTS.sumThenReset()
+                        + ", economyMarketPersistentHits=" + ECONOMY_MARKET_PERSISTENT_HITS.sumThenReset()
+                        + ", economyMarketPersistentRebuilds=" + ECONOMY_MARKET_PERSISTENT_REBUILDS.sumThenReset()
+                        + ", economyMarketPersistentAudits=" + ECONOMY_MARKET_PERSISTENT_AUDITS.sumThenReset()
+                        + ", economyMarketPersistentMismatches=" + ECONOMY_MARKET_PERSISTENT_MISMATCHES.sumThenReset()
+                        + ", economyMarketPersistentElements=" + ECONOMY_MARKET_PERSISTENT_ELEMENTS.sumThenReset()
+                        + ", marketConditionPersistentHits=" + MARKET_CONDITION_PERSISTENT_HITS.sumThenReset()
+                        + ", marketConditionPersistentRebuilds=" + MARKET_CONDITION_PERSISTENT_REBUILDS.sumThenReset()
+                        + ", marketConditionPersistentAudits=" + MARKET_CONDITION_PERSISTENT_AUDITS.sumThenReset()
+                        + ", marketConditionPersistentMismatches=" + MARKET_CONDITION_PERSISTENT_MISMATCHES.sumThenReset()
+                        + ", marketConditionPersistentElements=" + MARKET_CONDITION_PERSISTENT_ELEMENTS.sumThenReset()
+                        + ", marketIndustryPersistentHits=" + MARKET_INDUSTRY_PERSISTENT_HITS.sumThenReset()
+                        + ", marketIndustryPersistentRebuilds=" + MARKET_INDUSTRY_PERSISTENT_REBUILDS.sumThenReset()
+                        + ", marketIndustryPersistentAudits=" + MARKET_INDUSTRY_PERSISTENT_AUDITS.sumThenReset()
+                        + ", marketIndustryPersistentMismatches=" + MARKET_INDUSTRY_PERSISTENT_MISMATCHES.sumThenReset()
+                        + ", marketIndustryPersistentElements=" + MARKET_INDUSTRY_PERSISTENT_ELEMENTS.sumThenReset()
+                        + ", commodityTemporalMarkets=" + COMMODITY_TEMPORAL_MARKET_CALLS.sumThenReset()
+                        + ", commodityTemporalEntries=" + COMMODITY_TEMPORAL_ENTRIES.sumThenReset()
+                        + ", commodityTemporalActive=" + COMMODITY_TEMPORAL_ACTIVE_ADVANCES.sumThenReset()
+                        + ", commodityTemporalInactiveSkips=" + COMMODITY_TEMPORAL_INACTIVE_SKIPS.sumThenReset()
+                        + ", commodityTemporalReapplies=" + COMMODITY_TEMPORAL_REAPPLIES.sumThenReset()
+                        + ", commodityTemporalAvailableReapplies=" + COMMODITY_TEMPORAL_AVAILABLE_REAPPLIES.sumThenReset()
+                        + ", commodityTemporalDirtySignals=" + COMMODITY_TEMPORAL_DIRTY_SIGNALS.sumThenReset()
+                        + ", commodityTemporalExposures=" + COMMODITY_TEMPORAL_EXPOSURES.sumThenReset()
+                        + ", commodityTemporalAudits=" + COMMODITY_TEMPORAL_AUDITS.sumThenReset()
+                        + ", commodityTemporalRebuilds=" + COMMODITY_TEMPORAL_REBUILDS.sumThenReset()
+                        + ", commodityTemporalFallbacks=" + COMMODITY_TEMPORAL_FALLBACKS.sumThenReset()
+                        + ", persistentStructureEpochs=" + PERSISTENT_STRUCTURE_EPOCHS.sumThenReset()
+                        + ", economyLocationEpochHits=" + ECONOMY_LOCATION_EPOCH_HITS.sumThenReset()
+                        + ", economyLocationAudits=" + ECONOMY_LOCATION_AUDITS.sumThenReset()
+                        + ", economyLocationSequenceMismatches=" + ECONOMY_LOCATION_SEQUENCE_MISMATCHES.sumThenReset()
                         + ", commRelayIndexHits=" + COMM_RELAY_INDEX_HITS.sumThenReset()
                         + ", commRelayIndexBuilds=" + COMM_RELAY_INDEX_BUILDS.sumThenReset()
                         + ", commRelayIndexFallbacks=" + COMM_RELAY_INDEX_FALLBACKS.sumThenReset()
@@ -3453,7 +4462,10 @@ public final class StarsectorPrepatcherHooks {
                         + (STARTUP_LOG_JSON.sumThenReset() + STARTUP_LOG_CSV.sumThenReset()
                         + STARTUP_LOG_SCRIPT.sumThenReset() + STARTUP_LOG_RULE.sumThenReset()
                         + STARTUP_LOG_SPEC.sumThenReset() + STARTUP_LOG_TEXTURE.sumThenReset()
-                        + STARTUP_LOG_SOUND.sumThenReset() + STARTUP_LOG_OTHER.sumThenReset()));            } catch (InterruptedException ex) {
+                        + STARTUP_LOG_SOUND.sumThenReset() + STARTUP_LOG_OTHER.sumThenReset()));
+                PrepatcherLog.info("stats: "
+                        + StarsectorPrepatcherTempModHooks.statsAndReset());
+            } catch (InterruptedException ex) {
                 Thread.currentThread().interrupt();
                 return;
             } catch (Throwable ex) {
