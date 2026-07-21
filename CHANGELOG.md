@@ -45,6 +45,12 @@
   dirty/safety/forced scan counters, стоимость обходов, state/reason transitions и mutation races.
   Отдельный выключенный по умолчанию `observer.marketConstructionDiagnostics` пишет bounded
   per-reason CSV без сильных ссылок на market/industry objects и не влияет на scheduler policy.
+- Upgrade-only reason (`isUpgrading() && !isBuilding()`) переведён в diagnostic-only: он остаётся в
+  counters/gauges и CSV, но больше не удерживает рынок в full-rate. CSV теперь имеет отдельные поля
+  для building/upgrading industry, scalar `BaseIndustry` state и ограниченные transition buckets,
+  включая `TRANSITION_4_TO_6`.
+- Direct-market identity resolver читает только root-level `id`/`name` из `mod_info.json`; вложенные
+  dependency descriptors больше не могут подменить владельца JAR.
 - `FastForwardPresentationTransformer` переведён с whole-class/JAR SHA-256 gating на 24 локальных
   structural class plans. Все включённые компоненты класса применяются одной транзакцией; каждый
   transformed target получает общий owner и global feature mask. `CampaignState` выводит substep и

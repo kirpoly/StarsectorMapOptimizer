@@ -134,10 +134,24 @@ public final class StarsectorPrepatcherHooks {
     private static final int CONSTRUCTION_REASON_INDUSTRIES_UNKNOWN = 16;
     private static final int CONSTRUCTION_REASON_PROBE_FAILURE = 32;
     private static final int CONSTRUCTION_REASON_MUTATION_RACE = 64;
-    private static final int CONSTRUCTION_REASON_ACTIVE_MASK =
+    /** Reasons observed by the construction probe, including diagnostic-only signals. */
+    private static final int CONSTRUCTION_REASON_OBSERVED_MASK =
             CONSTRUCTION_REASON_QUEUE_NON_EMPTY
                     | CONSTRUCTION_REASON_INDUSTRY_BUILDING
                     | CONSTRUCTION_REASON_INDUSTRY_UPGRADING
+                    | CONSTRUCTION_REASON_QUEUE_ITEMS_UNKNOWN
+                    | CONSTRUCTION_REASON_INDUSTRIES_UNKNOWN
+                    | CONSTRUCTION_REASON_PROBE_FAILURE
+                    | CONSTRUCTION_REASON_MUTATION_RACE;
+    /**
+     * Reasons that require exact full-rate market advancement. isUpgrading() is
+     * intentionally diagnostic-only: vanilla PopulationAndInfrastructure uses
+     * an upgrade-like state without Industry.isBuilding(), so treating the bit
+     * independently as construction disables coalescing for most markets.
+     */
+    private static final int CONSTRUCTION_REASON_ACTIVE_MASK =
+            CONSTRUCTION_REASON_QUEUE_NON_EMPTY
+                    | CONSTRUCTION_REASON_INDUSTRY_BUILDING
                     | CONSTRUCTION_REASON_QUEUE_ITEMS_UNKNOWN
                     | CONSTRUCTION_REASON_INDUSTRIES_UNKNOWN
                     | CONSTRUCTION_REASON_PROBE_FAILURE
@@ -1890,10 +1904,16 @@ public final class StarsectorPrepatcherHooks {
                         upgrading = industry.isUpgrading();
                     } catch (Throwable failure) {
                         reasonMask |= CONSTRUCTION_REASON_PROBE_FAILURE;
-                                    if (probe != null) probe.failure(failure);
+                        if (probe != null) probe.failure(failure);
                     }
-                    if (building) reasonMask |= CONSTRUCTION_REASON_INDUSTRY_BUILDING;
-                    if (upgrading) reasonMask |= CONSTRUCTION_REASON_INDUSTRY_UPGRADING;
+                    if (building) {
+                        reasonMask |= CONSTRUCTION_REASON_INDUSTRY_BUILDING;
+                        if (probe != null) probe.captureBuildingIndustry(industry, i);
+                    }
+                    if (upgrading) {
+                        reasonMask |= CONSTRUCTION_REASON_INDUSTRY_UPGRADING;
+                        if (probe != null) probe.captureUpgradingIndustry(industry, i);
+                    }
                     if (probe != null && (building || upgrading)
                             && probe.industryIndex < 0) {
                         probe.captureIndustry(industry, i, building, upgrading);
@@ -2600,27 +2620,25 @@ public final class StarsectorPrepatcherHooks {
                 synchronized (state) {
                     pendingSteps += state.pendingSteps;
                     pendingRuns += state.pendingRuns == null ? 0 : state.pendingRuns.size();
-                    if (state.constructionFullRate) {
-                        constructionMarkets++;
-                        int reasons = state.constructionReasonMask;
-                        if ((reasons & CONSTRUCTION_REASON_QUEUE_NON_EMPTY) != 0) {
-                            constructionQueueMarkets++;
-                        }
-                        if ((reasons & CONSTRUCTION_REASON_INDUSTRY_BUILDING) != 0) {
-                            constructionBuildingMarkets++;
-                        }
-                        if ((reasons & CONSTRUCTION_REASON_INDUSTRY_UPGRADING) != 0) {
-                            constructionUpgradingMarkets++;
-                        }
-                        if ((reasons & (CONSTRUCTION_REASON_QUEUE_ITEMS_UNKNOWN
-                                | CONSTRUCTION_REASON_INDUSTRIES_UNKNOWN
-                                | CONSTRUCTION_REASON_PROBE_FAILURE
-                                | CONSTRUCTION_REASON_MUTATION_RACE)) != 0) {
-                            constructionUncertainMarkets++;
-                        }
-                        if (Integer.bitCount(reasons & CONSTRUCTION_REASON_ACTIVE_MASK) > 1) {
-                            constructionMultipleReasonMarkets++;
-                        }
+                    if (state.constructionFullRate) constructionMarkets++;
+                    int reasons = state.constructionReasonMask;
+                    if ((reasons & CONSTRUCTION_REASON_QUEUE_NON_EMPTY) != 0) {
+                        constructionQueueMarkets++;
+                    }
+                    if ((reasons & CONSTRUCTION_REASON_INDUSTRY_BUILDING) != 0) {
+                        constructionBuildingMarkets++;
+                    }
+                    if ((reasons & CONSTRUCTION_REASON_INDUSTRY_UPGRADING) != 0) {
+                        constructionUpgradingMarkets++;
+                    }
+                    if ((reasons & (CONSTRUCTION_REASON_QUEUE_ITEMS_UNKNOWN
+                            | CONSTRUCTION_REASON_INDUSTRIES_UNKNOWN
+                            | CONSTRUCTION_REASON_PROBE_FAILURE
+                            | CONSTRUCTION_REASON_MUTATION_RACE)) != 0) {
+                        constructionUncertainMarkets++;
+                    }
+                    if (Integer.bitCount(reasons & CONSTRUCTION_REASON_OBSERVED_MASK) > 1) {
+                        constructionMultipleReasonMarkets++;
                     }
                 }
             }
@@ -4900,11 +4918,32 @@ public final class StarsectorPrepatcherHooks {
         String queueClass = "";
         int queueSize = -2;
         int industryCount = -2;
+
+        // Legacy first-positive fields are retained for existing CSV consumers.
         int industryIndex = -1;
         String industryId = "";
         String industryClass = "";
         boolean industryBuilding;
         boolean industryUpgrading;
+
+        int buildingIndustryIndex = -1;
+        String buildingIndustryId = "";
+        String buildingIndustryClass = "";
+        String buildingRawBuildingField = "";
+        String buildingBuildProgress = "";
+        String buildingBuildTime = "";
+        String buildingUpgradeId = "";
+        String buildingIsFunctional = "";
+
+        int upgradingIndustryIndex = -1;
+        String upgradingIndustryId = "";
+        String upgradingIndustryClass = "";
+        String upgradingRawBuildingField = "";
+        String upgradingBuildProgress = "";
+        String upgradingBuildTime = "";
+        String upgradingUpgradeId = "";
+        String upgradingIsFunctional = "";
+
         String exceptionClass = "";
         String exceptionMessage = "";
 
@@ -4917,6 +4956,22 @@ public final class StarsectorPrepatcherHooks {
             industryClass = "";
             industryBuilding = false;
             industryUpgrading = false;
+            buildingIndustryIndex = -1;
+            buildingIndustryId = "";
+            buildingIndustryClass = "";
+            buildingRawBuildingField = "";
+            buildingBuildProgress = "";
+            buildingBuildTime = "";
+            buildingUpgradeId = "";
+            buildingIsFunctional = "";
+            upgradingIndustryIndex = -1;
+            upgradingIndustryId = "";
+            upgradingIndustryClass = "";
+            upgradingRawBuildingField = "";
+            upgradingBuildProgress = "";
+            upgradingBuildTime = "";
+            upgradingUpgradeId = "";
+            upgradingIsFunctional = "";
             exceptionClass = "";
             exceptionMessage = "";
         }
@@ -4924,15 +4979,120 @@ public final class StarsectorPrepatcherHooks {
         void captureIndustry(Industry industry, int index,
                              boolean building, boolean upgrading) {
             industryIndex = index;
-            industryClass = industry.getClass().getName();
+            industryClass = ((Object) industry).getClass().getName();
             industryBuilding = building;
             industryUpgrading = upgrading;
+            industryId = safeIndustryId(industry);
+        }
+
+        void captureBuildingIndustry(Industry industry, int index) {
+            if (buildingIndustryIndex >= 0) return;
+            buildingIndustryIndex = index;
+            buildingIndustryClass = ((Object) industry).getClass().getName();
+            buildingIndustryId = safeIndustryId(industry);
+            String[] details = baseIndustryDetails(industry);
+            buildingRawBuildingField = details[0];
+            buildingBuildProgress = details[1];
+            buildingBuildTime = details[2];
+            buildingUpgradeId = details[3];
+            buildingIsFunctional = details[4];
+        }
+
+        void captureUpgradingIndustry(Industry industry, int index) {
+            if (upgradingIndustryIndex >= 0) return;
+            upgradingIndustryIndex = index;
+            upgradingIndustryClass = ((Object) industry).getClass().getName();
+            upgradingIndustryId = safeIndustryId(industry);
+            String[] details = baseIndustryDetails(industry);
+            upgradingRawBuildingField = details[0];
+            upgradingBuildProgress = details[1];
+            upgradingBuildTime = details[2];
+            upgradingUpgradeId = details[3];
+            upgradingIsFunctional = details[4];
+        }
+
+        private static String safeIndustryId(Industry industry) {
             try {
                 String id = industry.getId();
-                industryId = id == null ? "" : id;
+                return id == null ? "" : id;
             } catch (Throwable ignored) {
-                industryId = "<unavailable>";
+                return "<unavailable>";
             }
+        }
+
+        /**
+         * Snapshot BaseIndustry internals as scalar text only. Reflection keeps
+         * this diagnostics path compatible with API variations and avoids
+         * retaining strong references to the industry object.
+         */
+        private static String[] baseIndustryDetails(Industry industry) {
+            String[] result = {"", "", "", "", ""};
+            if (!(industry instanceof BaseIndustry)) return result;
+            result[0] = readField(industry, "building");
+            result[1] = readMethodOrField(industry, "getBuildProgress", "buildProgress");
+            result[2] = readMethodOrField(industry, "getBuildTime", "buildTime");
+            result[3] = firstAvailable(
+                    readMethod(industry, "getUpgradeId"),
+                    readField(industry, "upgradeId"),
+                    readField(industry, "upgrade"));
+            result[4] = readMethod(industry, "isFunctional");
+            return result;
+        }
+
+        private static String readMethodOrField(
+                Object target, String methodName, String fieldName) {
+            return firstAvailable(readMethod(target, methodName),
+                    readField(target, fieldName));
+        }
+
+        private static String readMethod(Object target, String name) {
+            if (target == null) return "";
+            Class<?> type = target.getClass();
+            while (type != null) {
+                try {
+                    Method method = type.getDeclaredMethod(name);
+                    method.setAccessible(true);
+                    return diagnosticScalar(method.invoke(target));
+                } catch (NoSuchMethodException ignored) {
+                    type = type.getSuperclass();
+                } catch (Throwable ignored) {
+                    return "<unavailable>";
+                }
+            }
+            return "";
+        }
+
+        private static String readField(Object target, String name) {
+            if (target == null) return "";
+            Class<?> type = target.getClass();
+            while (type != null) {
+                try {
+                    Field field = type.getDeclaredField(name);
+                    field.setAccessible(true);
+                    return diagnosticScalar(field.get(target));
+                } catch (NoSuchFieldException ignored) {
+                    type = type.getSuperclass();
+                } catch (Throwable ignored) {
+                    return "<unavailable>";
+                }
+            }
+            return "";
+        }
+
+        private static String diagnosticScalar(Object value) {
+            if (value == null) return "<null>";
+            if (value instanceof Number || value instanceof Boolean
+                    || value instanceof Character || value instanceof String) {
+                return String.valueOf(value);
+            }
+            return value.getClass().getName() + ':' + String.valueOf(value);
+        }
+
+        private static String firstAvailable(String... values) {
+            for (String value : values) {
+                if (value != null && !value.isEmpty()) return value;
+            }
+            return "";
         }
 
         void failure(Throwable failure) {
@@ -4949,9 +5109,15 @@ public final class StarsectorPrepatcherHooks {
                         .withZone(ZoneOffset.UTC);
         private static final String HEADER =
                 "timestamp_utc,first_seen_utc,last_seen_utc,occurrences,"
-                        + "market_identity_hash,market_id,market_name,trigger,"
+                        + "market_identity_hash,market_id,market_name,trigger,sample_bucket,transition,"
                         + "reason_mask,reasons,queue_class,queue_size,industry_count,"
                         + "industry_index,industry_id,industry_class,is_building,is_upgrading,"
+                        + "building_industry_index,building_industry_id,building_industry_class,"
+                        + "building_raw_building_field,building_build_progress,building_build_time,"
+                        + "building_upgrade_id,building_is_functional,"
+                        + "upgrading_industry_index,upgrading_industry_id,upgrading_industry_class,"
+                        + "upgrading_raw_building_field,upgrading_build_progress,upgrading_build_time,"
+                        + "upgrading_upgrade_id,upgrading_is_functional,"
                         + "mutation_epoch,audited_epoch,last_audit_batch,old_active,new_active,"
                         + "old_reason_mask,new_reason_mask,exception_class,exception_message\n";
 
@@ -4999,12 +5165,19 @@ public final class StarsectorPrepatcherHooks {
             int identityHash = market == null ? 0 : System.identityHashCode(market);
             String marketId = safeMarketText(market, true);
             String marketName = safeMarketText(market, false);
-            String reasonBucket = constructionReasonBucket(newReasonMask);
+            String reasonBucket = constructionSampleBucket(oldReasonMask, newReasonMask);
             String industryClass = probe == null ? "" : probe.industryClass;
             String industryId = probe == null ? "" : probe.industryId;
+            String buildingClass = probe == null ? "" : probe.buildingIndustryClass;
+            String buildingId = probe == null ? "" : probe.buildingIndustryId;
+            String upgradingClass = probe == null ? "" : probe.upgradingIndustryClass;
+            String upgradingId = probe == null ? "" : probe.upgradingIndustryId;
             String key = reasonBucket + '\u001f' + identityHash + '\u001f' + marketId
-                    + '\u001f' + newReasonMask + '\u001f' + industryClass
-                    + '\u001f' + industryId + '\u001f' + trigger;
+                    + '\u001f' + oldReasonMask + '\u001f' + newReasonMask
+                    + '\u001f' + industryClass + '\u001f' + industryId
+                    + '\u001f' + buildingClass + '\u001f' + buildingId
+                    + '\u001f' + upgradingClass + '\u001f' + upgradingId
+                    + '\u001f' + trigger;
             ConstructionDiagnosticSample existing = samples.get(key);
             if (existing == null) {
                 AtomicInteger count = samplesPerReason.computeIfAbsent(
@@ -5016,7 +5189,7 @@ public final class StarsectorPrepatcherHooks {
                     return;
                 }
                 ConstructionDiagnosticSample candidate = new ConstructionDiagnosticSample(
-                        identityHash, marketId, marketName, trigger,
+                        identityHash, marketId, marketName, trigger, reasonBucket,
                         mutationEpoch, auditedEpoch, lastAuditBatch,
                         oldActive, newActive, oldReasonMask, newReasonMask, probe);
                 ConstructionDiagnosticSample raced = samples.putIfAbsent(key, candidate);
@@ -5072,6 +5245,8 @@ public final class StarsectorPrepatcherHooks {
         final String marketId;
         final String marketName;
         final String trigger;
+        final String sampleBucket;
+        final String transition;
         final long mutationEpoch;
         final long auditedEpoch;
         final long lastAuditBatch;
@@ -5087,6 +5262,22 @@ public final class StarsectorPrepatcherHooks {
         final String industryClass;
         final boolean building;
         final boolean upgrading;
+        final int buildingIndustryIndex;
+        final String buildingIndustryId;
+        final String buildingIndustryClass;
+        final String buildingRawBuildingField;
+        final String buildingBuildProgress;
+        final String buildingBuildTime;
+        final String buildingUpgradeId;
+        final String buildingIsFunctional;
+        final int upgradingIndustryIndex;
+        final String upgradingIndustryId;
+        final String upgradingIndustryClass;
+        final String upgradingRawBuildingField;
+        final String upgradingBuildProgress;
+        final String upgradingBuildTime;
+        final String upgradingUpgradeId;
+        final String upgradingIsFunctional;
         final String exceptionClass;
         final String exceptionMessage;
         final long firstSeenMillis = System.currentTimeMillis();
@@ -5095,6 +5286,7 @@ public final class StarsectorPrepatcherHooks {
 
         ConstructionDiagnosticSample(int marketIdentityHash,
                                      String marketId, String marketName, String trigger,
+                                     String sampleBucket,
                                      long mutationEpoch, long auditedEpoch, long lastAuditBatch,
                                      boolean oldActive, boolean newActive,
                                      int oldReasonMask, int newReasonMask,
@@ -5103,6 +5295,9 @@ public final class StarsectorPrepatcherHooks {
             this.marketId = marketId;
             this.marketName = marketName;
             this.trigger = trigger;
+            this.sampleBucket = sampleBucket;
+            this.transition = oldReasonMask == newReasonMask
+                    ? "" : oldReasonMask + "->" + newReasonMask;
             this.mutationEpoch = mutationEpoch;
             this.auditedEpoch = auditedEpoch;
             this.lastAuditBatch = lastAuditBatch;
@@ -5118,6 +5313,22 @@ public final class StarsectorPrepatcherHooks {
             industryClass = probe == null ? "" : probe.industryClass;
             building = probe != null && probe.industryBuilding;
             upgrading = probe != null && probe.industryUpgrading;
+            buildingIndustryIndex = probe == null ? -1 : probe.buildingIndustryIndex;
+            buildingIndustryId = probe == null ? "" : probe.buildingIndustryId;
+            buildingIndustryClass = probe == null ? "" : probe.buildingIndustryClass;
+            buildingRawBuildingField = probe == null ? "" : probe.buildingRawBuildingField;
+            buildingBuildProgress = probe == null ? "" : probe.buildingBuildProgress;
+            buildingBuildTime = probe == null ? "" : probe.buildingBuildTime;
+            buildingUpgradeId = probe == null ? "" : probe.buildingUpgradeId;
+            buildingIsFunctional = probe == null ? "" : probe.buildingIsFunctional;
+            upgradingIndustryIndex = probe == null ? -1 : probe.upgradingIndustryIndex;
+            upgradingIndustryId = probe == null ? "" : probe.upgradingIndustryId;
+            upgradingIndustryClass = probe == null ? "" : probe.upgradingIndustryClass;
+            upgradingRawBuildingField = probe == null ? "" : probe.upgradingRawBuildingField;
+            upgradingBuildProgress = probe == null ? "" : probe.upgradingBuildProgress;
+            upgradingBuildTime = probe == null ? "" : probe.upgradingBuildTime;
+            upgradingUpgradeId = probe == null ? "" : probe.upgradingUpgradeId;
+            upgradingIsFunctional = probe == null ? "" : probe.upgradingIsFunctional;
             exceptionClass = probe == null ? "" : probe.exceptionClass;
             exceptionMessage = probe == null ? "" : probe.exceptionMessage;
         }
@@ -5138,6 +5349,8 @@ public final class StarsectorPrepatcherHooks {
                     .append(DirectMarketObserver.csv(marketId)).append(',')
                     .append(DirectMarketObserver.csv(marketName)).append(',')
                     .append(DirectMarketObserver.csv(trigger)).append(',')
+                    .append(DirectMarketObserver.csv(sampleBucket)).append(',')
+                    .append(DirectMarketObserver.csv(transition)).append(',')
                     .append(newReasonMask).append(',')
                     .append(DirectMarketObserver.csv(
                             constructionReasonText(newReasonMask))).append(',')
@@ -5149,6 +5362,22 @@ public final class StarsectorPrepatcherHooks {
                     .append(DirectMarketObserver.csv(industryClass)).append(',')
                     .append(building).append(',')
                     .append(upgrading).append(',')
+                    .append(buildingIndustryIndex).append(',')
+                    .append(DirectMarketObserver.csv(buildingIndustryId)).append(',')
+                    .append(DirectMarketObserver.csv(buildingIndustryClass)).append(',')
+                    .append(DirectMarketObserver.csv(buildingRawBuildingField)).append(',')
+                    .append(DirectMarketObserver.csv(buildingBuildProgress)).append(',')
+                    .append(DirectMarketObserver.csv(buildingBuildTime)).append(',')
+                    .append(DirectMarketObserver.csv(buildingUpgradeId)).append(',')
+                    .append(DirectMarketObserver.csv(buildingIsFunctional)).append(',')
+                    .append(upgradingIndustryIndex).append(',')
+                    .append(DirectMarketObserver.csv(upgradingIndustryId)).append(',')
+                    .append(DirectMarketObserver.csv(upgradingIndustryClass)).append(',')
+                    .append(DirectMarketObserver.csv(upgradingRawBuildingField)).append(',')
+                    .append(DirectMarketObserver.csv(upgradingBuildProgress)).append(',')
+                    .append(DirectMarketObserver.csv(upgradingBuildTime)).append(',')
+                    .append(DirectMarketObserver.csv(upgradingUpgradeId)).append(',')
+                    .append(DirectMarketObserver.csv(upgradingIsFunctional)).append(',')
                     .append(mutationEpoch).append(',')
                     .append(auditedEpoch).append(',')
                     .append(lastAuditBatch).append(',')
@@ -5161,8 +5390,26 @@ public final class StarsectorPrepatcherHooks {
         }
     }
 
+    private static String constructionSampleBucket(
+            int oldReasonMask, int newReasonMask) {
+        if (oldReasonMask != 0 && oldReasonMask != newReasonMask) {
+            // Keep the number of quota categories fixed. The exact masks remain
+            // available in the transition/old_reason_mask/new_reason_mask columns.
+            if (oldReasonMask == CONSTRUCTION_REASON_INDUSTRY_UPGRADING
+                    && newReasonMask == (CONSTRUCTION_REASON_INDUSTRY_BUILDING
+                    | CONSTRUCTION_REASON_INDUSTRY_UPGRADING)) {
+                return "TRANSITION_4_TO_6";
+            }
+            return "TRANSITION_OTHER";
+        }
+        return constructionReasonBucket(newReasonMask);
+    }
+
     private static String constructionReasonBucket(int reasonMask) {
-        int semantic = reasonMask & CONSTRUCTION_REASON_ACTIVE_MASK;
+        int semantic = reasonMask & CONSTRUCTION_REASON_OBSERVED_MASK;
+        if (semantic == CONSTRUCTION_REASON_INDUSTRY_UPGRADING) {
+            return "INDUSTRY_UPGRADING_WITHOUT_BUILDING";
+        }
         if (Integer.bitCount(semantic) > 1) return "MULTIPLE";
         if ((semantic & CONSTRUCTION_REASON_QUEUE_NON_EMPTY) != 0) return "QUEUE_NON_EMPTY";
         if ((semantic & CONSTRUCTION_REASON_INDUSTRY_BUILDING) != 0) return "INDUSTRY_BUILDING";

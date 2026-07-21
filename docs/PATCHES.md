@@ -256,8 +256,10 @@ observer.marketConstructionDiagnosticsMaxSamplesPerReason=32
 внутри него воспроизводят исходные шаги только для собственного `advance()`. `RecentUnrest`
 останавливается после удаления condition. Наличие военной базы не переводит весь рынок в full-rate.
 
-Непустая construction queue, building или upgrading временно переводят весь рынок в full-rate.
-Старая history exact-replay’ится до текущего шага. Подтверждённые mutators `Market`, `BaseIndustry`
+Непустая construction queue, `Industry.isBuilding()` или uncertain probe state временно переводят
+весь рынок в full-rate. `Industry.isUpgrading()` остаётся reason/gauge для диагностики, но без
+`isBuilding()` не включает full-rate. Старая history exact-replay’ится до текущего шага.
+Подтверждённые mutators `Market`, `BaseIndustry`
 и `ConstructionQueue` flush’ят pending history до изменения структуры. После завершения
 строительства рынок автоматически возвращается к coalescing. Полный detector scan выполняется
 после mutation epoch и через редкий safety audit, а не на каждом simulation input.
@@ -267,8 +269,9 @@ upgrading gauges, dirty/safety/forced scans, cached decisions, state/reason tran
 queue/industry containers и probe failures. При включённом
 `observer.marketConstructionDiagnostics` bounded CSV записывается в
 `logs/market-construction-diagnostics/session-*/samples.csv`. Лимит применяется отдельно к каждой
-категории причины; строки содержат только identity hash, id/name и снимок queue/industry полей, не
-удерживая `MarketAPI`, `Industry` или queue objects. Этот observer не влияет на policy result.
+reason/transition bucket; строки содержат только identity hash, id/name, раздельные
+building/upgrading industry, transition mask и скалярный снимок queue/BaseIndustry полей, не удерживая
+`MarketAPI`, `Industry` или queue objects. Этот observer не влияет на policy result.
 
 Direct/event/fail-open barrier сначала доставляет старую history, затем выполняет текущий amount
 отдельно. Save по умолчанию coalesced с batch context; `market.remote.exactReplayBeforeSave=true`

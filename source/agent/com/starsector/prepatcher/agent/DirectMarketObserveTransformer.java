@@ -42,8 +42,6 @@ import java.util.Locale;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
 
 /**
  * Observation-only transformer for direct calls made by mod bytecode to
@@ -62,8 +60,6 @@ public final class DirectMarketObserveTransformer implements ClassFileTransforme
     private static final String HOOK_DESC =
             "(Lcom/fs/starfarer/api/campaign/econ/MarketAPI;FJLjava/lang/String;)V";
     private static final char FIELD_SEPARATOR = '\u001f';
-    private static final Pattern MOD_INFO_STRING = Pattern.compile(
-            "\\\"([^\\\"]+)\\\"\\s*:\\s*\\\"((?:\\\\.|[^\\\"\\\\])*)\\\"");
     private static final String SEMANTIC_RISK_HEADER =
             "modId,modName,modDirectory,jarName,source,className,methodName,descriptor,"
                     + "componentType,riskCategory,calledOwner,calledMethod,bytecodeOffset";
@@ -658,18 +654,172 @@ public final class DirectMarketObserveTransformer implements ClassFileTransforme
         Path info = modDirectory.resolve("mod_info.json");
         try {
             String json = Files.readString(info, StandardCharsets.UTF_8);
-            Matcher matcher = MOD_INFO_STRING.matcher(json);
-            while (matcher.find()) {
-                String key = matcher.group(1);
-                String value = unescapeJsonString(matcher.group(2));
-                if ("id".equals(key) && !value.isBlank()) id = value;
-                else if ("name".equals(key) && !value.isBlank()) name = value;
-            }
+            String rootId = rootStringProperty(json, "id");
+            String rootName = rootStringProperty(json, "name");
+            if (!rootId.isBlank()) id = rootId;
+            if (!rootName.isBlank()) name = rootName;
         } catch (Throwable ignored) {
             // A missing or malformed mod_info.json falls back to the directory name.
         }
         return new ModIdentity(id, name, directoryName, jarName);
     }
+
+    /** Reads a string property only from the root JSON object. */
+    private static String rootStringProperty(String json, String wantedKey) {
+        if (json == null || wantedKey == null) return "";
+        int cursor = skipJsonWhitespace(json, 0);
+        if (cursor < json.length() && json.charAt(cursor) == '\ufeff') {
+            cursor = skipJsonWhitespace(json, cursor + 1);
+        }
+        if (cursor >= json.length() || json.charAt(cursor) != '{') return "";
+        cursor++;
+        while (true) {
+            cursor = skipJsonWhitespace(json, cursor);
+            if (cursor >= json.length() || json.charAt(cursor) == '}') return "";
+            ParsedJsonString key = parseJsonString(json, cursor);
+            if (key == null) return "";
+            cursor = skipJsonWhitespace(json, key.next);
+            if (cursor >= json.length() || json.charAt(cursor) != ':') return "";
+            cursor = skipJsonWhitespace(json, cursor + 1);
+            if (cursor >= json.length()) return "";
+            if (json.charAt(cursor) == '"') {
+                ParsedJsonString value = parseJsonString(json, cursor);
+                if (value == null) return "";
+                if (wantedKey.equals(key.value)) return value.value;
+                cursor = value.next;
+            } else {
+                cursor = skipJsonValue(json, cursor);
+                if (cursor < 0) return "";
+            }
+            cursor = skipJsonWhitespace(json, cursor);
+            if (cursor >= json.length() || json.charAt(cursor) == '}') return "";
+            if (json.charAt(cursor) != ',') return "";
+            cursor++;
+        }
+    }
+
+    /** Skips JSON whitespace plus the comment forms accepted by Starsector data files. */
+    private static int skipJsonWhitespace(String json, int cursor) {
+        while (cursor < json.length()) {
+            char current = json.charAt(cursor);
+            if (Character.isWhitespace(current)) {
+                cursor++;
+                continue;
+            }
+            if (current == '#') {
+                cursor = skipJsonLineComment(json, cursor + 1);
+                continue;
+            }
+            if (current == '/' && cursor + 1 < json.length()) {
+                char next = json.charAt(cursor + 1);
+                if (next == '/') {
+                    cursor = skipJsonLineComment(json, cursor + 2);
+                    continue;
+                }
+                if (next == '*') {
+                    int end = json.indexOf("*/", cursor + 2);
+                    return end < 0 ? json.length() : skipJsonWhitespace(json, end + 2);
+                }
+            }
+            break;
+        }
+        return cursor;
+    }
+
+    private static int skipJsonLineComment(String json, int cursor) {
+        while (cursor < json.length()) {
+            char current = json.charAt(cursor++);
+            if (current == '\n' || current == '\r') break;
+        }
+        return cursor;
+    }
+
+    private static int skipJsonValue(String json, int cursor) {
+        cursor = skipJsonWhitespace(json, cursor);
+        if (cursor >= json.length()) return -1;
+        char first = json.charAt(cursor);
+        if (first == '"') {
+            ParsedJsonString value = parseJsonString(json, cursor);
+            return value == null ? -1 : value.next;
+        }
+        if (first == '{' || first == '[') {
+            StringBuilder closers = new StringBuilder();
+            closers.append(first == '{' ? '}' : ']');
+            cursor++;
+            while (cursor < json.length()) {
+                int next = skipJsonWhitespace(json, cursor);
+                if (next != cursor) {
+                    cursor = next;
+                    continue;
+                }
+                char current = json.charAt(cursor);
+                if (current == '"') {
+                    ParsedJsonString value = parseJsonString(json, cursor);
+                    if (value == null) return -1;
+                    cursor = value.next;
+                    continue;
+                }
+                if (current == '{' || current == '[') {
+                    closers.append(current == '{' ? '}' : ']');
+                } else if (closers.length() > 0
+                        && current == closers.charAt(closers.length() - 1)) {
+                    closers.setLength(closers.length() - 1);
+                    if (closers.length() == 0) return cursor + 1;
+                }
+                cursor++;
+            }
+            return -1;
+        }
+        while (cursor < json.length()) {
+            int next = skipJsonWhitespace(json, cursor);
+            if (next != cursor) {
+                cursor = next;
+                continue;
+            }
+            char current = json.charAt(cursor);
+            if (current == ',' || current == '}' || current == ']') break;
+            cursor++;
+        }
+        return cursor;
+    }
+
+    private static ParsedJsonString parseJsonString(String json, int quote) {
+        if (quote >= json.length() || json.charAt(quote) != '"') return null;
+        StringBuilder value = new StringBuilder();
+        boolean escaped = false;
+        for (int cursor = quote + 1; cursor < json.length(); cursor++) {
+            char current = json.charAt(cursor);
+            if (!escaped) {
+                if (current == '"') return new ParsedJsonString(value.toString(), cursor + 1);
+                if (current == '\\') escaped = true;
+                else value.append(current);
+                continue;
+            }
+            escaped = false;
+            switch (current) {
+                case '"', '\\', '/' -> value.append(current);
+                case 'b' -> value.append('\b');
+                case 'f' -> value.append('\f');
+                case 'n' -> value.append('\n');
+                case 'r' -> value.append('\r');
+                case 't' -> value.append('\t');
+                case 'u' -> {
+                    if (cursor + 4 >= json.length()) return null;
+                    try {
+                        value.append((char) Integer.parseInt(
+                                json.substring(cursor + 1, cursor + 5), 16));
+                    } catch (NumberFormatException invalid) {
+                        return null;
+                    }
+                    cursor += 4;
+                }
+                default -> value.append(current);
+            }
+        }
+        return null;
+    }
+
+    private record ParsedJsonString(String value, int next) {}
 
     private static String sourceJarName(Path sourcePath, String source) {
         String name = sourcePath == null || sourcePath.getFileName() == null
@@ -681,32 +831,6 @@ public final class DirectMarketObserveTransformer implements ClassFileTransforme
             name = tail.toLowerCase(Locale.ROOT).endsWith(".jar") ? tail : "";
         }
         return name;
-    }
-
-    private static String unescapeJsonString(String value) {
-        if (value == null || value.indexOf('\\') < 0) return value == null ? "" : value;
-        StringBuilder output = new StringBuilder(value.length());
-        boolean escaped = false;
-        for (int i = 0; i < value.length(); i++) {
-            char current = value.charAt(i);
-            if (!escaped) {
-                if (current == '\\') escaped = true;
-                else output.append(current);
-                continue;
-            }
-            escaped = false;
-            switch (current) {
-                case '"', '\\', '/' -> output.append(current);
-                case 'b' -> output.append('\b');
-                case 'f' -> output.append('\f');
-                case 'n' -> output.append('\n');
-                case 'r' -> output.append('\r');
-                case 't' -> output.append('\t');
-                default -> output.append(current);
-            }
-        }
-        if (escaped) output.append('\\');
-        return output.toString();
     }
 
     private static String sourceLocation(ProtectionDomain protectionDomain) {

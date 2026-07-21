@@ -221,7 +221,7 @@ industry недостаточно. Полный scan проверяет:
 
 - непустую `ConstructionQueue`;
 - `Industry.isBuilding()`;
-- `Industry.isUpgrading()`.
+- `Industry.isUpgrading()` как независимый диагностический признак.
 
 Но scan не выполняется на каждом simulation input. Mutation barriers увеличивают
 `constructionMutationEpoch`; следующий scheduler input выполняет один scan. При отсутствии мутаций
@@ -239,8 +239,10 @@ Save flush всегда принудительно выполняет свежи
 2. текущий шаг выполняется отдельным full-rate callback;
 3. новые шаги не добавляются в pending history.
 
-Когда очередь пуста и building/upgrading отсутствуют, рынок автоматически возвращается в coalesced
-mode. Наличие отрасли, которая когда-либо строилась, не делает режим постоянным.
+Когда очередь пуста и `isBuilding()` отсутствует, рынок автоматически возвращается в coalesced
+mode. `isUpgrading()` без `isBuilding()` сохраняется в reason mask и gauges, но не включает full-rate:
+ванильный `PopulationAndInfrastructure` использует такую комбинацию для собственной семантики.
+Наличие отрасли, которая когда-либо строилась, не делает режим постоянным.
 
 Ошибка compatibility probe трактуется консервативно как активное строительство.
 
@@ -259,9 +261,11 @@ observer.marketConstructionDiagnosticsMaxSamplesPerReason=32
 ```
 
 создаёт `logs/market-construction-diagnostics/session-*/samples.csv`. Выборка bounded отдельно по
-категории причины и хранит только строки/числа: identity hash, market id/name, queue size/class,
-первую подходящую industry, epochs и transition state. Сильные ссылки на game objects не
-сохраняются, diagnostic writer не участвует в scheduler policy.
+reason/transition bucket и хранит только строки/числа: identity hash, market id/name, queue
+size/class, legacy first-positive industry, раздельные building/upgrading industry, raw building
+field, build progress/time, upgrade id, functional state, epochs и transition state. Переходы вида
+`4->6` получают отдельный bucket `TRANSITION_4_TO_6`. Сильные ссылки на game objects не сохраняются,
+diagnostic writer не участвует в scheduler policy.
 
 ## 11. Construction mutation barriers
 

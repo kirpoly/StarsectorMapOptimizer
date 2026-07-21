@@ -1169,6 +1169,15 @@ public final class MarketSchedulerRuntimeTest {
             }
         }
 
+        Object upgradingState = schedulerState(upgradingMarket.proxy);
+        require(!(Boolean) field(upgradingState, "constructionFullRate")
+                        && intField(upgradingState, "constructionReasonMask") == 4,
+                "upgrade-only diagnostic signal incorrectly enabled full-rate mode");
+        Object multipleState = schedulerState(multipleMarket.proxy);
+        require((Boolean) field(multipleState, "constructionFullRate")
+                        && intField(multipleState, "constructionReasonMask") == 7,
+                "active construction reasons were lost when upgrading became diagnostic-only");
+
         require(metric("CONSTRUCTION_SCANS") >= scansBefore + markets.length,
                 "construction reason scenarios did not run one scan per market");
         require(metric("CONSTRUCTION_DETECTED_QUEUE_NON_EMPTY") >= queueBefore + 2L,
@@ -1220,6 +1229,32 @@ public final class MarketSchedulerRuntimeTest {
                 }
             }
 
+            MutableMarket transitionMarket = new MutableMarket(
+                    "diagnostic-transition", remote.proxy, false, false);
+            MutableIndustry transitionIndustry = new MutableIndustry();
+            transitionIndustry.upgrading = true;
+            transitionMarket.industries.add(transitionIndustry);
+            beginSyntheticSchedulerTick();
+            try {
+                StarsectorPrepatcherHooks.advanceMarketScheduled(
+                        transitionMarket.proxy, 0.01f, 0);
+            } finally {
+                endSyntheticSchedulerTick();
+            }
+            require(!(Boolean) field(schedulerState(transitionMarket.proxy),
+                            "constructionFullRate"),
+                    "diagnostic upgrade-only market entered full-rate mode");
+            StarsectorPrepatcherHooks.flushPendingMarketBeforeMutation(
+                    transitionMarket.proxy);
+            transitionIndustry.building = true;
+            beginSyntheticSchedulerTick();
+            try {
+                StarsectorPrepatcherHooks.advanceMarketScheduled(
+                        transitionMarket.proxy, 0.01f, 0);
+            } finally {
+                endSyntheticSchedulerTick();
+            }
+
             Object diagnostics = staticField("CONSTRUCTION_DIAGNOSTICS");
             require(diagnostics != null, "construction diagnostics were not initialized");
             Method writePending = diagnostics.getClass().getDeclaredMethod("writePending");
@@ -1231,12 +1266,19 @@ public final class MarketSchedulerRuntimeTest {
             String csv = Files.readString(directory.resolve("samples.csv"),
                     StandardCharsets.UTF_8);
             require(csv.contains("market_identity_hash,market_id,market_name,trigger")
-                            && csv.contains("reason_mask,reasons,queue_class,queue_size")
+                            && csv.contains("sample_bucket,transition,reason_mask,reasons")
+                            && csv.contains("building_industry_index,building_industry_id")
+                            && csv.contains("upgrading_industry_index,upgrading_industry_id")
+                            && csv.contains("building_raw_building_field,building_build_progress")
                             && csv.contains("INDUSTRY_BUILDING")
-                            && csv.contains("diagnostic-building-"),
+                            && csv.contains("INDUSTRY_UPGRADING_WITHOUT_BUILDING")
+                            && csv.contains("TRANSITION_4_TO_6")
+                            && csv.contains("4->6")
+                            && csv.contains("diagnostic-building-")
+                            && csv.contains("diagnostic-transition"),
                     "construction diagnostics CSV is incomplete: " + csv);
-            require(dataRows(csv) == 1,
-                    "per-reason sample limit did not bound diagnostic CSV: " + csv);
+            require(dataRows(csv) == 3,
+                    "per-bucket sample limit did not bound diagnostic CSV: " + csv);
             require(metric("CONSTRUCTION_DIAGNOSTIC_SAMPLES_DROPPED")
                             >= droppedBefore + 1L,
                     "diagnostic sample overflow was not counted");

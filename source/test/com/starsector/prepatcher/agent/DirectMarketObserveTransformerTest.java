@@ -61,10 +61,18 @@ public final class DirectMarketObserveTransformerTest {
         Files.createDirectories(testModJar.getParent());
         Files.createDirectories(otherModJar.getParent());
         Files.writeString(testModRoot.resolve("mod_info.json"),
-                "{\"id\":\"test_mod\",\"name\":\"Test Mod Display\"}",
+                "# Starsector-style comment\n{\n"
+                        + "  \"id\": \"test_mod\", // owner id\n"
+                        + "  \"name\": \"Test Mod Display\",\n"
+                        + "  \"dependencies\": [{\"id\":\"wrong_dependency\","
+                        + "\"name\":\"Wrong Dependency Display\"}],\n"
+                        + "}\n",
                 StandardCharsets.UTF_8);
         Files.writeString(otherModRoot.resolve("mod_info.json"),
-                "{\"id\":\"other_mod\",\"name\":\"Other Mod Display\"}",
+                "{/* nested dependency must not win */"
+                        + "\"dependencies\":[{\"id\":\"wrong_first\","
+                        + "\"name\":\"Wrong First Display\"}],"
+                        + "\"id\":\"other_mod\",\"name\":\"Other Mod Display\"}",
                 StandardCharsets.UTF_8);
 
         PrepatcherConfig config = config(true, false);
