@@ -172,12 +172,14 @@ to remove sampling overhead. `call-sites.csv` and `observations.csv` contain exp
 remains available as the exact code-source path rather than being the only way to identify a mod.
 
 Construction classification always publishes aggregate reason/scan counters in the periodic stats
-line. `Industry.isUpgrading()` is retained as a diagnostic signal but no longer independently enables
-full-rate mode; active policy is driven by a non-empty queue, `isBuilding()`, or uncertain probe state.
-Optional bounded samples can be enabled with `observer.marketConstructionDiagnostics=true`; they are
-written under `logs/market-construction-diagnostics/session-*/`, include separate building/upgrading
-industry identities, transition buckets, and scalar `BaseIndustry` state, retain no game objects, and
-do not change scheduler behavior.
+line. `Industry.isUpgrading()` is diagnostic-only. For `BaseIndustry` subclasses, full-rate policy uses
+the authoritative raw `building` field rather than an overridden virtual `isBuilding()` result;
+non-`BaseIndustry` implementations retain the interface-method fallback. Virtual-building reports with
+raw `building=false` are counted and sampled separately but do not enable full-rate. Optional bounded
+samples can be enabled with `observer.marketConstructionDiagnostics=true`; they are written under
+`logs/market-construction-diagnostics/session-*/`, include effective/reported building state, separate
+source industries, transition buckets, and scalar `BaseIndustry` state, retain no game objects, and do
+not change scheduler behavior.
 
 Run `uninstall-agent.bat` for vanilla, `uninstall-agent.bat -Target FasterRendering` for FR, or
 `uninstall-agent.bat -Target Both` to remove both managed entries. Each changed file is backed up.

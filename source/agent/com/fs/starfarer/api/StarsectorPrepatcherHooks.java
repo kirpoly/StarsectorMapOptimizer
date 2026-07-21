@@ -134,6 +134,12 @@ public final class StarsectorPrepatcherHooks {
     private static final int CONSTRUCTION_REASON_INDUSTRIES_UNKNOWN = 16;
     private static final int CONSTRUCTION_REASON_PROBE_FAILURE = 32;
     private static final int CONSTRUCTION_REASON_MUTATION_RACE = 64;
+    /**
+     * A virtual Industry.isBuilding() signal from BaseIndustry while the actual
+     * BaseIndustry.building field is false. PopulationAndInfrastructure uses
+     * this pattern for market-size growth, so it is telemetry-only.
+     */
+    private static final int CONSTRUCTION_REASON_REPORTED_BUILDING_WITHOUT_RAW = 128;
     /** Reasons observed by the construction probe, including diagnostic-only signals. */
     private static final int CONSTRUCTION_REASON_OBSERVED_MASK =
             CONSTRUCTION_REASON_QUEUE_NON_EMPTY
@@ -142,12 +148,13 @@ public final class StarsectorPrepatcherHooks {
                     | CONSTRUCTION_REASON_QUEUE_ITEMS_UNKNOWN
                     | CONSTRUCTION_REASON_INDUSTRIES_UNKNOWN
                     | CONSTRUCTION_REASON_PROBE_FAILURE
-                    | CONSTRUCTION_REASON_MUTATION_RACE;
+                    | CONSTRUCTION_REASON_MUTATION_RACE
+                    | CONSTRUCTION_REASON_REPORTED_BUILDING_WITHOUT_RAW;
     /**
-     * Reasons that require exact full-rate market advancement. isUpgrading() is
-     * intentionally diagnostic-only: vanilla PopulationAndInfrastructure uses
-     * an upgrade-like state without Industry.isBuilding(), so treating the bit
-     * independently as construction disables coalescing for most markets.
+     * Reasons that require exact full-rate market advancement. isUpgrading() and
+     * a BaseIndustry virtual-building signal without its raw building field are
+     * intentionally diagnostic-only. Vanilla PopulationAndInfrastructure uses
+     * both signals for market-size growth, not Industry construction.
      */
     private static final int CONSTRUCTION_REASON_ACTIVE_MASK =
             CONSTRUCTION_REASON_QUEUE_NON_EMPTY
@@ -180,6 +187,8 @@ public final class StarsectorPrepatcherHooks {
             ThreadLocal.withInitial(MarketAdvanceInvocationContext::new);
     private static final ThreadLocal<ConstructionProbe> CONSTRUCTION_PROBE =
             ThreadLocal.withInitial(ConstructionProbe::new);
+    private static volatile VarHandle baseIndustryBuildingHandle;
+    private static volatile boolean baseIndustryBuildingHandleResolved;
     private static volatile WeakIdentityMap<MarketAPI, MarketScheduleState> MARKET_SCHEDULER_STATES =
             new WeakIdentityMap<>();
     private static volatile WeakIdentityMap<ConstructionQueue, WeakReference<MarketAPI>>
@@ -312,6 +321,8 @@ public final class StarsectorPrepatcherHooks {
     private static final LongAdder CONSTRUCTION_DETECTED_QUEUE_NON_EMPTY = new LongAdder();
     private static final LongAdder CONSTRUCTION_DETECTED_INDUSTRY_BUILDING = new LongAdder();
     private static final LongAdder CONSTRUCTION_DETECTED_INDUSTRY_UPGRADING = new LongAdder();
+    private static final LongAdder CONSTRUCTION_DETECTED_REPORTED_BUILDING_WITHOUT_RAW =
+            new LongAdder();
     private static final LongAdder CONSTRUCTION_DETECTED_MULTIPLE_REASONS = new LongAdder();
     private static final LongAdder CONSTRUCTION_DETECTED_PROBE_FAILURE = new LongAdder();
     private static final LongAdder CONSTRUCTION_QUEUE_NULL_SCANS = new LongAdder();
@@ -1897,26 +1908,57 @@ public final class StarsectorPrepatcherHooks {
                 for (int i = 0; i < size; i++) {
                     Industry industry = industries.get(i);
                     if (industry == null) continue;
-                    boolean building = false;
+                    boolean reportedBuilding = false;
                     boolean upgrading = false;
+                    Boolean rawBuilding = null;
                     try {
-                        building = industry.isBuilding();
+                        reportedBuilding = industry.isBuilding();
+                    } catch (Throwable failure) {
+                        reasonMask |= CONSTRUCTION_REASON_PROBE_FAILURE;
+                        if (probe != null) probe.failure(failure);
+                    }
+                    try {
                         upgrading = industry.isUpgrading();
                     } catch (Throwable failure) {
                         reasonMask |= CONSTRUCTION_REASON_PROBE_FAILURE;
                         if (probe != null) probe.failure(failure);
                     }
-                    if (building) {
+                    try {
+                        rawBuilding = rawBaseIndustryBuilding(industry);
+                    } catch (Throwable failure) {
+                        reasonMask |= CONSTRUCTION_REASON_PROBE_FAILURE;
+                        if (probe != null) probe.failure(failure);
+                    }
+                    int buildingReason = constructionBuildingReason(
+                            reportedBuilding, rawBuilding);
+                    boolean effectiveBuilding = (buildingReason
+                            & CONSTRUCTION_REASON_INDUSTRY_BUILDING) != 0;
+                    boolean reportedBuildingWithoutRaw = (buildingReason
+                            & CONSTRUCTION_REASON_REPORTED_BUILDING_WITHOUT_RAW) != 0;
+                    if (effectiveBuilding) {
                         reasonMask |= CONSTRUCTION_REASON_INDUSTRY_BUILDING;
-                        if (probe != null) probe.captureBuildingIndustry(industry, i);
+                        if (probe != null) {
+                            probe.captureBuildingIndustry(industry, i, rawBuilding);
+                        }
+                    }
+                    if (reportedBuildingWithoutRaw) {
+                        reasonMask |= CONSTRUCTION_REASON_REPORTED_BUILDING_WITHOUT_RAW;
+                        if (probe != null) {
+                            probe.captureReportedBuildingWithoutRawIndustry(
+                                    industry, i, rawBuilding);
+                        }
                     }
                     if (upgrading) {
                         reasonMask |= CONSTRUCTION_REASON_INDUSTRY_UPGRADING;
-                        if (probe != null) probe.captureUpgradingIndustry(industry, i);
+                        if (probe != null) {
+                            probe.captureUpgradingIndustry(industry, i, rawBuilding);
+                        }
                     }
-                    if (probe != null && (building || upgrading)
+                    if (probe != null
+                            && (reportedBuilding || effectiveBuilding || upgrading)
                             && probe.industryIndex < 0) {
-                        probe.captureIndustry(industry, i, building, upgrading);
+                        probe.captureIndustry(industry, i, reportedBuilding,
+                                effectiveBuilding, upgrading);
                     }
                 }
             }
@@ -1925,6 +1967,56 @@ public final class StarsectorPrepatcherHooks {
             if (probe != null) probe.failure(failure);
         }
         return reasonMask;
+    }
+
+    /**
+     * Classifies the public building signal against the authoritative raw
+     * BaseIndustry field. A null raw value denotes a non-BaseIndustry
+     * implementation, for which the interface signal remains authoritative.
+     */
+    private static int constructionBuildingReason(
+            boolean reportedBuilding, Boolean rawBuilding) {
+        if (rawBuilding == null) {
+            return reportedBuilding ? CONSTRUCTION_REASON_INDUSTRY_BUILDING : 0;
+        }
+        if (rawBuilding.booleanValue()) {
+            return CONSTRUCTION_REASON_INDUSTRY_BUILDING;
+        }
+        return reportedBuilding
+                ? CONSTRUCTION_REASON_REPORTED_BUILDING_WITHOUT_RAW : 0;
+    }
+
+    private static VarHandle baseIndustryBuildingHandle() {
+        if (!baseIndustryBuildingHandleResolved) {
+            synchronized (StarsectorPrepatcherHooks.class) {
+                if (!baseIndustryBuildingHandleResolved) {
+                    try {
+                        baseIndustryBuildingHandle =
+                                privateVarHandle(BaseIndustry.class, "building");
+                    } catch (Throwable ignored) {
+                        baseIndustryBuildingHandle = null;
+                    }
+                    baseIndustryBuildingHandleResolved = true;
+                }
+            }
+        }
+        return baseIndustryBuildingHandle;
+    }
+
+    /**
+     * Returns the authoritative BaseIndustry construction flag. A null result
+     * means the implementation is not a BaseIndustry and the interface method
+     * remains the only available signal. Failure to access the known field is
+     * treated as a probe failure so the scheduler fails open.
+     */
+    private static Boolean rawBaseIndustryBuilding(Industry industry) {
+        if (!(industry instanceof BaseIndustry)) return null;
+        VarHandle handle = baseIndustryBuildingHandle();
+        if (handle == null) {
+            throw new IllegalStateException(
+                    "BaseIndustry.building field is unavailable");
+        }
+        return (boolean) handle.get(industry);
     }
 
     private static void recordConstructionReasonCounters(int reasonMask) {
@@ -1939,6 +2031,10 @@ public final class StarsectorPrepatcherHooks {
         }
         if ((reasonMask & CONSTRUCTION_REASON_INDUSTRY_UPGRADING) != 0) {
             CONSTRUCTION_DETECTED_INDUSTRY_UPGRADING.increment();
+            semanticReasons++;
+        }
+        if ((reasonMask & CONSTRUCTION_REASON_REPORTED_BUILDING_WITHOUT_RAW) != 0) {
+            CONSTRUCTION_DETECTED_REPORTED_BUILDING_WITHOUT_RAW.increment();
             semanticReasons++;
         }
         if ((reasonMask & CONSTRUCTION_REASON_PROBE_FAILURE) != 0) {
@@ -2610,6 +2706,7 @@ public final class StarsectorPrepatcherHooks {
         int constructionQueueMarkets = 0;
         int constructionBuildingMarkets = 0;
         int constructionUpgradingMarkets = 0;
+        int constructionReportedBuildingWithoutRawMarkets = 0;
         int constructionUncertainMarkets = 0;
         int constructionMultipleReasonMarkets = 0;
         try {
@@ -2631,6 +2728,9 @@ public final class StarsectorPrepatcherHooks {
                     if ((reasons & CONSTRUCTION_REASON_INDUSTRY_UPGRADING) != 0) {
                         constructionUpgradingMarkets++;
                     }
+                    if ((reasons & CONSTRUCTION_REASON_REPORTED_BUILDING_WITHOUT_RAW) != 0) {
+                        constructionReportedBuildingWithoutRawMarkets++;
+                    }
                     if ((reasons & (CONSTRUCTION_REASON_QUEUE_ITEMS_UNKNOWN
                             | CONSTRUCTION_REASON_INDUSTRIES_UNKNOWN
                             | CONSTRUCTION_REASON_PROBE_FAILURE
@@ -2647,8 +2747,8 @@ public final class StarsectorPrepatcherHooks {
         }
         return new MarketSchedulerGaugeSnapshot(pendingSteps, pendingRuns, constructionMarkets,
                 constructionQueueMarkets, constructionBuildingMarkets,
-                constructionUpgradingMarkets, constructionUncertainMarkets,
-                constructionMultipleReasonMarkets);
+                constructionUpgradingMarkets, constructionReportedBuildingWithoutRawMarkets,
+                constructionUncertainMarkets, constructionMultipleReasonMarkets);
     }
 
     private record MarketSchedulerGaugeSnapshot(
@@ -2658,6 +2758,7 @@ public final class StarsectorPrepatcherHooks {
             int constructionMarketsQueueNonEmpty,
             int constructionMarketsIndustryBuilding,
             int constructionMarketsIndustryUpgrading,
+            int constructionMarketsReportedBuildingWithoutRaw,
             int constructionMarketsUncertain,
             int constructionMarketsMultipleReasons) {}
 
@@ -4924,6 +5025,7 @@ public final class StarsectorPrepatcherHooks {
         String industryId = "";
         String industryClass = "";
         boolean industryBuilding;
+        boolean industryEffectiveBuilding;
         boolean industryUpgrading;
 
         int buildingIndustryIndex = -1;
@@ -4934,6 +5036,15 @@ public final class StarsectorPrepatcherHooks {
         String buildingBuildTime = "";
         String buildingUpgradeId = "";
         String buildingIsFunctional = "";
+
+        int reportedBuildingWithoutRawIndustryIndex = -1;
+        String reportedBuildingWithoutRawIndustryId = "";
+        String reportedBuildingWithoutRawIndustryClass = "";
+        String reportedBuildingWithoutRawRawBuildingField = "";
+        String reportedBuildingWithoutRawBuildProgress = "";
+        String reportedBuildingWithoutRawBuildTime = "";
+        String reportedBuildingWithoutRawUpgradeId = "";
+        String reportedBuildingWithoutRawIsFunctional = "";
 
         int upgradingIndustryIndex = -1;
         String upgradingIndustryId = "";
@@ -4955,6 +5066,7 @@ public final class StarsectorPrepatcherHooks {
             industryId = "";
             industryClass = "";
             industryBuilding = false;
+            industryEffectiveBuilding = false;
             industryUpgrading = false;
             buildingIndustryIndex = -1;
             buildingIndustryId = "";
@@ -4964,6 +5076,14 @@ public final class StarsectorPrepatcherHooks {
             buildingBuildTime = "";
             buildingUpgradeId = "";
             buildingIsFunctional = "";
+            reportedBuildingWithoutRawIndustryIndex = -1;
+            reportedBuildingWithoutRawIndustryId = "";
+            reportedBuildingWithoutRawIndustryClass = "";
+            reportedBuildingWithoutRawRawBuildingField = "";
+            reportedBuildingWithoutRawBuildProgress = "";
+            reportedBuildingWithoutRawBuildTime = "";
+            reportedBuildingWithoutRawUpgradeId = "";
+            reportedBuildingWithoutRawIsFunctional = "";
             upgradingIndustryIndex = -1;
             upgradingIndustryId = "";
             upgradingIndustryClass = "";
@@ -4977,20 +5097,23 @@ public final class StarsectorPrepatcherHooks {
         }
 
         void captureIndustry(Industry industry, int index,
-                             boolean building, boolean upgrading) {
+                             boolean reportedBuilding, boolean effectiveBuilding,
+                             boolean upgrading) {
             industryIndex = index;
             industryClass = ((Object) industry).getClass().getName();
-            industryBuilding = building;
+            industryBuilding = reportedBuilding;
+            industryEffectiveBuilding = effectiveBuilding;
             industryUpgrading = upgrading;
             industryId = safeIndustryId(industry);
         }
 
-        void captureBuildingIndustry(Industry industry, int index) {
+        void captureBuildingIndustry(
+                Industry industry, int index, Boolean rawBuilding) {
             if (buildingIndustryIndex >= 0) return;
             buildingIndustryIndex = index;
             buildingIndustryClass = ((Object) industry).getClass().getName();
             buildingIndustryId = safeIndustryId(industry);
-            String[] details = baseIndustryDetails(industry);
+            String[] details = baseIndustryDetails(industry, rawBuilding);
             buildingRawBuildingField = details[0];
             buildingBuildProgress = details[1];
             buildingBuildTime = details[2];
@@ -4998,12 +5121,28 @@ public final class StarsectorPrepatcherHooks {
             buildingIsFunctional = details[4];
         }
 
-        void captureUpgradingIndustry(Industry industry, int index) {
+        void captureReportedBuildingWithoutRawIndustry(
+                Industry industry, int index, Boolean rawBuilding) {
+            if (reportedBuildingWithoutRawIndustryIndex >= 0) return;
+            reportedBuildingWithoutRawIndustryIndex = index;
+            reportedBuildingWithoutRawIndustryClass =
+                    ((Object) industry).getClass().getName();
+            reportedBuildingWithoutRawIndustryId = safeIndustryId(industry);
+            String[] details = baseIndustryDetails(industry, rawBuilding);
+            reportedBuildingWithoutRawRawBuildingField = details[0];
+            reportedBuildingWithoutRawBuildProgress = details[1];
+            reportedBuildingWithoutRawBuildTime = details[2];
+            reportedBuildingWithoutRawUpgradeId = details[3];
+            reportedBuildingWithoutRawIsFunctional = details[4];
+        }
+
+        void captureUpgradingIndustry(
+                Industry industry, int index, Boolean rawBuilding) {
             if (upgradingIndustryIndex >= 0) return;
             upgradingIndustryIndex = index;
             upgradingIndustryClass = ((Object) industry).getClass().getName();
             upgradingIndustryId = safeIndustryId(industry);
-            String[] details = baseIndustryDetails(industry);
+            String[] details = baseIndustryDetails(industry, rawBuilding);
             upgradingRawBuildingField = details[0];
             upgradingBuildProgress = details[1];
             upgradingBuildTime = details[2];
@@ -5025,10 +5164,13 @@ public final class StarsectorPrepatcherHooks {
          * this diagnostics path compatible with API variations and avoids
          * retaining strong references to the industry object.
          */
-        private static String[] baseIndustryDetails(Industry industry) {
+        private static String[] baseIndustryDetails(
+                Industry industry, Boolean rawBuilding) {
             String[] result = {"", "", "", "", ""};
             if (!(industry instanceof BaseIndustry)) return result;
-            result[0] = readField(industry, "building");
+            result[0] = rawBuilding == null
+                    ? readField(industry, "building")
+                    : String.valueOf(rawBuilding.booleanValue());
             result[1] = readMethodOrField(industry, "getBuildProgress", "buildProgress");
             result[2] = readMethodOrField(industry, "getBuildTime", "buildTime");
             result[3] = firstAvailable(
@@ -5111,10 +5253,19 @@ public final class StarsectorPrepatcherHooks {
                 "timestamp_utc,first_seen_utc,last_seen_utc,occurrences,"
                         + "market_identity_hash,market_id,market_name,trigger,sample_bucket,transition,"
                         + "reason_mask,reasons,queue_class,queue_size,industry_count,"
-                        + "industry_index,industry_id,industry_class,is_building,is_upgrading,"
+                        + "industry_index,industry_id,industry_class,is_building,"
+                        + "effective_is_building,is_upgrading,reported_building_without_raw,"
                         + "building_industry_index,building_industry_id,building_industry_class,"
                         + "building_raw_building_field,building_build_progress,building_build_time,"
                         + "building_upgrade_id,building_is_functional,"
+                        + "reported_building_without_raw_industry_index,"
+                        + "reported_building_without_raw_industry_id,"
+                        + "reported_building_without_raw_industry_class,"
+                        + "reported_building_without_raw_raw_building_field,"
+                        + "reported_building_without_raw_build_progress,"
+                        + "reported_building_without_raw_build_time,"
+                        + "reported_building_without_raw_upgrade_id,"
+                        + "reported_building_without_raw_is_functional,"
                         + "upgrading_industry_index,upgrading_industry_id,upgrading_industry_class,"
                         + "upgrading_raw_building_field,upgrading_build_progress,upgrading_build_time,"
                         + "upgrading_upgrade_id,upgrading_is_functional,"
@@ -5170,12 +5321,18 @@ public final class StarsectorPrepatcherHooks {
             String industryId = probe == null ? "" : probe.industryId;
             String buildingClass = probe == null ? "" : probe.buildingIndustryClass;
             String buildingId = probe == null ? "" : probe.buildingIndustryId;
+            String reportedWithoutRawClass = probe == null
+                    ? "" : probe.reportedBuildingWithoutRawIndustryClass;
+            String reportedWithoutRawId = probe == null
+                    ? "" : probe.reportedBuildingWithoutRawIndustryId;
             String upgradingClass = probe == null ? "" : probe.upgradingIndustryClass;
             String upgradingId = probe == null ? "" : probe.upgradingIndustryId;
             String key = reasonBucket + '\u001f' + identityHash + '\u001f' + marketId
                     + '\u001f' + oldReasonMask + '\u001f' + newReasonMask
                     + '\u001f' + industryClass + '\u001f' + industryId
                     + '\u001f' + buildingClass + '\u001f' + buildingId
+                    + '\u001f' + reportedWithoutRawClass
+                    + '\u001f' + reportedWithoutRawId
                     + '\u001f' + upgradingClass + '\u001f' + upgradingId
                     + '\u001f' + trigger;
             ConstructionDiagnosticSample existing = samples.get(key);
@@ -5261,7 +5418,9 @@ public final class StarsectorPrepatcherHooks {
         final String industryId;
         final String industryClass;
         final boolean building;
+        final boolean effectiveBuilding;
         final boolean upgrading;
+        final boolean reportedBuildingWithoutRaw;
         final int buildingIndustryIndex;
         final String buildingIndustryId;
         final String buildingIndustryClass;
@@ -5270,6 +5429,14 @@ public final class StarsectorPrepatcherHooks {
         final String buildingBuildTime;
         final String buildingUpgradeId;
         final String buildingIsFunctional;
+        final int reportedBuildingWithoutRawIndustryIndex;
+        final String reportedBuildingWithoutRawIndustryId;
+        final String reportedBuildingWithoutRawIndustryClass;
+        final String reportedBuildingWithoutRawRawBuildingField;
+        final String reportedBuildingWithoutRawBuildProgress;
+        final String reportedBuildingWithoutRawBuildTime;
+        final String reportedBuildingWithoutRawUpgradeId;
+        final String reportedBuildingWithoutRawIsFunctional;
         final int upgradingIndustryIndex;
         final String upgradingIndustryId;
         final String upgradingIndustryClass;
@@ -5312,7 +5479,10 @@ public final class StarsectorPrepatcherHooks {
             industryId = probe == null ? "" : probe.industryId;
             industryClass = probe == null ? "" : probe.industryClass;
             building = probe != null && probe.industryBuilding;
+            effectiveBuilding = probe != null && probe.industryEffectiveBuilding;
             upgrading = probe != null && probe.industryUpgrading;
+            reportedBuildingWithoutRaw = probe != null
+                    && probe.reportedBuildingWithoutRawIndustryIndex >= 0;
             buildingIndustryIndex = probe == null ? -1 : probe.buildingIndustryIndex;
             buildingIndustryId = probe == null ? "" : probe.buildingIndustryId;
             buildingIndustryClass = probe == null ? "" : probe.buildingIndustryClass;
@@ -5321,6 +5491,22 @@ public final class StarsectorPrepatcherHooks {
             buildingBuildTime = probe == null ? "" : probe.buildingBuildTime;
             buildingUpgradeId = probe == null ? "" : probe.buildingUpgradeId;
             buildingIsFunctional = probe == null ? "" : probe.buildingIsFunctional;
+            reportedBuildingWithoutRawIndustryIndex = probe == null
+                    ? -1 : probe.reportedBuildingWithoutRawIndustryIndex;
+            reportedBuildingWithoutRawIndustryId = probe == null
+                    ? "" : probe.reportedBuildingWithoutRawIndustryId;
+            reportedBuildingWithoutRawIndustryClass = probe == null
+                    ? "" : probe.reportedBuildingWithoutRawIndustryClass;
+            reportedBuildingWithoutRawRawBuildingField = probe == null
+                    ? "" : probe.reportedBuildingWithoutRawRawBuildingField;
+            reportedBuildingWithoutRawBuildProgress = probe == null
+                    ? "" : probe.reportedBuildingWithoutRawBuildProgress;
+            reportedBuildingWithoutRawBuildTime = probe == null
+                    ? "" : probe.reportedBuildingWithoutRawBuildTime;
+            reportedBuildingWithoutRawUpgradeId = probe == null
+                    ? "" : probe.reportedBuildingWithoutRawUpgradeId;
+            reportedBuildingWithoutRawIsFunctional = probe == null
+                    ? "" : probe.reportedBuildingWithoutRawIsFunctional;
             upgradingIndustryIndex = probe == null ? -1 : probe.upgradingIndustryIndex;
             upgradingIndustryId = probe == null ? "" : probe.upgradingIndustryId;
             upgradingIndustryClass = probe == null ? "" : probe.upgradingIndustryClass;
@@ -5361,7 +5547,9 @@ public final class StarsectorPrepatcherHooks {
                     .append(DirectMarketObserver.csv(industryId)).append(',')
                     .append(DirectMarketObserver.csv(industryClass)).append(',')
                     .append(building).append(',')
+                    .append(effectiveBuilding).append(',')
                     .append(upgrading).append(',')
+                    .append(reportedBuildingWithoutRaw).append(',')
                     .append(buildingIndustryIndex).append(',')
                     .append(DirectMarketObserver.csv(buildingIndustryId)).append(',')
                     .append(DirectMarketObserver.csv(buildingIndustryClass)).append(',')
@@ -5370,6 +5558,21 @@ public final class StarsectorPrepatcherHooks {
                     .append(DirectMarketObserver.csv(buildingBuildTime)).append(',')
                     .append(DirectMarketObserver.csv(buildingUpgradeId)).append(',')
                     .append(DirectMarketObserver.csv(buildingIsFunctional)).append(',')
+                    .append(reportedBuildingWithoutRawIndustryIndex).append(',')
+                    .append(DirectMarketObserver.csv(
+                            reportedBuildingWithoutRawIndustryId)).append(',')
+                    .append(DirectMarketObserver.csv(
+                            reportedBuildingWithoutRawIndustryClass)).append(',')
+                    .append(DirectMarketObserver.csv(
+                            reportedBuildingWithoutRawRawBuildingField)).append(',')
+                    .append(DirectMarketObserver.csv(
+                            reportedBuildingWithoutRawBuildProgress)).append(',')
+                    .append(DirectMarketObserver.csv(
+                            reportedBuildingWithoutRawBuildTime)).append(',')
+                    .append(DirectMarketObserver.csv(
+                            reportedBuildingWithoutRawUpgradeId)).append(',')
+                    .append(DirectMarketObserver.csv(
+                            reportedBuildingWithoutRawIsFunctional)).append(',')
                     .append(upgradingIndustryIndex).append(',')
                     .append(DirectMarketObserver.csv(upgradingIndustryId)).append(',')
                     .append(DirectMarketObserver.csv(upgradingIndustryClass)).append(',')
@@ -5400,6 +5603,11 @@ public final class StarsectorPrepatcherHooks {
                     | CONSTRUCTION_REASON_INDUSTRY_UPGRADING)) {
                 return "TRANSITION_4_TO_6";
             }
+            if (oldReasonMask == CONSTRUCTION_REASON_INDUSTRY_UPGRADING
+                    && newReasonMask == (CONSTRUCTION_REASON_INDUSTRY_UPGRADING
+                    | CONSTRUCTION_REASON_REPORTED_BUILDING_WITHOUT_RAW)) {
+                return "TRANSITION_4_TO_132";
+            }
             return "TRANSITION_OTHER";
         }
         return constructionReasonBucket(newReasonMask);
@@ -5410,6 +5618,11 @@ public final class StarsectorPrepatcherHooks {
         if (semantic == CONSTRUCTION_REASON_INDUSTRY_UPGRADING) {
             return "INDUSTRY_UPGRADING_WITHOUT_BUILDING";
         }
+        if (semantic == CONSTRUCTION_REASON_REPORTED_BUILDING_WITHOUT_RAW
+                || semantic == (CONSTRUCTION_REASON_INDUSTRY_UPGRADING
+                | CONSTRUCTION_REASON_REPORTED_BUILDING_WITHOUT_RAW)) {
+            return "REPORTED_BUILDING_WITHOUT_RAW";
+        }
         if (Integer.bitCount(semantic) > 1) return "MULTIPLE";
         if ((semantic & CONSTRUCTION_REASON_QUEUE_NON_EMPTY) != 0) return "QUEUE_NON_EMPTY";
         if ((semantic & CONSTRUCTION_REASON_INDUSTRY_BUILDING) != 0) return "INDUSTRY_BUILDING";
@@ -5418,6 +5631,9 @@ public final class StarsectorPrepatcherHooks {
         if ((semantic & CONSTRUCTION_REASON_INDUSTRIES_UNKNOWN) != 0) return "INDUSTRIES_UNKNOWN";
         if ((semantic & CONSTRUCTION_REASON_PROBE_FAILURE) != 0) return "PROBE_FAILURE";
         if ((semantic & CONSTRUCTION_REASON_MUTATION_RACE) != 0) return "MUTATION_RACE";
+        if ((semantic & CONSTRUCTION_REASON_REPORTED_BUILDING_WITHOUT_RAW) != 0) {
+            return "REPORTED_BUILDING_WITHOUT_RAW";
+        }
         return "INACTIVE";
     }
 
@@ -5431,6 +5647,9 @@ public final class StarsectorPrepatcherHooks {
         appendReason(result, reasonMask, CONSTRUCTION_REASON_INDUSTRIES_UNKNOWN, "INDUSTRIES_UNKNOWN");
         appendReason(result, reasonMask, CONSTRUCTION_REASON_PROBE_FAILURE, "PROBE_FAILURE");
         appendReason(result, reasonMask, CONSTRUCTION_REASON_MUTATION_RACE, "MUTATION_RACE");
+        appendReason(result, reasonMask,
+                CONSTRUCTION_REASON_REPORTED_BUILDING_WITHOUT_RAW,
+                "REPORTED_BUILDING_WITHOUT_RAW");
         return result.toString();
     }
 
@@ -6475,6 +6694,8 @@ public final class StarsectorPrepatcherHooks {
                         + marketGauges.constructionMarketsIndustryBuilding()
                         + ", constructionMarketsIndustryUpgrading="
                         + marketGauges.constructionMarketsIndustryUpgrading()
+                        + ", constructionMarketsReportedBuildingWithoutRaw="
+                        + marketGauges.constructionMarketsReportedBuildingWithoutRaw()
                         + ", constructionMarketsUncertain="
                         + marketGauges.constructionMarketsUncertain()
                         + ", constructionMarketsMultipleReasons="
@@ -6501,6 +6722,8 @@ public final class StarsectorPrepatcherHooks {
                         + CONSTRUCTION_DETECTED_INDUSTRY_BUILDING.sumThenReset()
                         + ", constructionDetectedIndustryUpgrading="
                         + CONSTRUCTION_DETECTED_INDUSTRY_UPGRADING.sumThenReset()
+                        + ", constructionDetectedReportedBuildingWithoutRaw="
+                        + CONSTRUCTION_DETECTED_REPORTED_BUILDING_WITHOUT_RAW.sumThenReset()
                         + ", constructionDetectedMultipleReasons="
                         + CONSTRUCTION_DETECTED_MULTIPLE_REASONS.sumThenReset()
                         + ", constructionDetectedProbeFailure="

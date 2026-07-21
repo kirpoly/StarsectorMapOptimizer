@@ -256,21 +256,24 @@ observer.marketConstructionDiagnosticsMaxSamplesPerReason=32
 внутри него воспроизводят исходные шаги только для собственного `advance()`. `RecentUnrest`
 останавливается после удаления condition. Наличие военной базы не переводит весь рынок в full-rate.
 
-Непустая construction queue, `Industry.isBuilding()` или uncertain probe state временно переводят
-весь рынок в full-rate. `Industry.isUpgrading()` остаётся reason/gauge для диагностики, но без
-`isBuilding()` не включает full-rate. Старая history exact-replay’ится до текущего шага.
+Непустая construction queue, effective building или uncertain probe state временно переводят весь
+рынок в full-rate. Для наследников `BaseIndustry` effective building читается из raw-поля `building`;
+virtual `Industry.isBuilding()` используется как fallback только для других реализаций.
+`Industry.isUpgrading()` и virtual-building при raw=false остаются reason/gauge для диагностики, но не
+включают full-rate. Старая history exact-replay’ится до текущего шага.
 Подтверждённые mutators `Market`, `BaseIndustry`
 и `ConstructionQueue` flush’ят pending history до изменения структуры. После завершения
 строительства рынок автоматически возвращается к coalescing. Полный detector scan выполняется
 после mutation epoch и через редкий safety audit, а не на каждом simulation input.
 
-Периодическая строка stats всегда содержит причины и стоимость detector scan: queue/building/
-upgrading gauges, dirty/safety/forced scans, cached decisions, state/reason transitions, неизвестные
-queue/industry containers и probe failures. При включённом
+Периодическая строка stats всегда содержит причины и стоимость detector scan: queue/effective-
+building/upgrading/reported-without-raw gauges, dirty/safety/forced scans, cached decisions,
+state/reason transitions, неизвестные queue/industry containers и probe failures. При включённом
 `observer.marketConstructionDiagnostics` bounded CSV записывается в
 `logs/market-construction-diagnostics/session-*/samples.csv`. Лимит применяется отдельно к каждой
-reason/transition bucket; строки содержат только identity hash, id/name, раздельные
-building/upgrading industry, transition mask и скалярный снимок queue/BaseIndustry полей, не удерживая
+reason/transition bucket; строки содержат только identity hash, id/name, reported/effective building,
+раздельные effective-building/upgrading/reported-without-raw industries, transition mask и скалярный
+снимок queue/BaseIndustry полей, не удерживая
 `MarketAPI`, `Industry` или queue objects. Этот observer не влияет на policy result.
 
 Direct/event/fail-open barrier сначала доставляет старую history, затем выполняет текущий amount

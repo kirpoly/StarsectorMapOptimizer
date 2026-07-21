@@ -46,9 +46,11 @@
   Отдельный выключенный по умолчанию `observer.marketConstructionDiagnostics` пишет bounded
   per-reason CSV без сильных ссылок на market/industry objects и не влияет на scheduler policy.
 - Upgrade-only reason (`isUpgrading() && !isBuilding()`) переведён в diagnostic-only: он остаётся в
-  counters/gauges и CSV, но больше не удерживает рынок в full-rate. CSV теперь имеет отдельные поля
-  для building/upgrading industry, scalar `BaseIndustry` state и ограниченные transition buckets,
-  включая `TRANSITION_4_TO_6`.
+  counters/gauges и CSV, но больше не удерживает рынок в full-rate. Для наследников `BaseIndustry`
+  active construction теперь определяется по raw-полю `building`, а virtual `isBuilding()` остаётся
+  telemetry/fallback для произвольных реализаций `Industry`. Расхождение virtual=true/raw=false
+  получает отдельный reason, counter, gauge и CSV bucket; CSV также содержит раздельные источники,
+  scalar `BaseIndustry` state и transition buckets `TRANSITION_4_TO_6`/`TRANSITION_4_TO_132`.
 - Direct-market identity resolver читает только root-level `id`/`name` из `mod_info.json`; вложенные
   dependency descriptors больше не могут подменить владельца JAR.
 - `FastForwardPresentationTransformer` переведён с whole-class/JAR SHA-256 gating на 24 локальных

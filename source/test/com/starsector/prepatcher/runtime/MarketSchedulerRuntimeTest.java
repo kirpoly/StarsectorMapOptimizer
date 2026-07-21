@@ -1005,7 +1005,7 @@ public final class MarketSchedulerRuntimeTest {
         }
         MutableIndustry industry = new MutableIndustry();
         StarsectorPrepatcherHooks.flushPendingMarketBeforeMutation(market.proxy);
-        industry.building = true;
+        industry.setRawAndReportedBuilding(true);
         market.industries.add(industry);
 
         long entriesBefore = metric("CONSTRUCTION_MODE_ENTRIES");
@@ -1038,7 +1038,7 @@ public final class MarketSchedulerRuntimeTest {
                 "active construction was not kept full-rate");
 
         StarsectorPrepatcherHooks.flushPendingMarketBeforeMutation(market.proxy);
-        industry.building = false;
+        industry.setRawAndReportedBuilding(false);
         long exitsBefore = metric("CONSTRUCTION_MODE_EXITS");
         beginSyntheticSchedulerTick();
         try {
@@ -1125,9 +1125,12 @@ public final class MarketSchedulerRuntimeTest {
         long queueBefore = metric("CONSTRUCTION_DETECTED_QUEUE_NON_EMPTY");
         long buildingBefore = metric("CONSTRUCTION_DETECTED_INDUSTRY_BUILDING");
         long upgradingBefore = metric("CONSTRUCTION_DETECTED_INDUSTRY_UPGRADING");
+        long reportedWithoutRawBefore = metric(
+                "CONSTRUCTION_DETECTED_REPORTED_BUILDING_WITHOUT_RAW");
         long multipleBefore = metric("CONSTRUCTION_DETECTED_MULTIPLE_REASONS");
         long failureBefore = metric("CONSTRUCTION_DETECTED_PROBE_FAILURE");
         long scansBefore = metric("CONSTRUCTION_SCANS");
+        assertConstructionBuildingReasonClassification();
 
         MutableMarket queueMarket = new MutableMarket(
                 "construction-reason-queue", remote.proxy, false, false);
@@ -1136,7 +1139,7 @@ public final class MarketSchedulerRuntimeTest {
         MutableMarket buildingMarket = new MutableMarket(
                 "construction-reason-building", remote.proxy, false, false);
         MutableIndustry building = new MutableIndustry();
-        building.building = true;
+        building.setRawAndReportedBuilding(true);
         buildingMarket.industries.add(building);
 
         MutableMarket upgradingMarket = new MutableMarket(
@@ -1145,11 +1148,18 @@ public final class MarketSchedulerRuntimeTest {
         upgrading.upgrading = true;
         upgradingMarket.industries.add(upgrading);
 
+        MutableMarket reportedWithoutRawMarket = new MutableMarket(
+                "construction-reason-reported-without-raw",
+                remote.proxy, false, false);
+        MutableIndustry reportedWithoutRaw = new MutableIndustry();
+        reportedWithoutRaw.setReportedBuilding(true);
+        reportedWithoutRawMarket.industries.add(reportedWithoutRaw);
+
         MutableMarket multipleMarket = new MutableMarket(
                 "construction-reason-multiple", remote.proxy, false, false);
         multipleMarket.constructionQueue.addToEnd("queued_multiple", 1);
         MutableIndustry both = new MutableIndustry();
-        both.building = true;
+        both.setRawAndReportedBuilding(true);
         both.upgrading = true;
         multipleMarket.industries.add(both);
 
@@ -1158,7 +1168,8 @@ public final class MarketSchedulerRuntimeTest {
         failureMarket.throwConstructionProbe = true;
 
         MutableMarket[] markets = {
-                queueMarket, buildingMarket, upgradingMarket, multipleMarket, failureMarket
+                queueMarket, buildingMarket, upgradingMarket, reportedWithoutRawMarket,
+                multipleMarket, failureMarket
         };
         for (MutableMarket market : markets) {
             beginSyntheticSchedulerTick();
@@ -1173,6 +1184,10 @@ public final class MarketSchedulerRuntimeTest {
         require(!(Boolean) field(upgradingState, "constructionFullRate")
                         && intField(upgradingState, "constructionReasonMask") == 4,
                 "upgrade-only diagnostic signal incorrectly enabled full-rate mode");
+        Object reportedWithoutRawState = schedulerState(reportedWithoutRawMarket.proxy);
+        require(!(Boolean) field(reportedWithoutRawState, "constructionFullRate")
+                        && intField(reportedWithoutRawState, "constructionReasonMask") == 128,
+                "reported BaseIndustry building without raw state enabled full-rate mode");
         Object multipleState = schedulerState(multipleMarket.proxy);
         require((Boolean) field(multipleState, "constructionFullRate")
                         && intField(multipleState, "constructionReasonMask") == 7,
@@ -1186,6 +1201,9 @@ public final class MarketSchedulerRuntimeTest {
                 "building reason counter did not include building and multi-reason markets");
         require(metric("CONSTRUCTION_DETECTED_INDUSTRY_UPGRADING") >= upgradingBefore + 2L,
                 "upgrading reason counter did not include upgrading and multi-reason markets");
+        require(metric("CONSTRUCTION_DETECTED_REPORTED_BUILDING_WITHOUT_RAW")
+                        >= reportedWithoutRawBefore + 1L,
+                "reported-building-without-raw reason was not counted");
         require(metric("CONSTRUCTION_DETECTED_MULTIPLE_REASONS") >= multipleBefore + 1L,
                 "multiple construction reasons were not counted");
         require(metric("CONSTRUCTION_DETECTED_PROBE_FAILURE") >= failureBefore + 1L,
@@ -1198,10 +1216,27 @@ public final class MarketSchedulerRuntimeTest {
                 "building reason gauge is incomplete");
         require(recordInt(gauges, "constructionMarketsIndustryUpgrading") >= 2,
                 "upgrading reason gauge is incomplete");
+        require(recordInt(gauges,
+                        "constructionMarketsReportedBuildingWithoutRaw") >= 1,
+                "reported-building-without-raw gauge is incomplete");
         require(recordInt(gauges, "constructionMarketsMultipleReasons") >= 1,
                 "multiple-reason gauge is incomplete");
         require(recordInt(gauges, "constructionMarketsUncertain") >= 1,
                 "probe-failure market was not included in uncertain gauge");
+    }
+
+    private static void assertConstructionBuildingReasonClassification() throws Exception {
+        Method method = StarsectorPrepatcherHooks.class.getDeclaredMethod(
+                "constructionBuildingReason", boolean.class, Boolean.class);
+        method.setAccessible(true);
+        require((Integer) method.invoke(null, true, null) == 2,
+                "non-BaseIndustry isBuilding fallback was not preserved");
+        require((Integer) method.invoke(null, false, null) == 0,
+                "inactive non-BaseIndustry was classified as building");
+        require((Integer) method.invoke(null, true, Boolean.FALSE) == 128,
+                "virtual BaseIndustry building was not classified as diagnostic-only");
+        require((Integer) method.invoke(null, false, Boolean.TRUE) == 2,
+                "raw BaseIndustry building state was not authoritative");
     }
 
     private static void assertConstructionDiagnosticsCsv(
@@ -1219,7 +1254,7 @@ public final class MarketSchedulerRuntimeTest {
                 MutableMarket market = new MutableMarket(
                         "diagnostic-building-" + i, remote.proxy, false, false);
                 MutableIndustry industry = new MutableIndustry();
-                industry.building = true;
+                industry.setRawAndReportedBuilding(true);
                 market.industries.add(industry);
                 beginSyntheticSchedulerTick();
                 try {
@@ -1246,7 +1281,7 @@ public final class MarketSchedulerRuntimeTest {
                     "diagnostic upgrade-only market entered full-rate mode");
             StarsectorPrepatcherHooks.flushPendingMarketBeforeMutation(
                     transitionMarket.proxy);
-            transitionIndustry.building = true;
+            transitionIndustry.setReportedBuilding(true);
             beginSyntheticSchedulerTick();
             try {
                 StarsectorPrepatcherHooks.advanceMarketScheduled(
@@ -1254,6 +1289,35 @@ public final class MarketSchedulerRuntimeTest {
             } finally {
                 endSyntheticSchedulerTick();
             }
+            require(!(Boolean) field(schedulerState(transitionMarket.proxy),
+                            "constructionFullRate"),
+                    "reported-building-without-raw transition entered full-rate mode");
+
+            MutableMarket rawTransitionMarket = new MutableMarket(
+                    "diagnostic-raw-transition", remote.proxy, false, false);
+            MutableIndustry rawTransitionIndustry = new MutableIndustry();
+            rawTransitionIndustry.upgrading = true;
+            rawTransitionMarket.industries.add(rawTransitionIndustry);
+            beginSyntheticSchedulerTick();
+            try {
+                StarsectorPrepatcherHooks.advanceMarketScheduled(
+                        rawTransitionMarket.proxy, 0.01f, 0);
+            } finally {
+                endSyntheticSchedulerTick();
+            }
+            StarsectorPrepatcherHooks.flushPendingMarketBeforeMutation(
+                    rawTransitionMarket.proxy);
+            rawTransitionIndustry.setRawAndReportedBuilding(true);
+            beginSyntheticSchedulerTick();
+            try {
+                StarsectorPrepatcherHooks.advanceMarketScheduled(
+                        rawTransitionMarket.proxy, 0.01f, 0);
+            } finally {
+                endSyntheticSchedulerTick();
+            }
+            require((Boolean) field(schedulerState(rawTransitionMarket.proxy),
+                            "constructionFullRate"),
+                    "raw BaseIndustry building transition did not enter full-rate mode");
 
             Object diagnostics = staticField("CONSTRUCTION_DIAGNOSTICS");
             require(diagnostics != null, "construction diagnostics were not initialized");
@@ -1269,18 +1333,24 @@ public final class MarketSchedulerRuntimeTest {
                             && csv.contains("sample_bucket,transition,reason_mask,reasons")
                             && csv.contains("building_industry_index,building_industry_id")
                             && csv.contains("upgrading_industry_index,upgrading_industry_id")
+                            && csv.contains("effective_is_building")
+                            && csv.contains("reported_building_without_raw_industry_index")
                             && csv.contains("building_raw_building_field,building_build_progress")
                             && csv.contains("INDUSTRY_BUILDING")
                             && csv.contains("INDUSTRY_UPGRADING_WITHOUT_BUILDING")
+                            && csv.contains("REPORTED_BUILDING_WITHOUT_RAW")
+                            && csv.contains("TRANSITION_4_TO_132")
+                            && csv.contains("4->132")
                             && csv.contains("TRANSITION_4_TO_6")
                             && csv.contains("4->6")
                             && csv.contains("diagnostic-building-")
-                            && csv.contains("diagnostic-transition"),
+                            && csv.contains("diagnostic-transition")
+                            && csv.contains("diagnostic-raw-transition"),
                     "construction diagnostics CSV is incomplete: " + csv);
-            require(dataRows(csv) == 3,
+            require(dataRows(csv) == 4,
                     "per-bucket sample limit did not bound diagnostic CSV: " + csv);
             require(metric("CONSTRUCTION_DIAGNOSTIC_SAMPLES_DROPPED")
-                            >= droppedBefore + 1L,
+                            >= droppedBefore + 2L,
                     "diagnostic sample overflow was not counted");
         } finally {
             installConfig(original);
@@ -1679,8 +1749,17 @@ public final class MarketSchedulerRuntimeTest {
     }
 
     private static final class MutableIndustry extends BaseIndustry {
-        boolean building;
+        boolean reportedBuilding;
         boolean upgrading;
+
+        void setRawAndReportedBuilding(boolean value) {
+            super.building = value;
+            reportedBuilding = value;
+        }
+
+        void setReportedBuilding(boolean value) {
+            reportedBuilding = value;
+        }
 
         @Override
         public void apply() {}
@@ -1690,7 +1769,7 @@ public final class MarketSchedulerRuntimeTest {
 
         @Override
         public boolean isBuilding() {
-            return building;
+            return reportedBuilding;
         }
 
         @Override

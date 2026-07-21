@@ -239,15 +239,17 @@ Save flush всегда принудительно выполняет свежи
 2. текущий шаг выполняется отдельным full-rate callback;
 3. новые шаги не добавляются в pending history.
 
-Когда очередь пуста и `isBuilding()` отсутствует, рынок автоматически возвращается в coalesced
-mode. `isUpgrading()` без `isBuilding()` сохраняется в reason mask и gauges, но не включает full-rate:
-ванильный `PopulationAndInfrastructure` использует такую комбинацию для собственной семантики.
+Когда очередь пуста и effective building отсутствует, рынок автоматически возвращается в coalesced
+mode. Для наследников `BaseIndustry` effective building определяется raw-полем `building`; virtual
+`isBuilding()` остаётся telemetry и fallback только для других реализаций `Industry`. `isUpgrading()`
+и virtual-building при raw=false сохраняются в reason mask/gauges, но не включают full-rate:
+ванильный `PopulationAndInfrastructure` использует эти состояния для роста размера рынка.
 Наличие отрасли, которая когда-либо строилась, не делает режим постоянным.
 
 Ошибка compatibility probe трактуется консервативно как активное строительство.
 
-Detector публикует причины отдельно. Текущие gauges различают queue, building, upgrading,
-uncertain и multiple-reason markets. Накопительные counters различают dirty, safety-audit и forced
+Detector публикует причины отдельно. Текущие gauges различают queue, effective building, upgrading,
+reported-building-without-raw, uncertain и multiple-reason markets. Накопительные counters различают dirty, safety-audit и forced
 scans, cached decisions, queue/items/industries null cases, число просмотренных элементов,
 false→true/true→false transitions, изменения reason mask и mutation races. Это позволяет отличить
 реальное массовое строительство от постоянного `isBuilding()` у модовой industry или от
@@ -262,9 +264,10 @@ observer.marketConstructionDiagnosticsMaxSamplesPerReason=32
 
 создаёт `logs/market-construction-diagnostics/session-*/samples.csv`. Выборка bounded отдельно по
 reason/transition bucket и хранит только строки/числа: identity hash, market id/name, queue
-size/class, legacy first-positive industry, раздельные building/upgrading industry, raw building
-field, build progress/time, upgrade id, functional state, epochs и transition state. Переходы вида
-`4->6` получают отдельный bucket `TRANSITION_4_TO_6`. Сильные ссылки на game objects не сохраняются,
+size/class, legacy first-positive industry, reported/effective building, раздельные effective-
+building/upgrading/reported-without-raw industries, raw building field, build progress/time, upgrade
+id, functional state, epochs и transition state. Переходы `4->6` и `4->132` получают отдельные
+buckets `TRANSITION_4_TO_6` и `TRANSITION_4_TO_132`. Сильные ссылки на game objects не сохраняются,
 diagnostic writer не участвует в scheduler policy.
 
 ## 11. Construction mutation barriers
@@ -422,6 +425,7 @@ observer.marketAdvanceSemanticRisks=false
 - `constructionMarketsQueueNonEmpty`;
 - `constructionMarketsIndustryBuilding`;
 - `constructionMarketsIndustryUpgrading`;
+- `constructionMarketsReportedBuildingWithoutRaw`;
 - `constructionMarketsUncertain`;
 - `constructionMarketsMultipleReasons`;
 - `constructionModeEntries`;
@@ -430,8 +434,8 @@ observer.marketAdvanceSemanticRisks=false
 - `constructionScans`, `constructionDirtyScans`, `constructionSafetyAuditScans`,
   `constructionForcedScans`, `constructionCachedDecisions`;
 - `constructionDetectedQueueNonEmpty`, `constructionDetectedIndustryBuilding`,
-  `constructionDetectedIndustryUpgrading`, `constructionDetectedMultipleReasons`,
-  `constructionDetectedProbeFailure`;
+  `constructionDetectedIndustryUpgrading`, `constructionDetectedReportedBuildingWithoutRaw`,
+  `constructionDetectedMultipleReasons`, `constructionDetectedProbeFailure`;
 - `constructionQueueNullScans`, `constructionQueueItemsNullScans`,
   `constructionIndustriesNullScans`, `constructionQueueItemsObserved`,
   `constructionIndustriesScanned`, `constructionMaxQueueItems`,

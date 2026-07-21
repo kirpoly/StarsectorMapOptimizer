@@ -173,13 +173,15 @@ planet-condition engine path учитывается отдельно от unknow
 остаётся точным code-source path и больше не является единственным способом определить мод.
 
 Причины construction full-rate всегда представлены агрегированными counters/gauges в обычной
-строке stats. `Industry.isUpgrading()` остаётся диагностическим признаком, но больше не включает
-full-rate самостоятельно: policy опирается на непустую очередь, `isBuilding()` и uncertain-состояния
-probe. Ограниченную диагностическую выборку можно включить через
+строке stats. `Industry.isUpgrading()` остаётся диагностическим признаком. Для наследников
+`BaseIndustry` policy использует authoritative raw-поле `building`, а не переопределённый virtual
+`isBuilding()`; для произвольных реализаций `Industry` сохраняется fallback к интерфейсному методу.
+Случаи virtual=true при raw=false учитываются отдельным reason/counter/gauge, но не включают full-rate.
+Ограниченную диагностическую выборку можно включить через
 `observer.marketConstructionDiagnostics=true`; CSV записывается в
-`logs/market-construction-diagnostics/session-*/`, раздельно фиксирует building/upgrading industry,
-transition buckets и скалярное состояние `BaseIndustry`, не удерживает игровые объекты и не меняет
-поведение scheduler.
+`logs/market-construction-diagnostics/session-*/`, раздельно фиксирует reported/effective building,
+источники building/upgrading, transition buckets и скалярное состояние `BaseIndustry`, не удерживает
+игровые объекты и не меняет поведение scheduler.
 
 Для удаления записи vanilla запустите `uninstall-agent.bat`, для FR —
 `uninstall-agent.bat -Target FasterRendering`, для обоих файлов —
