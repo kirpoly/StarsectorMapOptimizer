@@ -33,12 +33,10 @@ StarsectorPrepatcher — compatibility-first слой ранних патчей 
 agent/StarsectorPrepatcherAgent.jar
 ```
 
-Единый agent независимо сопоставляет и проверяет каждый патч, включая hyperspace. Большинство
-патчей использует локальные structural-контракты и принимает совместимые оригинальные или
-переводные game files. Интегрированный FastForward Presentation Patch `1.1.0` — намеренное
-исключение: его call-site replacements требуют exact whole-class hashes и поддерживают только
-текущие hash `starfarer_obf.jar` и `starfarer.api.jar`, перечисленные в
-[`docs/PATCHES.md`](docs/PATCHES.md). Неизвестный, неоднозначный или изменённый target остаётся
+Единый agent независимо сопоставляет и проверяет каждый патч, включая hyperspace и fast-forward
+presentation. Все блоки используют локальные structural-контракты и принимают совместимые
+оригинальные, переводные или перепакованные game files, пока принадлежащая patch semantic surface
+не изменилась. Неизвестный, неоднозначный, частичный или foreign hook-shaped target остаётся
 vanilla, а причина записывается в лог.
 
 Control-код agent и typed runtime намеренно разделены. При запуске agent читает runtime-classfile'ы
@@ -128,7 +126,7 @@ enabled=false
 профилях после подтверждённых ошибок запуска миссий. Они не будут включены снова до отдельного
 исправления и изолированного startup/mission-прогона.
 
-Default и safe profiles включают exact-hash master/frame marker fast-forward presentation и более
+Default и safe profiles включают structurally matched master/frame marker fast-forward presentation и более
 узкие visual/audio группы. Global animations, sensor faders, slipstream particles и particle
 emitters остаются opt-in, поскольку могут менять callback, lifetime, RNG или emission cadence;
 aggressive profile включает их. `fastForward.visualTime=realtime` оставляет presentation на одном
@@ -160,8 +158,9 @@ Runtime stats используют одно семейство `marketScheduler*
 ускорения, а `marketSchedulerMaxTicksPerBatch` — крупнейший batch. Отдельно считаются накопленные
 input calls, выполненные callbacks, per-simulation-tick opt-outs и синхронное поглощение debt. Ошибки
 разделены по конкретным причинам. Ошибка обычного callback отключает batching только для данного
-рынка; ошибка pre-save flush восстанавливает pending debt и прерывает save. Периодические counters
-используют `sumThenReset()`.
+рынка; ошибка уже начатого pre-save callback отбрасывает отделённый неоднозначный debt, переводит
+рынок в immediate execution и прерывает save, чтобы частично применённый callback не запускался
+автоматически повторно. Периодические counters используют `sumThenReset()`.
 
 `patch.directMarketObservation` также включён в default/aggressive profile в 0.9.3. Он не
 throttling-ует прямые вызовы модов: каждый вызов остаётся синхронным и немедленным. Известный
@@ -169,7 +168,15 @@ planet-condition engine path учитывается отдельно от unknow
 пишется до первого выполнения, а лимит unknown stacks обновляется каждый отчётный интервал.
 Каталоги validation-smoke имеют заметную метку, а `session.json` содержит `sessionOrigin`.
 Результаты находятся в `logs/direct-market-observe/session-*/`; после сбора данных observer стоит
-выключить, чтобы убрать sampling overhead.
+выключить, чтобы убрать sampling overhead. `call-sites.csv` и `observations.csv` содержат отдельные
+поля `mod_id`, `mod_name`, каталог мода и имя JAR, полученные из `mod_info.json`; поле `source`
+остаётся точным code-source path и больше не является единственным способом определить мод.
+
+Причины construction full-rate всегда представлены агрегированными counters/gauges в обычной
+строке stats. Ограниченную диагностическую выборку можно включить через
+`observer.marketConstructionDiagnostics=true`; CSV записывается в
+`logs/market-construction-diagnostics/session-*/`, не удерживает игровые объекты и не меняет
+поведение scheduler.
 
 Для удаления записи vanilla запустите `uninstall-agent.bat`, для FR —
 `uninstall-agent.bat -Target FasterRendering`, для обоих файлов —
@@ -182,12 +189,12 @@ Runtime-логи:
 ```text
 mods\StarsectorPrepatcher\logs\prepatcher.log
 mods\StarsectorPrepatcher\logs\direct-market-observe\session-*\
+mods\StarsectorPrepatcher\logs\market-construction-diagnostics\session-*\
 ```
 
-Agent пишет `APPLIED`, `ALREADY_APPLIED`, `SKIPPED_STRUCTURAL`, `SKIPPED_LOADER` или
-`SKIPPED_ERROR` для structural patches. Exact-build presentation targets дополнительно публикуют
-`SKIPPED_CLASS_HASH` или `SKIPPED_CONTAINER_HASH`. Hyperspace targets используют ту же структурную
-модель статусов, что и остальные structural targets. Каждый skip работает fail-open;
+Agent пишет `APPLIED`, `ALREADY_APPLIED`, `SKIPPED_STRUCTURAL`, `SKIPPED_COMPOSITION`,
+`SKIPPED_LOADER`, `SKIPPED_ALREADY_LOADED` или `SKIPPED_ERROR`. Presentation и hyperspace targets
+используют ту же локальную structural-модель статусов, что и остальные patches. Каждый skip работает fail-open;
 `SKIPPED_LOADER` нужно разобрать до заявления совместимости соответствующего способа запуска.
 
 Полная проверка запускается через `verify-structural.bat` на Windows или `./verify-structural.sh` на

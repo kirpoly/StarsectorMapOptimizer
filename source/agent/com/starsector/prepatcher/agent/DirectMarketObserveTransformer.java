@@ -30,6 +30,7 @@ import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
 import java.security.CodeSource;
 import java.security.ProtectionDomain;
@@ -38,7 +39,10 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
  * Observation-only transformer for direct calls made by mod bytecode to
@@ -57,6 +61,11 @@ public final class DirectMarketObserveTransformer implements ClassFileTransforme
     private static final String HOOK_DESC =
             "(Lcom/fs/starfarer/api/campaign/econ/MarketAPI;FJLjava/lang/String;)V";
     private static final char FIELD_SEPARATOR = '\u001f';
+    private static final Pattern MOD_INFO_STRING = Pattern.compile(
+            "\\\"([^\\\"]+)\\\"\\s*:\\s*\\\"((?:\\\\.|[^\\\"\\\\])*)\\\"");
+    private static final String SEMANTIC_RISK_HEADER =
+            "modId,modName,modDirectory,jarName,source,className,methodName,descriptor,"
+                    + "componentType,riskCategory,calledOwner,calledMethod,bytecodeOffset";
 
     private final PrepatcherConfig config;
     private final ClassLoader runtimeLoader;
@@ -67,6 +76,8 @@ public final class DirectMarketObserveTransformer implements ClassFileTransforme
     private final Set<String> warnedClasses = java.util.Collections.synchronizedSet(new HashSet<>());
     private final Set<String> semanticRiskRows = java.util.Collections.synchronizedSet(new HashSet<>());
     private final Object semanticRiskWriteLock = new Object();
+    private final ConcurrentHashMap<String, ModIdentity> modIdentityCache =
+            new ConcurrentHashMap<>();
 
     public DirectMarketObserveTransformer(PrepatcherConfig config,
                                           ClassLoader runtimeLoader,
@@ -90,8 +101,9 @@ public final class DirectMarketObserveTransformer implements ClassFileTransforme
         try {
             ClassNode node = readClass(classfileBuffer);
             String source = sourceLabel(protectionDomain, loader);
+            ModIdentity modIdentity = resolveModIdentity(protectionDomain, source);
             if (config.marketAdvanceSemanticRiskObserver) {
-                observeMarketAdvanceSemanticRisks(node, source, loader);
+                observeMarketAdvanceSemanticRisks(node, source, modIdentity, loader);
             }
             // Observer-only mode is strictly static: generate the CSV and return
             // the original bytes without installing runtime call-site wrappers.
@@ -121,7 +133,8 @@ public final class DirectMarketObserveTransformer implements ClassFileTransforme
                     if (!(insn instanceof MethodInsnNode call) || !isMarketAdvance(call)) continue;
 
                     String amountSource = classifyAmountSource(method, call);
-                    String metadata = metadata(source, node.name, method.name, method.desc,
+                    String metadata = metadata(source, modIdentity,
+                            node.name, method.name, method.desc,
                             line, ordinal, amountSource, call.owner, call.getOpcode());
                     long siteId = fnv1a64(metadata);
                     registrations.add(new SiteRegistration(siteId, metadata));
@@ -165,7 +178,8 @@ public final class DirectMarketObserveTransformer implements ClassFileTransforme
             System.setProperty("starsector.prepatcher.directMarketPatchedCallSites",
                     Integer.toString(sites));
             PrepatcherLog.info("DIRECT_MARKET_OBSERVE patched " + className
-                    + " from " + source + ": callSites=" + changed
+                    + " from " + source + " [modId=" + modIdentity.modId
+                    + ", modName=" + modIdentity.modName + "]: callSites=" + changed
                     + ", loader=" + loaderName(loader));
             return candidate;
         } catch (Throwable failure) {
@@ -176,7 +190,8 @@ public final class DirectMarketObserveTransformer implements ClassFileTransforme
     }
 
 
-    private void observeMarketAdvanceSemanticRisks(ClassNode node, String source, ClassLoader loader) {
+    private void observeMarketAdvanceSemanticRisks(
+            ClassNode node, String source, ModIdentity modIdentity, ClassLoader loader) {
         for (MethodNode method : node.methods) {
             if (!"advance".equals(method.name) || !"(F)V".equals(method.desc)
                     || (method.access & (Opcodes.ACC_ABSTRACT | Opcodes.ACC_NATIVE)) != 0) {
@@ -217,11 +232,11 @@ public final class DirectMarketObserveTransformer implements ClassFileTransforme
                 }
                 String category = randomRiskCategory(call);
                 if (category != null) {
-                    writeSemanticRisk(source, node.name, method, componentType,
+                    writeSemanticRisk(source, modIdentity, node.name, method, componentType,
                             category, call.owner, call.name, offset);
                 }
                 if (isMarketStructureMutation(call)) {
-                    writeSemanticRisk(source, node.name, method, componentType,
+                    writeSemanticRisk(source, modIdentity, node.name, method, componentType,
                             "MARKET_STRUCTURE_MUTATION", call.owner, call.name, offset);
                 }
                 if (call.name.equals("convertToDays") && call.desc.contains("F")) {
@@ -230,14 +245,14 @@ public final class DirectMarketObserveTransformer implements ClassFileTransforme
             }
             if (intervalAdvance && intervalElapsed) {
                 for (MethodInsnNode site : intervalSites) {
-                    writeSemanticRisk(source, node.name, method, componentType,
+                    writeSemanticRisk(source, modIdentity, node.name, method, componentType,
                             "INTERVAL_SINGLE_ELAPSE", site.owner, site.name,
                             method.instructions.indexOf(site));
                 }
             }
             if (amountObserved && fieldWrite && conditional && !backwardJump) {
                 int offset = firstConditionalOffset(method);
-                writeSemanticRisk(source, node.name, method, componentType,
+                writeSemanticRisk(source, modIdentity, node.name, method, componentType,
                         "SINGLE_THRESHOLD_TRANSITION", node.name,
                         "<single-threshold-transition>", offset);
             }
@@ -330,30 +345,27 @@ public final class DirectMarketObserveTransformer implements ClassFileTransforme
         return -1;
     }
 
-    private void writeSemanticRisk(String source, String className, MethodNode method,
+    private void writeSemanticRisk(String source, ModIdentity modIdentity,
+                                   String className, MethodNode method,
                                    String componentType, String category,
                                    String calledOwner, String calledMethod, int offset) {
-        String modId = modId(source);
-        String key = source + '\u001f' + modId + '\u001f' + className + '\u001f'
+        String key = source + '\u001f' + modIdentity.modId + '\u001f'
+                + modIdentity.modDirectory + '\u001f' + className + '\u001f'
                 + method.name + method.desc + '\u001f' + category + '\u001f'
                 + calledOwner + '\u001f' + calledMethod + '\u001f' + offset;
         if (!semanticRiskRows.add(key)) return;
         if (modRoot == null) return;
         Path report = modRoot.resolve("logs").resolve("market-advance-semantic-risks.csv");
-        String row = csv(modId) + ',' + csv(className.replace('/', '.')) + ','
+        String row = csv(modIdentity.modId) + ',' + csv(modIdentity.modName) + ','
+                + csv(modIdentity.modDirectory) + ',' + csv(modIdentity.jarName) + ','
+                + csv(source) + ',' + csv(className.replace('/', '.')) + ','
                 + csv(method.name) + ',' + csv(method.desc) + ',' + csv(componentType) + ','
                 + csv(category) + ',' + csv(calledOwner.replace('/', '.')) + ','
                 + csv(calledMethod) + ',' + offset + System.lineSeparator();
         synchronized (semanticRiskWriteLock) {
             try {
                 Files.createDirectories(report.getParent());
-                if (!Files.exists(report)) {
-                    Files.writeString(report,
-                            "modId,className,methodName,descriptor,componentType,riskCategory,calledOwner,calledMethod,bytecodeOffset"
-                                    + System.lineSeparator(),
-                            StandardCharsets.UTF_8, StandardOpenOption.CREATE,
-                            StandardOpenOption.APPEND);
-                }
+                ensureSemanticRiskHeader(report);
                 Files.writeString(report, row, StandardCharsets.UTF_8,
                         StandardOpenOption.CREATE, StandardOpenOption.APPEND);
             } catch (Throwable failure) {
@@ -362,7 +374,27 @@ public final class DirectMarketObserveTransformer implements ClassFileTransforme
         }
     }
 
-    private static String modId(String source) {
+    private void ensureSemanticRiskHeader(Path report) throws Exception {
+        if (Files.exists(report)) {
+            String firstLine;
+            try (var reader = Files.newBufferedReader(report, StandardCharsets.UTF_8)) {
+                firstLine = reader.readLine();
+            }
+            if (!SEMANTIC_RISK_HEADER.equals(firstLine)) {
+                Path legacy = report.resolveSibling("market-advance-semantic-risks-legacy-"
+                        + System.currentTimeMillis() + ".csv");
+                Files.move(report, legacy, StandardCopyOption.REPLACE_EXISTING);
+                PrepatcherLog.warn("Rotated legacy semantic-risk CSV with incompatible header to "
+                        + legacy.toAbsolutePath());
+            }
+        }
+        if (!Files.exists(report)) {
+            Files.writeString(report, SEMANTIC_RISK_HEADER + System.lineSeparator(),
+                    StandardCharsets.UTF_8, StandardOpenOption.CREATE_NEW);
+        }
+    }
+
+    private static String modIdFromSource(String source) {
         String normalized = source == null ? "" : source.replace('\\', '/');
         int marker = normalized.indexOf("/mods/");
         if (marker < 0 && normalized.startsWith("mods/")) marker = -1;
@@ -545,6 +577,100 @@ public final class DirectMarketObserveTransformer implements ClassFileTransforme
         return "loader:" + loaderName(loader);
     }
 
+    private ModIdentity resolveModIdentity(
+            ProtectionDomain protectionDomain, String source) {
+        Path sourcePath = sourcePath(protectionDomain);
+        if (sourcePath == null || modRoot == null || modRoot.getParent() == null) {
+            String fallback = modIdFromSource(source);
+            return new ModIdentity(fallback, fallback, fallback,
+                    sourceJarName(sourcePath, source));
+        }
+        Path modsRoot = modRoot.getParent().toAbsolutePath().normalize();
+        if (!sourcePath.startsWith(modsRoot)) {
+            String fallback = modIdFromSource(source);
+            return new ModIdentity(fallback, fallback, fallback,
+                    sourceJarName(sourcePath, source));
+        }
+        Path relative = modsRoot.relativize(sourcePath);
+        if (relative.getNameCount() == 0) {
+            return new ModIdentity("unknown", "unknown", "unknown",
+                    sourceJarName(sourcePath, source));
+        }
+        String directory = relative.getName(0).toString();
+        String jarName = sourceJarName(sourcePath, source);
+        return modIdentityCache.computeIfAbsent(directory + FIELD_SEPARATOR + jarName,
+                ignored -> readModIdentity(modsRoot.resolve(directory), directory,
+                        jarName));
+    }
+
+    private static Path sourcePath(ProtectionDomain protectionDomain) {
+        String raw = sourceLocation(protectionDomain);
+        if (raw.isEmpty()) return null;
+        try {
+            return Path.of(new URI(raw)).toAbsolutePath().normalize();
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
+    private static ModIdentity readModIdentity(
+            Path modDirectory, String directoryName, String jarName) {
+        String id = directoryName;
+        String name = directoryName;
+        Path info = modDirectory.resolve("mod_info.json");
+        try {
+            String json = Files.readString(info, StandardCharsets.UTF_8);
+            Matcher matcher = MOD_INFO_STRING.matcher(json);
+            while (matcher.find()) {
+                String key = matcher.group(1);
+                String value = unescapeJsonString(matcher.group(2));
+                if ("id".equals(key) && !value.isBlank()) id = value;
+                else if ("name".equals(key) && !value.isBlank()) name = value;
+            }
+        } catch (Throwable ignored) {
+            // A missing or malformed mod_info.json falls back to the directory name.
+        }
+        return new ModIdentity(id, name, directoryName, jarName);
+    }
+
+    private static String sourceJarName(Path sourcePath, String source) {
+        String name = sourcePath == null || sourcePath.getFileName() == null
+                ? "" : sourcePath.getFileName().toString();
+        if (!name.toLowerCase(Locale.ROOT).endsWith(".jar")) {
+            String normalized = source == null ? "" : source.replace('\\', '/');
+            int slash = normalized.lastIndexOf('/');
+            String tail = slash < 0 ? normalized : normalized.substring(slash + 1);
+            name = tail.toLowerCase(Locale.ROOT).endsWith(".jar") ? tail : "";
+        }
+        return name;
+    }
+
+    private static String unescapeJsonString(String value) {
+        if (value == null || value.indexOf('\\') < 0) return value == null ? "" : value;
+        StringBuilder output = new StringBuilder(value.length());
+        boolean escaped = false;
+        for (int i = 0; i < value.length(); i++) {
+            char current = value.charAt(i);
+            if (!escaped) {
+                if (current == '\\') escaped = true;
+                else output.append(current);
+                continue;
+            }
+            escaped = false;
+            switch (current) {
+                case '"', '\\', '/' -> output.append(current);
+                case 'b' -> output.append('\b');
+                case 'f' -> output.append('\f');
+                case 'n' -> output.append('\n');
+                case 'r' -> output.append('\r');
+                case 't' -> output.append('\t');
+                default -> output.append(current);
+            }
+        }
+        if (escaped) output.append('\\');
+        return output.toString();
+    }
+
     private static String sourceLocation(ProtectionDomain protectionDomain) {
         try {
             CodeSource codeSource = protectionDomain == null ? null : protectionDomain.getCodeSource();
@@ -555,12 +681,17 @@ public final class DirectMarketObserveTransformer implements ClassFileTransforme
         }
     }
 
-    private static String metadata(String source, String className, String method,
+    private static String metadata(String source, ModIdentity modIdentity,
+                                   String className, String method,
                                    String descriptor, int line, int ordinal,
                                    String amountSource, String callOwner, int opcode) {
         return String.join(String.valueOf(FIELD_SEPARATOR),
-                "1",
+                "2",
                 sanitize(source),
+                sanitize(modIdentity.modId),
+                sanitize(modIdentity.modName),
+                sanitize(modIdentity.modDirectory),
+                sanitize(modIdentity.jarName),
                 sanitize(className.replace('/', '.')),
                 sanitize(method),
                 sanitize(descriptor),
@@ -639,4 +770,7 @@ public final class DirectMarketObserveTransformer implements ClassFileTransforme
     }
 
     private record SiteRegistration(long siteId, String metadata) {}
+
+    private record ModIdentity(
+            String modId, String modName, String modDirectory, String jarName) {}
 }

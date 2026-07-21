@@ -35,7 +35,7 @@ agent JAR как обычные entries `com/fs/starfarer/api/StarsectorPrepatch
 не должен иметь на них статических ссылок: `RuntimeInstaller` читает эти entries как bytes и через
 `MethodHandles.Lookup.defineClass()` определяет их в system/game loader. Build завершается ошибкой,
 если в JAR нет обязательных top-level entries или exact inventory текущего payload отличается от
-80 top-level/nested class entries:
+83 top-level/nested class entries:
 
 ```text
 com/fs/starfarer/api/StarsectorPrepatcherHooks.class
@@ -100,6 +100,7 @@ profile и только там включает known-disabled loading/startup p
 поставляемых профилях оба проблемных переключателя остаются `false`.
 
 Сырые отчёты `documentation-consistency.txt`, `structural-verification.txt`,
+`fast-forward-presentation-structural-plan.txt`,
 `fast-forward-presentation-compatibility.txt`, `fast-forward-presentation-runtime.txt`,
 `fast-forward-presentation-actual-agent.txt`, `direct-market-transformer.txt`,
 `runtime-regression.txt`, `temp-mod-actual-agent-smoke.txt`,

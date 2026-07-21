@@ -16,15 +16,15 @@ import java.util.TreeMap;
 
 /**
  * Ownership and postcondition contract for classes whose presentation and structural
- * transformation surfaces overlap. The exact-hash presentation stage owns the presentation
+ * transformation surfaces overlap. The structural presentation stage owns the presentation
  * hooks; the structural stage may add independent hooks only while preserving this contract.
  */
 final class PresentationStructuralContract {
     static final String PRESENTATION_HOOKS =
             "com/fs/starfarer/api/StarsectorPrepatcherPresentationHooks";
-    static final String OWNER_FIELD = "smo$presentation$fastForwardOwner";
-    static final String MASK_FIELD = "smo$presentation$fastForwardMask";
-    static final String OWNER_VALUE = "StarsectorPrepatcher:presentation-structural-v1";
+    static final String OWNER_FIELD = FastForwardPresentationTransformer.OWNER_FIELD;
+    static final String MASK_FIELD = FastForwardPresentationTransformer.MASK_FIELD;
+    static final String OWNER_VALUE = FastForwardPresentationTransformer.OWNER_VALUE;
 
     static final String CAMPAIGN_STATE = "com/fs/starfarer/campaign/CampaignState";
     static final String CAMPAIGN_ENGINE = "com/fs/starfarer/campaign/CampaignEngine";
@@ -32,15 +32,6 @@ final class PresentationStructuralContract {
     static final String BASE_CAMPAIGN_ENTITY = "com/fs/starfarer/campaign/BaseCampaignEntity";
     static final String HYPERSPACE_TERRAIN =
             "com/fs/starfarer/api/impl/campaign/terrain/HyperspaceTerrainPlugin";
-
-    private static final int FRAME_MARKER = 1;
-    private static final int ACTION_INDICATORS = 1 << 1;
-    private static final int GLOBAL_ANIMATIONS = 1 << 2;
-    private static final int LOCATION_VISUALS = 1 << 3;
-    private static final int FLOATING_TEXT = 1 << 4;
-    private static final int SENSOR_INDICATORS = 1 << 5;
-    private static final int SENSOR_FADERS = 1 << 6;
-    private static final int CONTINUOUS_SOUND = 1 << 7;
 
     static final Set<String> OVERLAP_CLASSES = Set.of(
             CAMPAIGN_STATE,
@@ -52,25 +43,8 @@ final class PresentationStructuralContract {
     private PresentationStructuralContract() {}
 
     static int expectedMask(String className, PrepatcherConfig config) {
-        if (!OVERLAP_CLASSES.contains(className)
-                || !config.fastForwardEnabled
-                || !config.fastForwardFrameMarker) {
-            return 0;
-        }
-        return switch (className) {
-            case CAMPAIGN_STATE -> anyPresentationFeature(config) ? FRAME_MARKER : 0;
-            case CAMPAIGN_ENGINE ->
-                    (config.fastForwardActionIndicators ? ACTION_INDICATORS : 0)
-                            | (config.fastForwardGlobalAnimations ? GLOBAL_ANIMATIONS : 0);
-            case BASE_LOCATION -> config.fastForwardLocationVisuals ? LOCATION_VISUALS : 0;
-            case BASE_CAMPAIGN_ENTITY ->
-                    (config.fastForwardFloatingText ? FLOATING_TEXT : 0)
-                            | (config.fastForwardSensorIndicators ? SENSOR_INDICATORS : 0)
-                            | (config.fastForwardSensorFaders ? SENSOR_FADERS : 0);
-            case HYPERSPACE_TERRAIN ->
-                    config.fastForwardContinuousSound ? CONTINUOUS_SOUND : 0;
-            default -> 0;
-        };
+        if (!OVERLAP_CLASSES.contains(className)) return 0;
+        return FastForwardPresentationTransformer.requestedMaskForClass(className, config);
     }
 
     static void addOwnership(ClassNode node, int mask) {
@@ -148,12 +122,12 @@ final class PresentationStructuralContract {
                         "endOuterFrame", "()V", 1);
             }
             case CAMPAIGN_ENGINE -> {
-                if ((mask & ACTION_INDICATORS) != 0) {
+                if ((mask & FastForwardPresentationTransformer.ACTION_INDICATORS) != 0) {
                     add(expected, "advance", "(FLcom/fs/starfarer/util/A/new;)V",
                             "advanceActionIndicator",
                             "(Lcom/fs/starfarer/campaign/ActionIndicator;F)V", 1);
                 }
-                if ((mask & GLOBAL_ANIMATIONS) != 0) {
+                if ((mask & FastForwardPresentationTransformer.GLOBAL_ANIMATIONS) != 0) {
                     add(expected, "advance", "(FLcom/fs/starfarer/util/A/new;)V",
                             "advanceAnimationManager",
                             "(Lcom/fs/graphics/anim/AnimationManager;F)V", 2);
@@ -171,17 +145,17 @@ final class PresentationStructuralContract {
                         "(Lcom/fs/graphics/particle/DynamicParticleGroup;F)V", 1);
             }
             case BASE_CAMPAIGN_ENTITY -> {
-                if ((mask & FLOATING_TEXT) != 0) {
+                if ((mask & FastForwardPresentationTransformer.FLOATING_TEXT) != 0) {
                     add(expected, "advance", "(F)V", "advanceFloatingText",
                             "(Lcom/fs/starfarer/campaign/fleet/CampaignFloatingText;F)V", 1);
                     add(expected, "advanceEvenIfPaused", "(F)V", "advanceFloatingText",
                             "(Lcom/fs/starfarer/campaign/fleet/CampaignFloatingText;F)V", 1);
                 }
-                if ((mask & SENSOR_INDICATORS) != 0) {
+                if ((mask & FastForwardPresentationTransformer.SENSOR_INDICATORS) != 0) {
                     add(expected, "advance", "(F)V", "advanceSelectionIndicator",
                             "(Ljava/lang/Object;F)V", 1);
                 }
-                if ((mask & SENSOR_FADERS) != 0) {
+                if ((mask & FastForwardPresentationTransformer.SENSOR_FADERS) != 0) {
                     add(expected, "advance", "(F)V", "advanceSensorFader",
                             "(Lcom/fs/graphics/util/Fader;F)V", 2);
                 }
@@ -193,16 +167,6 @@ final class PresentationStructuralContract {
             default -> throw new IllegalArgumentException("not an overlap: " + className);
         }
         return Collections.unmodifiableMap(expected);
-    }
-
-    private static boolean anyPresentationFeature(PrepatcherConfig config) {
-        return config.fastForwardActionIndicators || config.fastForwardLocationVisuals
-                || config.fastForwardFloatingText || config.fastForwardFleetView
-                || config.fastForwardFleetPresentation || config.fastForwardSensorIndicators
-                || config.fastForwardCelestialVisuals || config.fastForwardAuroraAnimation
-                || config.fastForwardContinuousSound || config.fastForwardGateJitter
-                || config.fastForwardGlobalAnimations || config.fastForwardSensorFaders
-                || config.fastForwardSlipstreamParticles || config.fastForwardParticleEmitters;
     }
 
     private static Map<HookSite, Integer> presentationHooks(ClassNode node) {

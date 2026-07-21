@@ -127,6 +127,21 @@ public final class StarsectorPrepatcherHooks {
     private static final int MARKET_SCHEDULER_COMPONENT_RECENT_UNREST = 256;
     private static final int MARKET_SCHEDULER_COMPONENT_BASE_INDUSTRY = 512;
     private static final int MARKET_SCHEDULER_COMPONENT_CONSTRUCTION_QUEUE = 1024;
+    private static final int CONSTRUCTION_REASON_QUEUE_NON_EMPTY = 1;
+    private static final int CONSTRUCTION_REASON_INDUSTRY_BUILDING = 2;
+    private static final int CONSTRUCTION_REASON_INDUSTRY_UPGRADING = 4;
+    private static final int CONSTRUCTION_REASON_QUEUE_ITEMS_UNKNOWN = 8;
+    private static final int CONSTRUCTION_REASON_INDUSTRIES_UNKNOWN = 16;
+    private static final int CONSTRUCTION_REASON_PROBE_FAILURE = 32;
+    private static final int CONSTRUCTION_REASON_MUTATION_RACE = 64;
+    private static final int CONSTRUCTION_REASON_ACTIVE_MASK =
+            CONSTRUCTION_REASON_QUEUE_NON_EMPTY
+                    | CONSTRUCTION_REASON_INDUSTRY_BUILDING
+                    | CONSTRUCTION_REASON_INDUSTRY_UPGRADING
+                    | CONSTRUCTION_REASON_QUEUE_ITEMS_UNKNOWN
+                    | CONSTRUCTION_REASON_INDUSTRIES_UNKNOWN
+                    | CONSTRUCTION_REASON_PROBE_FAILURE
+                    | CONSTRUCTION_REASON_MUTATION_RACE;
     private static final int MARKET_SCHEDULER_COMPONENT_ALL =
             MARKET_SCHEDULER_COMPONENT_ENGINE
                     | MARKET_SCHEDULER_COMPONENT_ECONOMY
@@ -149,10 +164,13 @@ public final class StarsectorPrepatcherHooks {
             ThreadLocal.withInitial(MarketAdvanceBatchStack::new);
     private static final ThreadLocal<MarketAdvanceInvocationContext> MARKET_ADVANCE_INVOCATION =
             ThreadLocal.withInitial(MarketAdvanceInvocationContext::new);
+    private static final ThreadLocal<ConstructionProbe> CONSTRUCTION_PROBE =
+            ThreadLocal.withInitial(ConstructionProbe::new);
     private static volatile WeakIdentityMap<MarketAPI, MarketScheduleState> MARKET_SCHEDULER_STATES =
             new WeakIdentityMap<>();
     private static volatile WeakIdentityMap<ConstructionQueue, WeakReference<MarketAPI>>
             CONSTRUCTION_QUEUE_OWNERS = new WeakIdentityMap<>();
+    private static volatile ConstructionDiagnostics CONSTRUCTION_DIAGNOSTICS;
     private static volatile Map<Object, CommRelaySystemIndex> COMM_RELAY_SYSTEM_INDEXES =
             Collections.synchronizedMap(new WeakHashMap<>());
     private static final Object CAMPAIGN_CACHE_LIFECYCLE_LOCK = new Object();
@@ -272,6 +290,29 @@ public final class StarsectorPrepatcherHooks {
     private static final LongAdder CONSTRUCTION_MODE_ENTRIES = new LongAdder();
     private static final LongAdder CONSTRUCTION_MODE_EXITS = new LongAdder();
     private static final LongAdder CONSTRUCTION_BOUNDARY_EXACT_REPLAYS = new LongAdder();
+    private static final LongAdder CONSTRUCTION_SCANS = new LongAdder();
+    private static final LongAdder CONSTRUCTION_DIRTY_SCANS = new LongAdder();
+    private static final LongAdder CONSTRUCTION_SAFETY_AUDIT_SCANS = new LongAdder();
+    private static final LongAdder CONSTRUCTION_FORCED_SCANS = new LongAdder();
+    private static final LongAdder CONSTRUCTION_CACHED_DECISIONS = new LongAdder();
+    private static final LongAdder CONSTRUCTION_DETECTED_QUEUE_NON_EMPTY = new LongAdder();
+    private static final LongAdder CONSTRUCTION_DETECTED_INDUSTRY_BUILDING = new LongAdder();
+    private static final LongAdder CONSTRUCTION_DETECTED_INDUSTRY_UPGRADING = new LongAdder();
+    private static final LongAdder CONSTRUCTION_DETECTED_MULTIPLE_REASONS = new LongAdder();
+    private static final LongAdder CONSTRUCTION_DETECTED_PROBE_FAILURE = new LongAdder();
+    private static final LongAdder CONSTRUCTION_QUEUE_NULL_SCANS = new LongAdder();
+    private static final LongAdder CONSTRUCTION_QUEUE_ITEMS_NULL_SCANS = new LongAdder();
+    private static final LongAdder CONSTRUCTION_INDUSTRIES_NULL_SCANS = new LongAdder();
+    private static final LongAdder CONSTRUCTION_QUEUE_ITEMS_OBSERVED = new LongAdder();
+    private static final LongAdder CONSTRUCTION_INDUSTRIES_SCANNED = new LongAdder();
+    private static final AtomicLong CONSTRUCTION_MAX_QUEUE_ITEMS = new AtomicLong();
+    private static final AtomicLong CONSTRUCTION_MAX_INDUSTRIES_SCANNED = new AtomicLong();
+    private static final LongAdder CONSTRUCTION_AUDIT_STATE_CHANGES = new LongAdder();
+    private static final LongAdder CONSTRUCTION_AUDIT_FALSE_TO_TRUE = new LongAdder();
+    private static final LongAdder CONSTRUCTION_AUDIT_TRUE_TO_FALSE = new LongAdder();
+    private static final LongAdder CONSTRUCTION_REASON_CHANGES = new LongAdder();
+    private static final LongAdder CONSTRUCTION_MUTATION_RACES = new LongAdder();
+    private static final LongAdder CONSTRUCTION_DIAGNOSTIC_SAMPLES_DROPPED = new LongAdder();
     private static final LongAdder SAVE_COALESCED_MARKETS = new LongAdder();
     private static final LongAdder SAVE_EXACT_REPLAY_MARKETS = new LongAdder();
     private static final LongAdder SAVE_EXACT_REPLAY_STEPS = new LongAdder();
@@ -353,6 +394,20 @@ public final class StarsectorPrepatcherHooks {
     static void configure(PrepatcherConfig optimizerConfig, Path root) {
         config = optimizerConfig;
         modRoot = root;
+        CONSTRUCTION_DIAGNOSTICS = null;
+        if (optimizerConfig.marketConstructionDiagnostics) {
+            try {
+                ConstructionDiagnostics diagnostics =
+                        new ConstructionDiagnostics(optimizerConfig, root);
+                CONSTRUCTION_DIAGNOSTICS = diagnostics;
+                diagnostics.start();
+            } catch (Throwable failure) {
+                CONSTRUCTION_DIAGNOSTICS = null;
+                PrepatcherLog.error("Market construction diagnostics initialization failed; "
+                        + "scheduler behavior is unchanged and CSV sampling is disabled.",
+                        failure);
+            }
+        }
         if (optimizerConfig.directMarketObservation) {
             try {
                 DirectMarketObserver observer = new DirectMarketObserver(optimizerConfig, root);
@@ -1703,62 +1758,183 @@ public final class StarsectorPrepatcherHooks {
         PrepatcherConfig c = config;
         long auditBatch = marketSchedulerRenderBatch;
         long observedEpoch;
-        boolean scan;
+        boolean dirtyScan;
+        boolean safetyAudit;
         synchronized (state) {
             observedEpoch = state.constructionMutationEpoch;
             long last = state.lastConstructionAuditBatch;
             boolean auditDue = last == Long.MIN_VALUE || auditBatch < last
                     || auditBatch - last >= (c == null
                     ? 60 : c.marketSchedulerConstructionAuditBatches);
-            scan = forceAudit || state.constructionAuditedEpoch != observedEpoch || auditDue;
-            if (!scan) return state.constructionFullRate;
+            dirtyScan = state.constructionAuditedEpoch != observedEpoch;
+            safetyAudit = !forceAudit && !dirtyScan && auditDue;
+            if (!(forceAudit || dirtyScan || auditDue)) {
+                CONSTRUCTION_CACHED_DECISIONS.increment();
+                return state.constructionFullRate;
+            }
             state.lastConstructionAuditBatch = auditBatch;
         }
 
-        boolean active;
+        CONSTRUCTION_SCANS.increment();
+        if (forceAudit) CONSTRUCTION_FORCED_SCANS.increment();
+        else if (dirtyScan) CONSTRUCTION_DIRTY_SCANS.increment();
+        else if (safetyAudit) CONSTRUCTION_SAFETY_AUDIT_SCANS.increment();
+
+        ConstructionDiagnostics diagnostics = CONSTRUCTION_DIAGNOSTICS;
+        ConstructionProbe probe = diagnostics == null ? null : CONSTRUCTION_PROBE.get();
+        if (probe != null) probe.reset();
+        int reasonMask;
         try {
-            active = requiresFullRateForConstruction(market);
-        } catch (Throwable ignored) {
-            // A failed compatibility probe must not batch a potentially active
-            // construction transition.
-            active = true;
+            reasonMask = scanConstructionState(market, probe);
+        } catch (Throwable failure) {
+            reasonMask = CONSTRUCTION_REASON_PROBE_FAILURE;
+            if (probe != null) probe.failure(failure);
+        }
+        if ((reasonMask & CONSTRUCTION_REASON_PROBE_FAILURE) != 0) {
             MARKET_SCHEDULER_POLICY_FAILURES.increment();
         }
+        recordConstructionReasonCounters(reasonMask);
+        boolean active = (reasonMask & CONSTRUCTION_REASON_ACTIVE_MASK) != 0;
+
+        boolean oldActive;
+        int oldReasonMask;
+        int finalReasonMask;
+        boolean mutationRace;
+        long auditedEpoch;
+        long lastAuditBatch;
         synchronized (state) {
-            // A mutation that raced the scan leaves the state dirty and forces
-            // conservative full-rate delivery until a later clean audit.
-            if (state.constructionMutationEpoch != observedEpoch) {
-                if (!state.constructionFullRate) CONSTRUCTION_MODE_ENTRIES.increment();
-                state.constructionFullRate = true;
-                return true;
+            oldActive = state.constructionFullRate;
+            oldReasonMask = state.constructionReasonMask;
+            mutationRace = state.constructionMutationEpoch != observedEpoch;
+            if (mutationRace) {
+                CONSTRUCTION_MUTATION_RACES.increment();
+                finalReasonMask = reasonMask | CONSTRUCTION_REASON_MUTATION_RACE;
+                active = true;
+            } else {
+                finalReasonMask = reasonMask;
+                state.constructionAuditedEpoch = observedEpoch;
             }
-            state.constructionAuditedEpoch = observedEpoch;
-            if (state.constructionFullRate != active) {
+            state.constructionReasonMask = finalReasonMask;
+            if (oldReasonMask != finalReasonMask) CONSTRUCTION_REASON_CHANGES.increment();
+            if (oldActive != active) {
                 state.constructionFullRate = active;
-                if (active) CONSTRUCTION_MODE_ENTRIES.increment();
-                else CONSTRUCTION_MODE_EXITS.increment();
+                CONSTRUCTION_AUDIT_STATE_CHANGES.increment();
+                if (active) {
+                    CONSTRUCTION_MODE_ENTRIES.increment();
+                    CONSTRUCTION_AUDIT_FALSE_TO_TRUE.increment();
+                } else {
+                    CONSTRUCTION_MODE_EXITS.increment();
+                    CONSTRUCTION_AUDIT_TRUE_TO_FALSE.increment();
+                }
             }
-            return active;
+            auditedEpoch = state.constructionAuditedEpoch;
+            lastAuditBatch = state.lastConstructionAuditBatch;
         }
+
+        if (diagnostics != null) {
+            diagnostics.observe(market, probe, forceAudit ? "FORCED"
+                            : (dirtyScan ? "DIRTY" : "SAFETY_AUDIT"),
+                    observedEpoch, auditedEpoch, lastAuditBatch,
+                    oldActive, active, oldReasonMask, finalReasonMask);
+        }
+        return active;
     }
 
-    private static boolean requiresFullRateForConstruction(MarketAPI market) {
-        // Market.getConstructionQueue() already performs the weak owner registration.
-        // Do not repeat that synchronized weak-map write in the policy scanner.
-        ConstructionQueue queue = market.getConstructionQueue();
-        if (queue != null) {
-            List<?> items = queue.getItems();
-            if (items == null || !items.isEmpty()) return true;
-        }
-        List<Industry> industries = market.getIndustries();
-        if (industries == null) return true;
-        for (int i = 0; i < industries.size(); i++) {
-            Industry industry = industries.get(i);
-            if (industry != null && (industry.isBuilding() || industry.isUpgrading())) {
-                return true;
+    private static int scanConstructionState(MarketAPI market, ConstructionProbe probe) {
+        int reasonMask = 0;
+        ConstructionQueue queue = null;
+        try {
+            // Market.getConstructionQueue() already performs weak owner registration.
+            // Do not repeat that synchronized weak-map write in the policy scanner.
+            queue = market.getConstructionQueue();
+            if (probe != null) probe.queueClass = queue == null ? "" : queue.getClass().getName();
+            if (queue == null) {
+                CONSTRUCTION_QUEUE_NULL_SCANS.increment();
+            } else {
+                List<?> items = queue.getItems();
+                if (items == null) {
+                    CONSTRUCTION_QUEUE_ITEMS_NULL_SCANS.increment();
+                    reasonMask |= CONSTRUCTION_REASON_QUEUE_ITEMS_UNKNOWN;
+                    if (probe != null) probe.queueSize = -1;
+                } else {
+                    int size = items.size();
+                    CONSTRUCTION_QUEUE_ITEMS_OBSERVED.add(size);
+                    updateMax(CONSTRUCTION_MAX_QUEUE_ITEMS, size);
+                    if (probe != null) probe.queueSize = size;
+                    if (size > 0) reasonMask |= CONSTRUCTION_REASON_QUEUE_NON_EMPTY;
+                }
             }
+        } catch (Throwable failure) {
+            reasonMask |= CONSTRUCTION_REASON_PROBE_FAILURE;
+            if (probe != null) probe.failure(failure);
         }
-        return false;
+
+        try {
+            List<Industry> industries = market.getIndustries();
+            if (industries == null) {
+                CONSTRUCTION_INDUSTRIES_NULL_SCANS.increment();
+                reasonMask |= CONSTRUCTION_REASON_INDUSTRIES_UNKNOWN;
+                if (probe != null) probe.industryCount = -1;
+            } else {
+                int size = industries.size();
+                CONSTRUCTION_INDUSTRIES_SCANNED.add(size);
+                updateMax(CONSTRUCTION_MAX_INDUSTRIES_SCANNED, size);
+                if (probe != null) probe.industryCount = size;
+                for (int i = 0; i < size; i++) {
+                    Industry industry = industries.get(i);
+                    if (industry == null) continue;
+                    boolean building = false;
+                    boolean upgrading = false;
+                    try {
+                        building = industry.isBuilding();
+                        upgrading = industry.isUpgrading();
+                    } catch (Throwable failure) {
+                        reasonMask |= CONSTRUCTION_REASON_PROBE_FAILURE;
+                                    if (probe != null) probe.failure(failure);
+                    }
+                    if (building) reasonMask |= CONSTRUCTION_REASON_INDUSTRY_BUILDING;
+                    if (upgrading) reasonMask |= CONSTRUCTION_REASON_INDUSTRY_UPGRADING;
+                    if (probe != null && (building || upgrading)
+                            && probe.industryIndex < 0) {
+                        probe.captureIndustry(industry, i, building, upgrading);
+                    }
+                }
+            }
+        } catch (Throwable failure) {
+            reasonMask |= CONSTRUCTION_REASON_PROBE_FAILURE;
+            if (probe != null) probe.failure(failure);
+        }
+        return reasonMask;
+    }
+
+    private static void recordConstructionReasonCounters(int reasonMask) {
+        int semanticReasons = 0;
+        if ((reasonMask & CONSTRUCTION_REASON_QUEUE_NON_EMPTY) != 0) {
+            CONSTRUCTION_DETECTED_QUEUE_NON_EMPTY.increment();
+            semanticReasons++;
+        }
+        if ((reasonMask & CONSTRUCTION_REASON_INDUSTRY_BUILDING) != 0) {
+            CONSTRUCTION_DETECTED_INDUSTRY_BUILDING.increment();
+            semanticReasons++;
+        }
+        if ((reasonMask & CONSTRUCTION_REASON_INDUSTRY_UPGRADING) != 0) {
+            CONSTRUCTION_DETECTED_INDUSTRY_UPGRADING.increment();
+            semanticReasons++;
+        }
+        if ((reasonMask & CONSTRUCTION_REASON_PROBE_FAILURE) != 0) {
+            CONSTRUCTION_DETECTED_PROBE_FAILURE.increment();
+            semanticReasons++;
+        }
+        if ((reasonMask & CONSTRUCTION_REASON_QUEUE_ITEMS_UNKNOWN) != 0) semanticReasons++;
+        if ((reasonMask & CONSTRUCTION_REASON_INDUSTRIES_UNKNOWN) != 0) semanticReasons++;
+        if (semanticReasons > 1) CONSTRUCTION_DETECTED_MULTIPLE_REASONS.increment();
+    }
+
+    private static void updateMax(AtomicLong target, long value) {
+        long current;
+        while (value > (current = target.get()) && !target.compareAndSet(current, value)) {
+            // Retry only when another observation raised the high-water concurrently.
+        }
     }
 
     private static boolean wouldCreateNewPendingRun(
@@ -2411,6 +2587,11 @@ public final class StarsectorPrepatcherHooks {
         long pendingSteps = 0L;
         long pendingRuns = 0L;
         int constructionMarkets = 0;
+        int constructionQueueMarkets = 0;
+        int constructionBuildingMarkets = 0;
+        int constructionUpgradingMarkets = 0;
+        int constructionUncertainMarkets = 0;
+        int constructionMultipleReasonMarkets = 0;
         try {
             for (WeakIdentityEntry<MarketAPI, MarketScheduleState> entry
                     : MARKET_SCHEDULER_STATES.entriesSnapshot()) {
@@ -2419,19 +2600,48 @@ public final class StarsectorPrepatcherHooks {
                 synchronized (state) {
                     pendingSteps += state.pendingSteps;
                     pendingRuns += state.pendingRuns == null ? 0 : state.pendingRuns.size();
-                    if (state.constructionFullRate) constructionMarkets++;
+                    if (state.constructionFullRate) {
+                        constructionMarkets++;
+                        int reasons = state.constructionReasonMask;
+                        if ((reasons & CONSTRUCTION_REASON_QUEUE_NON_EMPTY) != 0) {
+                            constructionQueueMarkets++;
+                        }
+                        if ((reasons & CONSTRUCTION_REASON_INDUSTRY_BUILDING) != 0) {
+                            constructionBuildingMarkets++;
+                        }
+                        if ((reasons & CONSTRUCTION_REASON_INDUSTRY_UPGRADING) != 0) {
+                            constructionUpgradingMarkets++;
+                        }
+                        if ((reasons & (CONSTRUCTION_REASON_QUEUE_ITEMS_UNKNOWN
+                                | CONSTRUCTION_REASON_INDUSTRIES_UNKNOWN
+                                | CONSTRUCTION_REASON_PROBE_FAILURE
+                                | CONSTRUCTION_REASON_MUTATION_RACE)) != 0) {
+                            constructionUncertainMarkets++;
+                        }
+                        if (Integer.bitCount(reasons & CONSTRUCTION_REASON_ACTIVE_MASK) > 1) {
+                            constructionMultipleReasonMarkets++;
+                        }
+                    }
                 }
             }
         } catch (Throwable ignored) {
             MARKET_SCHEDULER_STATE_FAILURES.increment();
         }
-        return new MarketSchedulerGaugeSnapshot(pendingSteps, pendingRuns, constructionMarkets);
+        return new MarketSchedulerGaugeSnapshot(pendingSteps, pendingRuns, constructionMarkets,
+                constructionQueueMarkets, constructionBuildingMarkets,
+                constructionUpgradingMarkets, constructionUncertainMarkets,
+                constructionMultipleReasonMarkets);
     }
 
     private record MarketSchedulerGaugeSnapshot(
             long pendingMarketStepsCurrent,
             long pendingMarketRunsCurrent,
-            int constructionFullRateMarkets) {}
+            int constructionFullRateMarkets,
+            int constructionMarketsQueueNonEmpty,
+            int constructionMarketsIndustryBuilding,
+            int constructionMarketsIndustryUpgrading,
+            int constructionMarketsUncertain,
+            int constructionMarketsMultipleReasons) {}
 
     private static int stableMarketPhase(MarketAPI market, int interval) {
         if (interval <= 1) return 0;
@@ -4678,11 +4888,310 @@ public final class StarsectorPrepatcherHooks {
         int sourceMask;
         boolean perSimulationTick;
         boolean constructionFullRate;
+        int constructionReasonMask;
         long constructionMutationEpoch;
         long constructionAuditedEpoch = Long.MIN_VALUE;
         long lastConstructionAuditBatch = Long.MIN_VALUE;
         boolean inAdvance;
         boolean disabled;
+    }
+
+    private static final class ConstructionProbe {
+        String queueClass = "";
+        int queueSize = -2;
+        int industryCount = -2;
+        int industryIndex = -1;
+        String industryId = "";
+        String industryClass = "";
+        boolean industryBuilding;
+        boolean industryUpgrading;
+        String exceptionClass = "";
+        String exceptionMessage = "";
+
+        void reset() {
+            queueClass = "";
+            queueSize = -2;
+            industryCount = -2;
+            industryIndex = -1;
+            industryId = "";
+            industryClass = "";
+            industryBuilding = false;
+            industryUpgrading = false;
+            exceptionClass = "";
+            exceptionMessage = "";
+        }
+
+        void captureIndustry(Industry industry, int index,
+                             boolean building, boolean upgrading) {
+            industryIndex = index;
+            industryClass = industry.getClass().getName();
+            industryBuilding = building;
+            industryUpgrading = upgrading;
+            try {
+                String id = industry.getId();
+                industryId = id == null ? "" : id;
+            } catch (Throwable ignored) {
+                industryId = "<unavailable>";
+            }
+        }
+
+        void failure(Throwable failure) {
+            if (failure == null || !exceptionClass.isEmpty()) return;
+            exceptionClass = failure.getClass().getName();
+            String message = failure.getMessage();
+            exceptionMessage = message == null ? "" : message;
+        }
+    }
+
+    private static final class ConstructionDiagnostics {
+        private static final DateTimeFormatter SESSION_FORMAT =
+                DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss-SSS")
+                        .withZone(ZoneOffset.UTC);
+        private static final String HEADER =
+                "timestamp_utc,first_seen_utc,last_seen_utc,occurrences,"
+                        + "market_identity_hash,market_id,market_name,trigger,"
+                        + "reason_mask,reasons,queue_class,queue_size,industry_count,"
+                        + "industry_index,industry_id,industry_class,is_building,is_upgrading,"
+                        + "mutation_epoch,audited_epoch,last_audit_batch,old_active,new_active,"
+                        + "old_reason_mask,new_reason_mask,exception_class,exception_message\n";
+
+        private final int maxSamplesPerReason;
+        private final int reportIntervalSeconds;
+        private final Path output;
+        private final ConcurrentHashMap<String, ConstructionDiagnosticSample> samples =
+                new ConcurrentHashMap<>();
+        private final ConcurrentHashMap<String, AtomicInteger> samplesPerReason =
+                new ConcurrentHashMap<>();
+        private final Object writeLock = new Object();
+
+        ConstructionDiagnostics(PrepatcherConfig configuration, Path root) throws IOException {
+            maxSamplesPerReason = configuration
+                    .marketConstructionDiagnosticsMaxSamplesPerReason;
+            reportIntervalSeconds = configuration.statsLogIntervalSeconds > 0
+                    ? configuration.statsLogIntervalSeconds : 30;
+            String sessionName = "session-" + SESSION_FORMAT.format(Instant.now())
+                    + "-pid" + ProcessHandle.current().pid();
+            Path directory = root.resolve("logs")
+                    .resolve("market-construction-diagnostics").resolve(sessionName);
+            Files.createDirectories(directory);
+            output = directory.resolve("samples.csv");
+            Files.writeString(output, HEADER, StandardCharsets.UTF_8,
+                    StandardOpenOption.CREATE_NEW);
+            System.setProperty("starsector.prepatcher.marketConstructionDiagnosticsDir",
+                    directory.toAbsolutePath().toString());
+            PrepatcherLog.info("Market construction diagnostics session: "
+                    + directory.toAbsolutePath());
+        }
+
+        void start() {
+            Thread reporter = new Thread(this::reportLoop,
+                    "StarsectorPrepatcher-ConstructionDiagnostics");
+            reporter.setDaemon(true);
+            reporter.setPriority(Thread.MIN_PRIORITY);
+            reporter.start();
+        }
+
+        void observe(MarketAPI market, ConstructionProbe probe, String trigger,
+                     long mutationEpoch, long auditedEpoch, long lastAuditBatch,
+                     boolean oldActive, boolean newActive,
+                     int oldReasonMask, int newReasonMask) {
+            if (newReasonMask == 0 && oldReasonMask == 0 && oldActive == newActive) return;
+            int identityHash = market == null ? 0 : System.identityHashCode(market);
+            String marketId = safeMarketText(market, true);
+            String marketName = safeMarketText(market, false);
+            String reasonBucket = constructionReasonBucket(newReasonMask);
+            String industryClass = probe == null ? "" : probe.industryClass;
+            String industryId = probe == null ? "" : probe.industryId;
+            String key = reasonBucket + '\u001f' + identityHash + '\u001f' + marketId
+                    + '\u001f' + newReasonMask + '\u001f' + industryClass
+                    + '\u001f' + industryId + '\u001f' + trigger;
+            ConstructionDiagnosticSample existing = samples.get(key);
+            if (existing == null) {
+                AtomicInteger count = samplesPerReason.computeIfAbsent(
+                        reasonBucket, ignored -> new AtomicInteger());
+                int slot = count.incrementAndGet();
+                if (slot > maxSamplesPerReason) {
+                    count.decrementAndGet();
+                    CONSTRUCTION_DIAGNOSTIC_SAMPLES_DROPPED.increment();
+                    return;
+                }
+                ConstructionDiagnosticSample candidate = new ConstructionDiagnosticSample(
+                        identityHash, marketId, marketName, trigger,
+                        mutationEpoch, auditedEpoch, lastAuditBatch,
+                        oldActive, newActive, oldReasonMask, newReasonMask, probe);
+                ConstructionDiagnosticSample raced = samples.putIfAbsent(key, candidate);
+                existing = raced == null ? candidate : raced;
+                if (raced != null) count.decrementAndGet();
+            }
+            existing.observe();
+        }
+
+        private void reportLoop() {
+            while (true) {
+                try {
+                    Thread.sleep(reportIntervalSeconds * 1000L);
+                    writePending();
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    try { writePending(); } catch (Throwable ignored) {}
+                    return;
+                } catch (Throwable failure) {
+                    PrepatcherLog.error("Market construction diagnostics report failed", failure);
+                }
+            }
+        }
+
+        private void writePending() throws IOException {
+            String timestamp = Instant.now().toString();
+            StringBuilder rows = new StringBuilder();
+            for (ConstructionDiagnosticSample sample : samples.values()) {
+                long occurrences = sample.pendingOccurrences.sumThenReset();
+                if (occurrences <= 0L) continue;
+                sample.append(rows, timestamp, occurrences);
+            }
+            if (rows.length() == 0) return;
+            synchronized (writeLock) {
+                Files.writeString(output, rows, StandardCharsets.UTF_8,
+                        StandardOpenOption.CREATE, StandardOpenOption.APPEND);
+            }
+        }
+
+        private static String safeMarketText(MarketAPI market, boolean id) {
+            if (market == null) return "<null>";
+            try {
+                String value = id ? market.getId() : market.getName();
+                return value == null ? "" : value;
+            } catch (Throwable failure) {
+                return "<" + failure.getClass().getSimpleName() + ">";
+            }
+        }
+    }
+
+    private static final class ConstructionDiagnosticSample {
+        final int marketIdentityHash;
+        final String marketId;
+        final String marketName;
+        final String trigger;
+        final long mutationEpoch;
+        final long auditedEpoch;
+        final long lastAuditBatch;
+        final boolean oldActive;
+        final boolean newActive;
+        final int oldReasonMask;
+        final int newReasonMask;
+        final String queueClass;
+        final int queueSize;
+        final int industryCount;
+        final int industryIndex;
+        final String industryId;
+        final String industryClass;
+        final boolean building;
+        final boolean upgrading;
+        final String exceptionClass;
+        final String exceptionMessage;
+        final long firstSeenMillis = System.currentTimeMillis();
+        final AtomicLong lastSeenMillis = new AtomicLong(firstSeenMillis);
+        final LongAdder pendingOccurrences = new LongAdder();
+
+        ConstructionDiagnosticSample(int marketIdentityHash,
+                                     String marketId, String marketName, String trigger,
+                                     long mutationEpoch, long auditedEpoch, long lastAuditBatch,
+                                     boolean oldActive, boolean newActive,
+                                     int oldReasonMask, int newReasonMask,
+                                     ConstructionProbe probe) {
+            this.marketIdentityHash = marketIdentityHash;
+            this.marketId = marketId;
+            this.marketName = marketName;
+            this.trigger = trigger;
+            this.mutationEpoch = mutationEpoch;
+            this.auditedEpoch = auditedEpoch;
+            this.lastAuditBatch = lastAuditBatch;
+            this.oldActive = oldActive;
+            this.newActive = newActive;
+            this.oldReasonMask = oldReasonMask;
+            this.newReasonMask = newReasonMask;
+            queueClass = probe == null ? "" : probe.queueClass;
+            queueSize = probe == null ? -2 : probe.queueSize;
+            industryCount = probe == null ? -2 : probe.industryCount;
+            industryIndex = probe == null ? -1 : probe.industryIndex;
+            industryId = probe == null ? "" : probe.industryId;
+            industryClass = probe == null ? "" : probe.industryClass;
+            building = probe != null && probe.industryBuilding;
+            upgrading = probe != null && probe.industryUpgrading;
+            exceptionClass = probe == null ? "" : probe.exceptionClass;
+            exceptionMessage = probe == null ? "" : probe.exceptionMessage;
+        }
+
+        void observe() {
+            lastSeenMillis.set(System.currentTimeMillis());
+            pendingOccurrences.increment();
+        }
+
+        void append(StringBuilder output, String timestamp, long occurrences) {
+            output.append(DirectMarketObserver.csv(timestamp)).append(',')
+                    .append(DirectMarketObserver.csv(
+                            Instant.ofEpochMilli(firstSeenMillis).toString())).append(',')
+                    .append(DirectMarketObserver.csv(
+                            Instant.ofEpochMilli(lastSeenMillis.get()).toString())).append(',')
+                    .append(occurrences).append(',')
+                    .append(marketIdentityHash).append(',')
+                    .append(DirectMarketObserver.csv(marketId)).append(',')
+                    .append(DirectMarketObserver.csv(marketName)).append(',')
+                    .append(DirectMarketObserver.csv(trigger)).append(',')
+                    .append(newReasonMask).append(',')
+                    .append(DirectMarketObserver.csv(
+                            constructionReasonText(newReasonMask))).append(',')
+                    .append(DirectMarketObserver.csv(queueClass)).append(',')
+                    .append(queueSize).append(',')
+                    .append(industryCount).append(',')
+                    .append(industryIndex).append(',')
+                    .append(DirectMarketObserver.csv(industryId)).append(',')
+                    .append(DirectMarketObserver.csv(industryClass)).append(',')
+                    .append(building).append(',')
+                    .append(upgrading).append(',')
+                    .append(mutationEpoch).append(',')
+                    .append(auditedEpoch).append(',')
+                    .append(lastAuditBatch).append(',')
+                    .append(oldActive).append(',')
+                    .append(newActive).append(',')
+                    .append(oldReasonMask).append(',')
+                    .append(newReasonMask).append(',')
+                    .append(DirectMarketObserver.csv(exceptionClass)).append(',')
+                    .append(DirectMarketObserver.csv(exceptionMessage)).append('\n');
+        }
+    }
+
+    private static String constructionReasonBucket(int reasonMask) {
+        int semantic = reasonMask & CONSTRUCTION_REASON_ACTIVE_MASK;
+        if (Integer.bitCount(semantic) > 1) return "MULTIPLE";
+        if ((semantic & CONSTRUCTION_REASON_QUEUE_NON_EMPTY) != 0) return "QUEUE_NON_EMPTY";
+        if ((semantic & CONSTRUCTION_REASON_INDUSTRY_BUILDING) != 0) return "INDUSTRY_BUILDING";
+        if ((semantic & CONSTRUCTION_REASON_INDUSTRY_UPGRADING) != 0) return "INDUSTRY_UPGRADING";
+        if ((semantic & CONSTRUCTION_REASON_QUEUE_ITEMS_UNKNOWN) != 0) return "QUEUE_ITEMS_UNKNOWN";
+        if ((semantic & CONSTRUCTION_REASON_INDUSTRIES_UNKNOWN) != 0) return "INDUSTRIES_UNKNOWN";
+        if ((semantic & CONSTRUCTION_REASON_PROBE_FAILURE) != 0) return "PROBE_FAILURE";
+        if ((semantic & CONSTRUCTION_REASON_MUTATION_RACE) != 0) return "MUTATION_RACE";
+        return "INACTIVE";
+    }
+
+    private static String constructionReasonText(int reasonMask) {
+        if (reasonMask == 0) return "NONE";
+        StringBuilder result = new StringBuilder();
+        appendReason(result, reasonMask, CONSTRUCTION_REASON_QUEUE_NON_EMPTY, "QUEUE_NON_EMPTY");
+        appendReason(result, reasonMask, CONSTRUCTION_REASON_INDUSTRY_BUILDING, "INDUSTRY_BUILDING");
+        appendReason(result, reasonMask, CONSTRUCTION_REASON_INDUSTRY_UPGRADING, "INDUSTRY_UPGRADING");
+        appendReason(result, reasonMask, CONSTRUCTION_REASON_QUEUE_ITEMS_UNKNOWN, "QUEUE_ITEMS_UNKNOWN");
+        appendReason(result, reasonMask, CONSTRUCTION_REASON_INDUSTRIES_UNKNOWN, "INDUSTRIES_UNKNOWN");
+        appendReason(result, reasonMask, CONSTRUCTION_REASON_PROBE_FAILURE, "PROBE_FAILURE");
+        appendReason(result, reasonMask, CONSTRUCTION_REASON_MUTATION_RACE, "MUTATION_RACE");
+        return result.toString();
+    }
+
+    private static void appendReason(
+            StringBuilder output, int mask, int bit, String label) {
+        if ((mask & bit) == 0) return;
+        if (output.length() > 0) output.append('|');
+        output.append(label);
     }
 
     private static final class PendingStepRun {
@@ -5713,12 +6222,68 @@ public final class StarsectorPrepatcherHooks {
                         + CONSTRUCTION_FULL_RATE_CALLS.sumThenReset()
                         + ", constructionFullRateMarkets="
                         + marketGauges.constructionFullRateMarkets()
+                        + ", constructionMarketsQueueNonEmpty="
+                        + marketGauges.constructionMarketsQueueNonEmpty()
+                        + ", constructionMarketsIndustryBuilding="
+                        + marketGauges.constructionMarketsIndustryBuilding()
+                        + ", constructionMarketsIndustryUpgrading="
+                        + marketGauges.constructionMarketsIndustryUpgrading()
+                        + ", constructionMarketsUncertain="
+                        + marketGauges.constructionMarketsUncertain()
+                        + ", constructionMarketsMultipleReasons="
+                        + marketGauges.constructionMarketsMultipleReasons()
                         + ", constructionModeEntries="
                         + CONSTRUCTION_MODE_ENTRIES.sumThenReset()
                         + ", constructionModeExits="
                         + CONSTRUCTION_MODE_EXITS.sumThenReset()
                         + ", constructionBoundaryExactReplays="
                         + CONSTRUCTION_BOUNDARY_EXACT_REPLAYS.sumThenReset()
+                        + ", constructionScans="
+                        + CONSTRUCTION_SCANS.sumThenReset()
+                        + ", constructionDirtyScans="
+                        + CONSTRUCTION_DIRTY_SCANS.sumThenReset()
+                        + ", constructionSafetyAuditScans="
+                        + CONSTRUCTION_SAFETY_AUDIT_SCANS.sumThenReset()
+                        + ", constructionForcedScans="
+                        + CONSTRUCTION_FORCED_SCANS.sumThenReset()
+                        + ", constructionCachedDecisions="
+                        + CONSTRUCTION_CACHED_DECISIONS.sumThenReset()
+                        + ", constructionDetectedQueueNonEmpty="
+                        + CONSTRUCTION_DETECTED_QUEUE_NON_EMPTY.sumThenReset()
+                        + ", constructionDetectedIndustryBuilding="
+                        + CONSTRUCTION_DETECTED_INDUSTRY_BUILDING.sumThenReset()
+                        + ", constructionDetectedIndustryUpgrading="
+                        + CONSTRUCTION_DETECTED_INDUSTRY_UPGRADING.sumThenReset()
+                        + ", constructionDetectedMultipleReasons="
+                        + CONSTRUCTION_DETECTED_MULTIPLE_REASONS.sumThenReset()
+                        + ", constructionDetectedProbeFailure="
+                        + CONSTRUCTION_DETECTED_PROBE_FAILURE.sumThenReset()
+                        + ", constructionQueueNullScans="
+                        + CONSTRUCTION_QUEUE_NULL_SCANS.sumThenReset()
+                        + ", constructionQueueItemsNullScans="
+                        + CONSTRUCTION_QUEUE_ITEMS_NULL_SCANS.sumThenReset()
+                        + ", constructionIndustriesNullScans="
+                        + CONSTRUCTION_INDUSTRIES_NULL_SCANS.sumThenReset()
+                        + ", constructionQueueItemsObserved="
+                        + CONSTRUCTION_QUEUE_ITEMS_OBSERVED.sumThenReset()
+                        + ", constructionIndustriesScanned="
+                        + CONSTRUCTION_INDUSTRIES_SCANNED.sumThenReset()
+                        + ", constructionMaxQueueItems="
+                        + CONSTRUCTION_MAX_QUEUE_ITEMS.get()
+                        + ", constructionMaxIndustriesScanned="
+                        + CONSTRUCTION_MAX_INDUSTRIES_SCANNED.get()
+                        + ", constructionAuditStateChanges="
+                        + CONSTRUCTION_AUDIT_STATE_CHANGES.sumThenReset()
+                        + ", constructionAuditFalseToTrue="
+                        + CONSTRUCTION_AUDIT_FALSE_TO_TRUE.sumThenReset()
+                        + ", constructionAuditTrueToFalse="
+                        + CONSTRUCTION_AUDIT_TRUE_TO_FALSE.sumThenReset()
+                        + ", constructionReasonChanges="
+                        + CONSTRUCTION_REASON_CHANGES.sumThenReset()
+                        + ", constructionMutationRaces="
+                        + CONSTRUCTION_MUTATION_RACES.sumThenReset()
+                        + ", constructionDiagnosticSamplesDropped="
+                        + CONSTRUCTION_DIAGNOSTIC_SAMPLES_DROPPED.sumThenReset()
                         + ", saveCoalescedMarkets="
                         + SAVE_COALESCED_MARKETS.sumThenReset()
                         + ", saveExactReplayMarkets="
@@ -5822,9 +6387,9 @@ public final class StarsectorPrepatcherHooks {
         private static final DateTimeFormatter SESSION_FORMAT =
                 DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss-SSS").withZone(ZoneOffset.UTC);
         private static final String SITE_HEADER =
-                "site_id,source,class,method,descriptor,line,ordinal,amount_source,call_owner,opcode\n";
+                "site_id,mod_id,mod_name,mod_directory,jar_name,source,class,method,descriptor,line,ordinal,amount_source,call_owner,opcode\n";
         private static final String OBSERVATION_HEADER =
-                "timestamp_utc,interval_seconds,site_id,source,class,method,descriptor,line,ordinal,"
+                "timestamp_utc,interval_seconds,site_id,mod_id,mod_name,mod_directory,jar_name,source,class,method,descriptor,line,ordinal,"
                         + "amount_source,call_owner,opcode,interval_calls,cumulative_calls,calls_per_second,"
                         + "sampled_calls,sampled_inclusive_ns,estimated_inclusive_ns,avg_sample_ns,"
                         + "exceptions,recursive_calls,finite_amounts,amount_sum,amount_avg,"
@@ -6180,6 +6745,10 @@ public final class StarsectorPrepatcherHooks {
 
         private static void appendSiteRow(StringBuilder output, DirectMarketMetadata metadata) {
             output.append(csv(unsignedHex(metadata.siteId))).append(',')
+                    .append(csv(metadata.modId)).append(',')
+                    .append(csv(metadata.modName)).append(',')
+                    .append(csv(metadata.modDirectory)).append(',')
+                    .append(csv(metadata.jarName)).append(',')
                     .append(csv(metadata.source)).append(',')
                     .append(csv(metadata.className)).append(',')
                     .append(csv(metadata.method)).append(',')
@@ -6201,6 +6770,10 @@ public final class StarsectorPrepatcherHooks {
             output.append(csv(timestamp)).append(',')
                     .append(decimal(elapsedSeconds)).append(',')
                     .append(csv(unsignedHex(metadata.siteId))).append(',')
+                    .append(csv(metadata.modId)).append(',')
+                    .append(csv(metadata.modName)).append(',')
+                    .append(csv(metadata.modDirectory)).append(',')
+                    .append(csv(metadata.jarName)).append(',')
                     .append(csv(metadata.source)).append(',')
                     .append(csv(metadata.className)).append(',')
                     .append(csv(metadata.method)).append(',')
@@ -6356,9 +6929,11 @@ public final class StarsectorPrepatcherHooks {
 
         static DirectMarketSiteStats overflow() {
             DirectMarketSiteStats result = new DirectMarketSiteStats(
-                    new DirectMarketMetadata(0L, "<site-overflow>", "<site-overflow>",
-                            "<site-overflow>", "", -1, -1, "UNKNOWN", "", -1,
-                            "<site-overflow>"));
+                    new DirectMarketMetadata(0L,
+                            "<site-overflow>", "<site-overflow>",
+                            "<site-overflow>", "", "<site-overflow>",
+                            "<site-overflow>", "<site-overflow>", "",
+                            -1, -1, "UNKNOWN", "", -1, "<site-overflow>"));
             result.metadataWritten = true;
             return result;
         }
@@ -6443,6 +7018,10 @@ public final class StarsectorPrepatcherHooks {
 
     private static final class DirectMarketMetadata {
         final long siteId;
+        final String modId;
+        final String modName;
+        final String modDirectory;
+        final String jarName;
         final String source;
         final String className;
         final String method;
@@ -6454,10 +7033,16 @@ public final class StarsectorPrepatcherHooks {
         final int opcode;
         final String raw;
 
-        DirectMarketMetadata(long siteId, String source, String className, String method,
+        DirectMarketMetadata(long siteId, String modId, String modName,
+                             String modDirectory, String jarName,
+                             String source, String className, String method,
                              String descriptor, int line, int ordinal, String amountSource,
                              String callOwner, int opcode, String raw) {
             this.siteId = siteId;
+            this.modId = modId;
+            this.modName = modName;
+            this.modDirectory = modDirectory;
+            this.jarName = jarName;
             this.source = source;
             this.className = className;
             this.method = method;
@@ -6473,13 +7058,41 @@ public final class StarsectorPrepatcherHooks {
         static DirectMarketMetadata parse(long siteId, String metadata) {
             String raw = metadata == null ? "" : metadata;
             String[] fields = raw.split("\u001f", -1);
-            if (fields.length != 10 || !"1".equals(fields[0])) {
-                return new DirectMarketMetadata(siteId, "<malformed>", "<malformed>",
-                        "<malformed>", "", -1, -1, "UNKNOWN", "", -1, raw);
+            if (fields.length == 14 && "2".equals(fields[0])) {
+                return new DirectMarketMetadata(siteId,
+                        fields[2], fields[3], fields[4], fields[5], fields[1],
+                        fields[6], fields[7], fields[8], parseInt(fields[9], -1),
+                        parseInt(fields[10], -1), fields[11], fields[12],
+                        parseInt(fields[13], -1), raw);
             }
-            return new DirectMarketMetadata(siteId, fields[1], fields[2], fields[3], fields[4],
-                    parseInt(fields[5], -1), parseInt(fields[6], -1), fields[7], fields[8],
-                    parseInt(fields[9], -1), raw);
+            if (fields.length == 10 && "1".equals(fields[0])) {
+                String modId = modIdFromSource(fields[1]);
+                return new DirectMarketMetadata(siteId, modId, modId, modId,
+                        jarNameFromSource(fields[1]), fields[1], fields[2], fields[3], fields[4],
+                        parseInt(fields[5], -1), parseInt(fields[6], -1), fields[7], fields[8],
+                        parseInt(fields[9], -1), raw);
+            }
+            return new DirectMarketMetadata(siteId,
+                    "<malformed>", "<malformed>", "<malformed>", "",
+                    "<malformed>", "<malformed>", "<malformed>", "",
+                    -1, -1, "UNKNOWN", "", -1, raw);
+        }
+
+        private static String modIdFromSource(String source) {
+            String normalized = source == null ? "" : source.replace('\\', '/');
+            int marker = normalized.indexOf("/mods/");
+            int start = marker >= 0 ? marker + 6
+                    : (normalized.startsWith("mods/") ? 5 : -1);
+            if (start < 0) return "unknown";
+            int end = normalized.indexOf('/', start);
+            return end < 0 ? normalized.substring(start) : normalized.substring(start, end);
+        }
+
+        private static String jarNameFromSource(String source) {
+            String normalized = source == null ? "" : source.replace('\\', '/');
+            int slash = normalized.lastIndexOf('/');
+            String tail = slash < 0 ? normalized : normalized.substring(slash + 1);
+            return tail.toLowerCase(java.util.Locale.ROOT).endsWith(".jar") ? tail : "";
         }
 
         private static int parseInt(String value, int fallback) {

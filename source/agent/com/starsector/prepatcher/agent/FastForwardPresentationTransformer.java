@@ -3,87 +3,330 @@ package com.starsector.prepatcher.agent;
 import jdk.internal.org.objectweb.asm.ClassReader;
 import jdk.internal.org.objectweb.asm.ClassWriter;
 import jdk.internal.org.objectweb.asm.Opcodes;
+import jdk.internal.org.objectweb.asm.Type;
 import jdk.internal.org.objectweb.asm.tree.AbstractInsnNode;
 import jdk.internal.org.objectweb.asm.tree.ClassNode;
+import jdk.internal.org.objectweb.asm.tree.FieldNode;
+import jdk.internal.org.objectweb.asm.tree.IincInsnNode;
 import jdk.internal.org.objectweb.asm.tree.InsnList;
+import jdk.internal.org.objectweb.asm.tree.InsnNode;
+import jdk.internal.org.objectweb.asm.tree.JumpInsnNode;
+import jdk.internal.org.objectweb.asm.tree.LabelNode;
+import jdk.internal.org.objectweb.asm.tree.LookupSwitchInsnNode;
 import jdk.internal.org.objectweb.asm.tree.MethodInsnNode;
 import jdk.internal.org.objectweb.asm.tree.MethodNode;
+import jdk.internal.org.objectweb.asm.tree.TableSwitchInsnNode;
 import jdk.internal.org.objectweb.asm.tree.VarInsnNode;
+import jdk.internal.org.objectweb.asm.tree.analysis.Analyzer;
+import jdk.internal.org.objectweb.asm.tree.analysis.AnalyzerException;
+import jdk.internal.org.objectweb.asm.tree.analysis.Frame;
+import jdk.internal.org.objectweb.asm.tree.analysis.SourceInterpreter;
+import jdk.internal.org.objectweb.asm.tree.analysis.SourceValue;
 
-import java.io.InputStream;
 import java.lang.instrument.ClassFileTransformer;
-import java.net.JarURLConnection;
-import java.net.URL;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.security.MessageDigest;
 import java.security.ProtectionDomain;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.jar.JarEntry;
-import java.util.jar.JarFile;
 
 /**
- * Exact-build presentation coalescing imported from FastForward Presentation
- * Patch 1.1.0. This transformer deliberately runs before the structural
- * prepatcher transformer so its whole-class hashes always see vanilla bytes.
+ * Structurally matched fast-forward presentation coalescing. Compatibility is decided from the
+ * local methods and semantic call sites owned by each class-level plan; class and JAR hashes do not
+ * participate in the runtime decision.
  */
 public final class FastForwardPresentationTransformer implements ClassFileTransformer {
     private static final String RUNTIME =
             "com/fs/starfarer/api/StarsectorPrepatcherPresentationHooks";
 
+    static final String OWNER_FIELD = "smo$patched$fastForwardPresentation";
+    static final String MASK_FIELD = "smo$fastForwardPresentationMask";
+    static final String OWNER_VALUE =
+            "StarsectorPrepatcher:fast-forward-presentation-structural-v1";
+
+    static final int FRAME_MARKER = 1;
+    static final int ACTION_INDICATORS = 1 << 1;
+    static final int LOCATION_VISUALS = 1 << 2;
+    static final int FLOATING_TEXT = 1 << 3;
+    static final int FLEET_VIEW = 1 << 4;
+    static final int FLEET_PRESENTATION = 1 << 5;
+    static final int SENSOR_INDICATORS = 1 << 6;
+    static final int CELESTIAL_VISUALS = 1 << 7;
+    static final int AURORA_ANIMATION = 1 << 8;
+    static final int CONTINUOUS_SOUND = 1 << 9;
+    static final int GATE_JITTER = 1 << 10;
+    static final int GLOBAL_ANIMATIONS = 1 << 11;
+    static final int SENSOR_FADERS = 1 << 12;
+    static final int SLIPSTREAM_PARTICLES = 1 << 13;
+    static final int PARTICLE_EMITTERS = 1 << 14;
+
     private enum Container {
-        CORE("starfarer_obf.jar", "5dd222b9e266d2ac2d63b3dad4983eb05caaf5a247d7dfb82aaeba47ea774cc8"),
-        API("starfarer.api.jar", "a7ba18f3476ffe704729bd0a7a47443f035fea98a32ac2930eae8b391d013c2a");
+        CORE("starfarer_obf.jar"),
+        API("starfarer.api.jar");
 
         final String fileName;
-        final String sha256;
-        Container(String fileName, String sha256) {
+        Container(String fileName) {
             this.fileName = fileName;
-            this.sha256 = sha256;
         }
     }
 
-    private record Target(String classSha256, Container container) {}
+    private enum PlanKind { GENERIC, CAMPAIGN_STATE, CAMPAIGN_FLEET }
+    private enum State { VANILLA, COMPLETE_PATCHED }
 
-    private static final Map<String, Target> TARGETS;
-    static final Set<String> TARGET_CLASSES;
-    static {
-        Map<String, Target> hashes = new HashMap<>();
-        hashes.put("com/fs/starfarer/campaign/CampaignState", new Target("3823d61bdc91484248c5aecf58fff7726d38e498bccf9884eca1a53b668be431", Container.CORE));
-        hashes.put("com/fs/starfarer/campaign/CampaignEngine", new Target("9888ba1d2493f8d1d41106b57d9843c266f7073355aa9d2c41e73c14c3527cab", Container.CORE));
-        hashes.put("com/fs/starfarer/campaign/BaseLocation", new Target("76b19cd60a3e1d8c9dbcd1cccc78dc8587ed1c3ae1539089f54625a93bc8fe38", Container.CORE));
-        hashes.put("com/fs/starfarer/campaign/BaseCampaignEntity", new Target("e1fc45909ea1300d4b82aa4a22f22af5fb01fe327136e47abf3fe3574ee031f7", Container.CORE));
-        hashes.put("com/fs/starfarer/campaign/fleet/CampaignFleet", new Target("7707b678ee754fa256c270743a9243e7a4398e75707c8b6b085a2324ef25d341", Container.CORE));
-        hashes.put("com/fs/starfarer/campaign/SensorContactIndicatorManager", new Target("34069cd7728684a08f13cb897f80bc810d8c16eb31e0e3bb9b16ca05c97226c8", Container.CORE));
-        hashes.put("com/fs/starfarer/campaign/CampaignPlanet", new Target("377a6778c2db17a66cb707c2f040b5bad45ad8e5cc52e0316ed7cf982ee30b0d", Container.CORE));
-        hashes.put("com/fs/starfarer/campaign/JumpPoint", new Target("047d460ae7c48acdd031ba2f285a307a4f6bb55336379f0a8c197ae6159deee2", Container.CORE));
+    private record CallSiteSpec(
+            String methodName,
+            String methodDesc,
+            int originalOpcode,
+            String originalOwner,
+            String originalName,
+            String originalDesc,
+            String wrapperName,
+            String wrapperDesc,
+            int expectedCount) {}
 
-        hashes.put("com/fs/starfarer/api/impl/campaign/terrain/StarCoronaTerrainPlugin", new Target("a500462f64b1f2a4984df6df10d64d4a715307f021942f907abf8e4b09d25659", Container.API));
-        hashes.put("com/fs/starfarer/api/impl/campaign/terrain/MagneticFieldTerrainPlugin", new Target("318dfc03b0f67ac78133e87f5085dbd52e133675805b0564bdaf4a8b818f6c98", Container.API));
-        hashes.put("com/fs/starfarer/api/impl/campaign/terrain/SpatialAnomalyTerrainPlugin", new Target("f9e680a61b5f1d814d2e688b1f8fcbcdccbfb47938f511d85d646338d173e202", Container.API));
-        hashes.put("com/fs/starfarer/api/impl/campaign/terrain/HyperspaceTerrainPlugin", new Target("40f504bdca41cf45fa223ec6d9a201a17945f624dad36300f7b40d1161916931", Container.API));
-        hashes.put("com/fs/starfarer/api/impl/campaign/terrain/RadioChatterTerrainPlugin", new Target("80b54746bb0622536a7ab5be8c6d08d9c6599b98cf5ccfc57e8c0e5454242c53", Container.API));
-        hashes.put("com/fs/starfarer/api/impl/campaign/velfield/SlipstreamTerrainPlugin2", new Target("3b87fc4796bed4a3658285d51c3aade36968c0b9b2a08e4cecee7f3c0004df7a", Container.API));
-        hashes.put("com/fs/starfarer/api/impl/campaign/velfield/SlipstreamEntityPlugin2", new Target("cea817e302adc9535daadf41aaa801fa555d48f6dc621b94dcf94899bb67c2f3", Container.API));
-        hashes.put("com/fs/starfarer/api/impl/campaign/terrain/BaseTerrain", new Target("cfa0ef70bd4ffcbc593e6788086f704a544c6ff46990a02cf11ef4cb75611287", Container.API));
-        hashes.put("com/fs/starfarer/api/impl/campaign/abilities/BaseDurationAbility", new Target("1c13ce637fd278e9a4caa9dfaa08e7dec8aeb3800192887f5047d21a56f56bbc", Container.API));
-        hashes.put("com/fs/starfarer/api/impl/campaign/abilities/BaseToggleAbility", new Target("d41dac331c420400b6a8b2a8c7dd9a8e65bbd85c3c02ad8ea3add4d5c0ac7b8a", Container.API));
-        hashes.put("com/fs/starfarer/api/impl/campaign/abilities/GenerateSlipsurgeAbility$SlipsurgeEffectScript", new Target("dca1ed72b810db22c35802029ef4ec014a2afa322c56e712d13f239463771c69", Container.API));
-        hashes.put("com/fs/starfarer/api/impl/campaign/entities/GateHaulerEntityPlugin", new Target("737233beac85d7e6fd4d59ac4497070ce7fdb8f0ab7a12f5eac5e4c3cebfac92", Container.API));
-        hashes.put("com/fs/starfarer/api/impl/campaign/GateEntityPlugin", new Target("48f0b2d2a6ca25ef8d9f07d86bcc80eb81ad3aa9450e002ec83f1baaaa04a8e5", Container.API));
-        hashes.put("com/fs/starfarer/api/impl/campaign/world/MoteParticleScript", new Target("ba3cc6fa3000b67def30fa00739e6c3bdbc5c662e7dcd36b9f2c94c381c61ff3", Container.API));
-        hashes.put("com/fs/starfarer/api/impl/campaign/CoronalTapParticleScript", new Target("b5843c7d02b58a93f89dacb5243d6becd9f622802930d2bd8b8c314569dafff7", Container.API));
-        hashes.put("com/fs/starfarer/api/impl/campaign/world/ZigLeashAssignmentAI", new Target("f34c810493ad970bf7d842af07c01becf71a73d4fcdbe3db83b11a67218238d5", Container.API));
-        TARGETS = Collections.unmodifiableMap(hashes);
-        TARGET_CLASSES = TARGETS.keySet();
+    private record Component(int bit, List<CallSiteSpec> sites) {}
+
+    private record PresentationClassPlan(
+            Container container,
+            PlanKind kind,
+            List<Component> components) {}
+
+    private record SiteRef(String methodName, String methodDesc, int instructionIndex) {}
+
+    private record CampaignStateProtocol(
+            SiteRef firstFalse,
+            SiteRef engineAdvance,
+            SiteRef loopTrue,
+            SiteRef finalFalse,
+            int substepLocal,
+            int totalLocal) {}
+
+    private record FleetPulseSite(SiteRef call) {}
+
+    private static final class PresentationInspection {
+        final State state;
+        final int requestedMask;
+        final Map<CallSiteSpec, List<SiteRef>> sites;
+        final CampaignStateProtocol campaignState;
+        final FleetPulseSite fleetPulse;
+
+        PresentationInspection(State state, int requestedMask,
+                               Map<CallSiteSpec, List<SiteRef>> sites,
+                               CampaignStateProtocol campaignState,
+                               FleetPulseSite fleetPulse) {
+            this.state = state;
+            this.requestedMask = requestedMask;
+            this.sites = sites;
+            this.campaignState = campaignState;
+            this.fleetPulse = fleetPulse;
+        }
     }
 
-    private static final Map<Path, String> CONTAINER_HASH_CACHE = new ConcurrentHashMap<>();
+    private static final class StructuralMismatch extends RuntimeException {
+        StructuralMismatch(String message) {
+            super(message);
+        }
+    }
+
+    private static final Map<String, PresentationClassPlan> PLANS;
+    static final Set<String> TARGET_CLASSES;
     private static final Set<String> LOGGED = ConcurrentHashMap.newKeySet();
+
+    static {
+        Map<String, PresentationClassPlan> plans = new LinkedHashMap<>();
+        plans.put("com/fs/starfarer/campaign/CampaignState",
+                new PresentationClassPlan(Container.CORE, PlanKind.CAMPAIGN_STATE,
+                        List.of(new Component(FRAME_MARKER, List.of()))));
+        plans.put("com/fs/starfarer/campaign/CampaignEngine", generic(Container.CORE,
+                component(ACTION_INDICATORS,
+                        site("advance", "(FLcom/fs/starfarer/util/A/new;)V", Opcodes.INVOKEVIRTUAL,
+                                "com/fs/starfarer/campaign/ActionIndicator", "advance", "(F)V",
+                                "advanceActionIndicator",
+                                "(Lcom/fs/starfarer/campaign/ActionIndicator;F)V", 1)),
+                component(GLOBAL_ANIMATIONS,
+                        site("advance", "(FLcom/fs/starfarer/util/A/new;)V", Opcodes.INVOKEVIRTUAL,
+                                "com/fs/graphics/anim/AnimationManager", "advanceAll", "(F)V",
+                                "advanceAnimationManager",
+                                "(Lcom/fs/graphics/anim/AnimationManager;F)V", 2))));
+        plans.put("com/fs/starfarer/campaign/BaseLocation", generic(Container.CORE,
+                component(LOCATION_VISUALS,
+                        site("advance", "(FLcom/fs/starfarer/util/A/new;)V", Opcodes.INVOKEVIRTUAL,
+                                "com/fs/graphics/util/Fader", "advance", "(F)V",
+                                "advanceLocationLightFader",
+                                "(Lcom/fs/graphics/util/Fader;F)V", 1),
+                        site("advance", "(FLcom/fs/starfarer/util/A/new;)V", Opcodes.INVOKEVIRTUAL,
+                                "com/fs/starfarer/campaign/BackgroundAndStars", "advance", "(F)V",
+                                "advanceBackground",
+                                "(Lcom/fs/starfarer/campaign/BackgroundAndStars;F)V", 1),
+                        site("advance", "(FLcom/fs/starfarer/util/A/new;)V", Opcodes.INVOKEVIRTUAL,
+                                "com/fs/graphics/particle/DynamicParticleGroup", "advance", "(F)V",
+                                "advanceParticleGroup",
+                                "(Lcom/fs/graphics/particle/DynamicParticleGroup;F)V", 1))));
+        plans.put("com/fs/starfarer/campaign/BaseCampaignEntity", generic(Container.CORE,
+                component(FLOATING_TEXT,
+                        site("advance", "(F)V", Opcodes.INVOKEVIRTUAL,
+                                "com/fs/starfarer/campaign/fleet/CampaignFloatingText", "advance", "(F)V",
+                                "advanceFloatingText",
+                                "(Lcom/fs/starfarer/campaign/fleet/CampaignFloatingText;F)V", 1),
+                        site("advanceEvenIfPaused", "(F)V", Opcodes.INVOKEVIRTUAL,
+                                "com/fs/starfarer/campaign/fleet/CampaignFloatingText", "advance", "(F)V",
+                                "advanceFloatingText",
+                                "(Lcom/fs/starfarer/campaign/fleet/CampaignFloatingText;F)V", 1)),
+                component(SENSOR_INDICATORS,
+                        site("advance", "(F)V", Opcodes.INVOKEVIRTUAL,
+                                "com/fs/starfarer/campaign/ui/oOO0", "new", "(F)V",
+                                "advanceSelectionIndicator", "(Ljava/lang/Object;F)V", 1)),
+                component(SENSOR_FADERS,
+                        site("advance", "(F)V", Opcodes.INVOKEVIRTUAL,
+                                "com/fs/graphics/util/Fader", "advance", "(F)V",
+                                "advanceSensorFader", "(Lcom/fs/graphics/util/Fader;F)V", 2))));
+        plans.put("com/fs/starfarer/campaign/fleet/CampaignFleet",
+                new PresentationClassPlan(Container.CORE, PlanKind.CAMPAIGN_FLEET, List.of(
+                        component(FLEET_VIEW,
+                                site("advance", "(F)V", Opcodes.INVOKEVIRTUAL,
+                                        "com/fs/starfarer/campaign/fleet/CampaignFleetView", "advance", "(F)V",
+                                        "advanceFleetView",
+                                        "(Lcom/fs/starfarer/campaign/fleet/CampaignFleetView;F)V", 1)),
+                        component(FLEET_PRESENTATION,
+                                site("advance", "(F)V", Opcodes.INVOKEVIRTUAL,
+                                        "com/fs/starfarer/campaign/fleet/FleetAbilityRenderer", "updateLayers", "()V",
+                                        "updateFleetAbilityLayers",
+                                        "(Lcom/fs/starfarer/campaign/fleet/FleetAbilityRenderer;)V", 1),
+                                site("advance", "(F)V", Opcodes.INVOKEVIRTUAL,
+                                        "com/fs/starfarer/campaign/fleet/CampaignFleetView", "clear", "()V",
+                                        "clearFleetView",
+                                        "(Lcom/fs/starfarer/campaign/fleet/CampaignFleetView;)V", 1),
+                                site("advance", "(F)V", Opcodes.INVOKEVIRTUAL,
+                                        "com/fs/starfarer/campaign/E", "Ò00000", "(F)V",
+                                        "advanceSensorRangeIndicator",
+                                        "(Lcom/fs/starfarer/campaign/E;F)V", 1)))));
+        plans.put("com/fs/starfarer/campaign/SensorContactIndicatorManager", generic(Container.CORE,
+                component(SENSOR_INDICATORS,
+                        site("advance", "(F)V", Opcodes.INVOKEVIRTUAL,
+                                "com/fs/starfarer/campaign/SensorContactIndicatorManager$SensorContactIndicator",
+                                "advance", "(F)V", "advanceSensorContactIndicator",
+                                "(Lcom/fs/starfarer/campaign/SensorContactIndicatorManager$SensorContactIndicator;F)V", 1))));
+        plans.put("com/fs/starfarer/campaign/CampaignPlanet", generic(Container.CORE,
+                component(CELESTIAL_VISUALS,
+                        site("advance", "(F)V", Opcodes.INVOKEVIRTUAL,
+                                "com/fs/starfarer/combat/entities/terrain/Planet", "advance", "(F)V",
+                                "advancePlanetGraphics",
+                                "(Lcom/fs/starfarer/combat/entities/terrain/Planet;F)V", 1))));
+        plans.put("com/fs/starfarer/campaign/JumpPoint", generic(Container.CORE,
+                component(CELESTIAL_VISUALS,
+                        site("advance", "(F)V", Opcodes.INVOKEVIRTUAL,
+                                "com/fs/starfarer/campaign/DynamicRingBand", "advance", "(F)V",
+                                "advanceDynamicRingBand",
+                                "(Lcom/fs/starfarer/campaign/DynamicRingBand;F)V", 1),
+                        site("advance", "(F)V", Opcodes.INVOKEVIRTUAL,
+                                "com/fs/starfarer/campaign/JumpPoint$RingData", "advance", "(F)V",
+                                "advanceJumpRingData",
+                                "(Lcom/fs/starfarer/campaign/JumpPoint$RingData;F)V", 2),
+                        site("advance", "(F)V", Opcodes.INVOKEVIRTUAL,
+                                "com/fs/starfarer/campaign/JumpPoint$CoronaData", "advance", "(F)V",
+                                "advanceJumpCoronaData",
+                                "(Lcom/fs/starfarer/campaign/JumpPoint$CoronaData;F)V", 1),
+                        site("advance", "(F)V", Opcodes.INVOKEVIRTUAL,
+                                "com/fs/starfarer/combat/entities/terrain/Planet", "advance", "(F)V",
+                                "advancePlanetGraphics",
+                                "(Lcom/fs/starfarer/combat/entities/terrain/Planet;F)V", 1))));
+
+        for (String name : List.of(
+                "com/fs/starfarer/api/impl/campaign/terrain/StarCoronaTerrainPlugin",
+                "com/fs/starfarer/api/impl/campaign/terrain/MagneticFieldTerrainPlugin",
+                "com/fs/starfarer/api/impl/campaign/terrain/SpatialAnomalyTerrainPlugin")) {
+            plans.put(name, generic(Container.API,
+                    component(AURORA_ANIMATION,
+                            site("advance", "(F)V", Opcodes.INVOKEVIRTUAL,
+                                    "com/fs/starfarer/api/impl/campaign/terrain/AuroraRenderer", "advance", "(F)V",
+                                    "advanceAurora",
+                                    "(Lcom/fs/starfarer/api/impl/campaign/terrain/AuroraRenderer;F)V", 1))));
+        }
+        plans.put("com/fs/starfarer/api/impl/campaign/terrain/HyperspaceTerrainPlugin",
+                generic(Container.API, component(CONTINUOUS_SOUND,
+                        lowPass("advance", "(F)V", 1))));
+        plans.put("com/fs/starfarer/api/impl/campaign/terrain/RadioChatterTerrainPlugin",
+                generic(Container.API, component(CONTINUOUS_SOUND,
+                        suppressMusic("applyEffect", "(Lcom/fs/starfarer/api/campaign/SectorEntityToken;F)V", 1),
+                        playLoop("applyEffect", "(Lcom/fs/starfarer/api/campaign/SectorEntityToken;F)V", 1))));
+        plans.put("com/fs/starfarer/api/impl/campaign/velfield/SlipstreamTerrainPlugin2",
+                generic(Container.API,
+                        component(SLIPSTREAM_PARTICLES,
+                                site("advance", "(F)V", Opcodes.INVOKEVIRTUAL,
+                                        "com/fs/starfarer/api/impl/campaign/velfield/SlipstreamTerrainPlugin2",
+                                        "addParticles", "()V", "addSlipstreamTerrainParticles",
+                                        "(Lcom/fs/starfarer/api/impl/campaign/velfield/SlipstreamTerrainPlugin2;)V", 1),
+                                site("advance", "(F)V", Opcodes.INVOKEVIRTUAL,
+                                        "com/fs/starfarer/api/impl/campaign/velfield/SlipstreamTerrainPlugin2",
+                                        "advanceParticles", "(F)V", "advanceSlipstreamTerrainParticles",
+                                        "(Lcom/fs/starfarer/api/impl/campaign/velfield/SlipstreamTerrainPlugin2;F)V", 1)),
+                        component(CONTINUOUS_SOUND,
+                                lowPass("doSoundPlayback", "(F)V", 1),
+                                site("doSoundPlayback", "(F)V", Opcodes.INVOKEINTERFACE,
+                                        "com/fs/starfarer/api/SoundPlayerAPI", "playLoop",
+                                        "(Ljava/lang/String;Ljava/lang/Object;FFLorg/lwjgl/util/vector/Vector2f;Lorg/lwjgl/util/vector/Vector2f;FF)V",
+                                        "playLoopWithRange",
+                                        "(Lcom/fs/starfarer/api/SoundPlayerAPI;Ljava/lang/String;Ljava/lang/Object;FFLorg/lwjgl/util/vector/Vector2f;Lorg/lwjgl/util/vector/Vector2f;FF)V", 2),
+                                suppressMusic("doSoundPlayback", "(F)V", 1))));
+        plans.put("com/fs/starfarer/api/impl/campaign/velfield/SlipstreamEntityPlugin2",
+                generic(Container.API, component(SLIPSTREAM_PARTICLES,
+                        site("advance", "(F)V", Opcodes.INVOKEVIRTUAL,
+                                "com/fs/starfarer/api/impl/campaign/velfield/SlipstreamEntityPlugin2",
+                                "addParticles", "()V", "addSlipstreamEntityParticles",
+                                "(Lcom/fs/starfarer/api/impl/campaign/velfield/SlipstreamEntityPlugin2;)V", 1),
+                        site("advance", "(F)V", Opcodes.INVOKEVIRTUAL,
+                                "com/fs/starfarer/api/impl/campaign/velfield/SlipstreamEntityPlugin2",
+                                "advanceParticles", "(F)V", "advanceSlipstreamEntityParticles",
+                                "(Lcom/fs/starfarer/api/impl/campaign/velfield/SlipstreamEntityPlugin2;F)V", 1))));
+        plans.put("com/fs/starfarer/api/impl/campaign/terrain/BaseTerrain",
+                generic(Container.API, component(CONTINUOUS_SOUND,
+                        suppressMusic("advance", "(F)V", 4), playLoop("advance", "(F)V", 4))));
+        for (String name : List.of(
+                "com/fs/starfarer/api/impl/campaign/abilities/BaseDurationAbility",
+                "com/fs/starfarer/api/impl/campaign/abilities/BaseToggleAbility")) {
+            plans.put(name, generic(Container.API, component(CONTINUOUS_SOUND,
+                    suppressMusic("advance", "(F)V", 2), playLoop("advance", "(F)V", 2))));
+        }
+        plans.put("com/fs/starfarer/api/impl/campaign/abilities/GenerateSlipsurgeAbility$SlipsurgeEffectScript",
+                generic(Container.API, component(CONTINUOUS_SOUND,
+                        suppressMusic("advance", "(F)V", 1), playLoop("advance", "(F)V", 1))));
+        plans.put("com/fs/starfarer/api/impl/campaign/entities/GateHaulerEntityPlugin",
+                generic(Container.API, component(CONTINUOUS_SOUND,
+                        playLoop("advance", "(F)V", 1))));
+        plans.put("com/fs/starfarer/api/impl/campaign/GateEntityPlugin", generic(Container.API,
+                component(CONTINUOUS_SOUND,
+                        suppressMusic("playProximityLoop", "()V", 1),
+                        playLoop("playProximityLoop", "()V", 2)),
+                component(GATE_JITTER,
+                        site("advance", "(F)V", Opcodes.INVOKEVIRTUAL,
+                                "com/fs/starfarer/api/util/FaderUtil", "advance", "(F)V",
+                                "advanceGateFader",
+                                "(Lcom/fs/starfarer/api/util/FaderUtil;F)V", 3),
+                        site("advance", "(F)V", Opcodes.INVOKEVIRTUAL,
+                                "com/fs/starfarer/api/util/WarpingSpriteRendererUtil", "advance", "(F)V",
+                                "advanceGateWarp",
+                                "(Lcom/fs/starfarer/api/util/WarpingSpriteRendererUtil;F)V", 1),
+                        site("advance", "(F)V", Opcodes.INVOKEVIRTUAL,
+                                "com/fs/starfarer/api/util/JitterUtil", "updateSeed", "()V",
+                                "updateGateJitter",
+                                "(Lcom/fs/starfarer/api/util/JitterUtil;)V", 1)),
+                component(PARTICLE_EMITTERS, emitter("advance", "(F)V", 1))));
+        for (String name : List.of(
+                "com/fs/starfarer/api/impl/campaign/world/MoteParticleScript",
+                "com/fs/starfarer/api/impl/campaign/CoronalTapParticleScript",
+                "com/fs/starfarer/api/impl/campaign/world/ZigLeashAssignmentAI")) {
+            plans.put(name, generic(Container.API,
+                    component(PARTICLE_EMITTERS, emitter("advance", "(F)V", 1))));
+        }
+        PLANS = Collections.unmodifiableMap(plans);
+        TARGET_CLASSES = Collections.unmodifiableSet(new LinkedHashSet<>(plans.keySet()));
+    }
+
     private final PrepatcherConfig config;
     private final ClassLoader runtimeLoader;
 
@@ -100,9 +343,7 @@ public final class FastForwardPresentationTransformer implements ClassFileTransf
     @Override
     public byte[] transform(ClassLoader loader, String className, Class<?> classBeingRedefined,
                             ProtectionDomain protectionDomain, byte[] classfileBuffer) {
-        Target target;
-        if (className == null || (target = TARGETS.get(className)) == null
-                || !isTargetEnabled(className)) {
+        if (className == null || !PLANS.containsKey(className) || !isTargetEnabled(className)) {
             return null;
         }
         if (runtimeLoader != null && loader != runtimeLoader) {
@@ -113,480 +354,111 @@ public final class FastForwardPresentationTransformer implements ClassFileTransf
             return null;
         }
         try {
-            if (!sha256(classfileBuffer).equals(target.classSha256())) {
-                recordStatus(className, "SKIPPED_CLASS_HASH");
-                logOnce(className + ":hash", "Fast-forward presentation patch skipped "
-                        + className + ": class SHA-256 mismatch");
+            byte[] transformed = transformStructural(className, classfileBuffer);
+            if (transformed == null) {
+                recordStatus(className, "ALREADY_APPLIED");
                 return null;
             }
-            if (config.fastForwardGuardJar
-                    && !validContainer(loader, className, classfileBuffer,
-                    protectionDomain, target.container())) {
-                recordStatus(className, "SKIPPED_CONTAINER_HASH");
-                logOnce(className + ":jar", "Fast-forward presentation patch skipped "
-                        + className + ": "
-                        + target.container().fileName + " guard failed");
-                return null;
-            }
-            byte[] transformed = transformVerified(className, classfileBuffer);
-            if (transformed != null) {
-                recordStatus(className, "APPLIED");
-                if (config.fastForwardVerbose) {
-                    PrepatcherLog.info("APPLIED fast-forward presentation coalescing to "
-                            + className + ", bytes " + classfileBuffer.length
-                            + " -> " + transformed.length);
-                }
+            recordStatus(className, "APPLIED");
+            if (config.fastForwardVerbose) {
+                PrepatcherLog.info("APPLIED structural fast-forward presentation plan to "
+                        + className + ", bytes " + classfileBuffer.length
+                        + " -> " + transformed.length);
             }
             return transformed;
+        } catch (StructuralMismatch mismatch) {
+            recordStatus(className, "SKIPPED_STRUCTURAL");
+            logOnce(className + ":structural:" + mismatch.getMessage(),
+                    "Fast-forward presentation patch skipped " + className + ": "
+                            + mismatch.getMessage());
+            return null;
         } catch (Throwable failure) {
             recordStatus(className, "SKIPPED_ERROR");
             PrepatcherLog.error("Fast-forward presentation patch failed for "
-                    + className + "; using vanilla bytes", failure);
+                    + className + "; using input bytes", failure);
             return null;
         }
     }
 
-    /** Test entry point: exact class hash is required; container check is bypassed. */
+    /** Test entry point. Compatibility is structural; no class or container hash is consulted. */
     public byte[] transformBytesForTest(String className, byte[] classfileBuffer) {
-        Target target = TARGETS.get(className);
-        if (target == null) throw new IllegalArgumentException("not a target: " + className);
-        if (!sha256(classfileBuffer).equals(target.classSha256())) {
-            throw new IllegalArgumentException("class hash mismatch: " + className);
+        if (!PLANS.containsKey(className)) {
+            throw new IllegalArgumentException("not a target: " + className);
         }
-        return transformVerified(className, classfileBuffer);
+        if (!isTargetEnabled(className)) return null;
+        return transformStructural(className, classfileBuffer);
     }
 
     public Set<String> targetClassesForTest() {
-        return TARGETS.keySet();
+        return TARGET_CLASSES;
     }
 
     public String targetJarForTest(String className) {
-        Target target = TARGETS.get(className);
-        if (target == null) throw new IllegalArgumentException("not a target: " + className);
-        return target.container().fileName;
+        PresentationClassPlan plan = PLANS.get(className);
+        if (plan == null) throw new IllegalArgumentException("not a target: " + className);
+        return plan.container.fileName;
     }
 
-    private byte[] transformVerified(String className, byte[] original) {
-        if (className.equals("com/fs/starfarer/campaign/CampaignState")
-                && (!config.fastForwardFrameMarker || !anyPresentationPatch())) {
-            return null;
-        }
+    record TestCallSite(String methodName, String methodDesc, int originalOpcode,
+                        String originalOwner, String originalName, String originalDesc,
+                        int expectedCount) {}
 
-        ClassNode node = new ClassNode(Opcodes.ASM8);
-        new ClassReader(original).accept(node, 0);
-        int changes = switch (className) {
-            case "com/fs/starfarer/campaign/CampaignState" -> patchCampaignState(node);
-            case "com/fs/starfarer/campaign/CampaignEngine" -> patchCampaignEngine(node);
-            case "com/fs/starfarer/campaign/BaseLocation" -> patchBaseLocation(node);
-            case "com/fs/starfarer/campaign/BaseCampaignEntity" -> patchBaseCampaignEntity(node);
-            case "com/fs/starfarer/campaign/fleet/CampaignFleet" -> patchCampaignFleet(node);
-            case "com/fs/starfarer/campaign/SensorContactIndicatorManager" -> patchSensorContactManager(node);
-            case "com/fs/starfarer/campaign/CampaignPlanet" -> patchCampaignPlanet(node);
-            case "com/fs/starfarer/campaign/JumpPoint" -> patchJumpPoint(node);
-
-            case "com/fs/starfarer/api/impl/campaign/terrain/StarCoronaTerrainPlugin",
-                 "com/fs/starfarer/api/impl/campaign/terrain/MagneticFieldTerrainPlugin",
-                 "com/fs/starfarer/api/impl/campaign/terrain/SpatialAnomalyTerrainPlugin" -> patchAuroraCaller(node);
-            case "com/fs/starfarer/api/impl/campaign/terrain/HyperspaceTerrainPlugin" -> patchHyperspaceTerrain(node);
-            case "com/fs/starfarer/api/impl/campaign/terrain/RadioChatterTerrainPlugin" -> patchRadioChatter(node);
-            case "com/fs/starfarer/api/impl/campaign/velfield/SlipstreamTerrainPlugin2" -> patchSlipstreamTerrain(node);
-            case "com/fs/starfarer/api/impl/campaign/velfield/SlipstreamEntityPlugin2" -> patchSlipstreamEntity(node);
-            case "com/fs/starfarer/api/impl/campaign/terrain/BaseTerrain" -> patchBaseTerrain(node);
-            case "com/fs/starfarer/api/impl/campaign/abilities/BaseDurationAbility",
-                 "com/fs/starfarer/api/impl/campaign/abilities/BaseToggleAbility" -> patchBaseAbility(node);
-            case "com/fs/starfarer/api/impl/campaign/abilities/GenerateSlipsurgeAbility$SlipsurgeEffectScript" -> patchSlipsurge(node);
-            case "com/fs/starfarer/api/impl/campaign/entities/GateHaulerEntityPlugin" -> patchGateHauler(node);
-            case "com/fs/starfarer/api/impl/campaign/GateEntityPlugin" -> patchGate(node);
-            case "com/fs/starfarer/api/impl/campaign/world/MoteParticleScript",
-                 "com/fs/starfarer/api/impl/campaign/CoronalTapParticleScript",
-                 "com/fs/starfarer/api/impl/campaign/world/ZigLeashAssignmentAI" -> patchEmitter(node);
-            default -> 0;
-        };
-        if (changes == 0) return null;
-
-        int compositionMask = PresentationStructuralContract.expectedMask(className, config);
-        if (compositionMask != 0) {
-            PresentationStructuralContract.addOwnership(node, compositionMask);
-            PresentationStructuralContract.inspectNode(className, node, config);
-        }
-
-        ClassWriter writer = new ClassWriter(ClassWriter.COMPUTE_MAXS);
-        node.accept(writer);
-        byte[] transformed = writer.toByteArray();
-        if (compositionMask != 0) {
-            PresentationStructuralContract.inspect(className, transformed, config);
-        }
-        return transformed;
-    }
-
-    private int patchCampaignState(ClassNode node) {
-        MethodNode method = requireMethod(node, "advance", "(FLcom/fs/starfarer/util/A/new;)V");
-        java.util.List<MethodInsnNode> flagCalls = findCalls(method,
-                "com/fs/starfarer/campaign/CampaignEngine", "setFastForwardIteration", "(Z)V");
-        java.util.List<MethodInsnNode> advanceCalls = findCalls(method,
-                "com/fs/starfarer/campaign/CampaignEngine", "advance", "(FLcom/fs/starfarer/util/A/new;)V");
-        requireCount(node.name + ".advance setFastForwardIteration", flagCalls.size(), 3);
-        requireCount(node.name + ".advance CampaignEngine.advance", advanceCalls.size(), 1);
-        if (method.maxLocals <= 13) throw new IllegalStateException("CampaignState.advance local layout changed");
-
-        InsnList begin = new InsnList();
-        begin.add(new VarInsnNode(Opcodes.ILOAD, 9));
-        begin.add(new MethodInsnNode(Opcodes.INVOKESTATIC, RUNTIME, "beginOuterFrame", "(I)V", false));
-        method.instructions.insertBefore(flagCalls.get(0), begin);
-
-        InsnList beforeStep = new InsnList();
-        beforeStep.add(new VarInsnNode(Opcodes.ILOAD, 13));
-        beforeStep.add(new VarInsnNode(Opcodes.ILOAD, 9));
-        beforeStep.add(new MethodInsnNode(Opcodes.INVOKESTATIC, RUNTIME, "beforeSubstep", "(II)V", false));
-        method.instructions.insertBefore(advanceCalls.get(0), beforeStep);
-
-        InsnList end = new InsnList();
-        end.add(new MethodInsnNode(Opcodes.INVOKESTATIC, RUNTIME, "endOuterFrame", "()V", false));
-        method.instructions.insert(flagCalls.get(flagCalls.size() - 1), end);
-        return 3;
-    }
-
-    private int patchCampaignEngine(ClassNode node) {
-        MethodNode method = requireMethod(node, "advance", "(FLcom/fs/starfarer/util/A/new;)V");
-        int changes = 0;
-        if (config.fastForwardActionIndicators) {
-            changes += replaceCalls(node.name, method,
-                    "com/fs/starfarer/campaign/ActionIndicator", "advance", "(F)V", 1,
-                    "advanceActionIndicator", "(Lcom/fs/starfarer/campaign/ActionIndicator;F)V");
-        }
-        if (config.fastForwardGlobalAnimations) {
-            changes += replaceCalls(node.name, method,
-                    "com/fs/graphics/anim/AnimationManager", "advanceAll", "(F)V", 2,
-                    "advanceAnimationManager", "(Lcom/fs/graphics/anim/AnimationManager;F)V");
-        }
-        return changes;
-    }
-
-    private int patchBaseLocation(ClassNode node) {
-        if (!config.fastForwardLocationVisuals) return 0;
-        MethodNode method = requireMethod(node, "advance", "(FLcom/fs/starfarer/util/A/new;)V");
-        int changes = 0;
-        changes += replaceCalls(node.name, method,
-                "com/fs/graphics/util/Fader", "advance", "(F)V", 1,
-                "advanceLocationLightFader", "(Lcom/fs/graphics/util/Fader;F)V");
-        changes += replaceCalls(node.name, method,
-                "com/fs/starfarer/campaign/BackgroundAndStars", "advance", "(F)V", 1,
-                "advanceBackground", "(Lcom/fs/starfarer/campaign/BackgroundAndStars;F)V");
-        changes += replaceCalls(node.name, method,
-                "com/fs/graphics/particle/DynamicParticleGroup", "advance", "(F)V", 1,
-                "advanceParticleGroup", "(Lcom/fs/graphics/particle/DynamicParticleGroup;F)V");
-        return changes;
-    }
-
-    private int patchBaseCampaignEntity(ClassNode node) {
-        int changes = 0;
-        MethodNode advance = requireMethod(node, "advance", "(F)V");
-        MethodNode paused = requireMethod(node, "advanceEvenIfPaused", "(F)V");
-        if (config.fastForwardFloatingText) {
-            changes += replaceCalls(node.name, advance,
-                    "com/fs/starfarer/campaign/fleet/CampaignFloatingText", "advance", "(F)V", 1,
-                    "advanceFloatingText", "(Lcom/fs/starfarer/campaign/fleet/CampaignFloatingText;F)V");
-            changes += replaceCalls(node.name, paused,
-                    "com/fs/starfarer/campaign/fleet/CampaignFloatingText", "advance", "(F)V", 1,
-                    "advanceFloatingText", "(Lcom/fs/starfarer/campaign/fleet/CampaignFloatingText;F)V");
-        }
-        if (config.fastForwardSensorIndicators) {
-            changes += replaceCalls(node.name, advance,
-                    "com/fs/starfarer/campaign/ui/oOO0", "new", "(F)V", 1,
-                    "advanceSelectionIndicator", "(Ljava/lang/Object;F)V");
-        }
-        if (config.fastForwardSensorFaders) {
-            changes += replaceCalls(node.name, advance,
-                    "com/fs/graphics/util/Fader", "advance", "(F)V", 2,
-                    "advanceSensorFader", "(Lcom/fs/graphics/util/Fader;F)V");
-        }
-        return changes;
-    }
-
-    private int patchCampaignFleet(ClassNode node) {
-        MethodNode method = requireMethod(node, "advance", "(F)V");
-        int changes = 0;
-        if (config.fastForwardFleetView) {
-            changes += replaceCalls(node.name, method,
-                    "com/fs/starfarer/campaign/fleet/CampaignFleetView", "advance", "(F)V", 1,
-                    "advanceFleetView", "(Lcom/fs/starfarer/campaign/fleet/CampaignFleetView;F)V");
-        }
-        if (config.fastForwardFleetPresentation) {
-            changes += replaceCalls(node.name, method,
-                    "com/fs/starfarer/campaign/fleet/FleetAbilityRenderer", "updateLayers", "()V", 1,
-                    "updateFleetAbilityLayers", "(Lcom/fs/starfarer/campaign/fleet/FleetAbilityRenderer;)V");
-            changes += replaceCalls(node.name, method,
-                    "com/fs/starfarer/campaign/fleet/CampaignFleetView", "clear", "()V", 1,
-                    "clearFleetView", "(Lcom/fs/starfarer/campaign/fleet/CampaignFleetView;)V");
-            changes += replaceCalls(node.name, method,
-                    "com/fs/starfarer/campaign/E", "Ò00000", "(F)V", 1,
-                    "advanceSensorRangeIndicator", "(Lcom/fs/starfarer/campaign/E;F)V");
-            java.util.List<MethodInsnNode> fleetFaders = findCalls(method,
-                    "com/fs/graphics/util/Fader", "advance", "(F)V");
-            requireCount(node.name + ".advance fleet Faders", fleetFaders.size(), 2);
-            replaceOneCall(fleetFaders.get(1), "advanceFleetPulseFader",
-                    "(Lcom/fs/graphics/util/Fader;F)V");
-            changes++;
-        }
-        return changes;
-    }
-
-    private int patchSensorContactManager(ClassNode node) {
-        if (!config.fastForwardSensorIndicators) return 0;
-        MethodNode method = requireMethod(node, "advance", "(F)V");
-        return replaceCalls(node.name, method,
-                "com/fs/starfarer/campaign/SensorContactIndicatorManager$SensorContactIndicator",
-                "advance", "(F)V", 1,
-                "advanceSensorContactIndicator",
-                "(Lcom/fs/starfarer/campaign/SensorContactIndicatorManager$SensorContactIndicator;F)V");
-    }
-
-    private int patchCampaignPlanet(ClassNode node) {
-        if (!config.fastForwardCelestialVisuals) return 0;
-        MethodNode method = requireMethod(node, "advance", "(F)V");
-        return replaceCalls(node.name, method,
-                "com/fs/starfarer/combat/entities/terrain/Planet", "advance", "(F)V", 1,
-                "advancePlanetGraphics", "(Lcom/fs/starfarer/combat/entities/terrain/Planet;F)V");
-    }
-
-    private int patchJumpPoint(ClassNode node) {
-        if (!config.fastForwardCelestialVisuals) return 0;
-        MethodNode method = requireMethod(node, "advance", "(F)V");
-        int changes = 0;
-        changes += replaceCalls(node.name, method,
-                "com/fs/starfarer/campaign/DynamicRingBand", "advance", "(F)V", 1,
-                "advanceDynamicRingBand", "(Lcom/fs/starfarer/campaign/DynamicRingBand;F)V");
-        changes += replaceCalls(node.name, method,
-                "com/fs/starfarer/campaign/JumpPoint$RingData", "advance", "(F)V", 2,
-                "advanceJumpRingData", "(Lcom/fs/starfarer/campaign/JumpPoint$RingData;F)V");
-        changes += replaceCalls(node.name, method,
-                "com/fs/starfarer/campaign/JumpPoint$CoronaData", "advance", "(F)V", 1,
-                "advanceJumpCoronaData", "(Lcom/fs/starfarer/campaign/JumpPoint$CoronaData;F)V");
-        changes += replaceCalls(node.name, method,
-                "com/fs/starfarer/combat/entities/terrain/Planet", "advance", "(F)V", 1,
-                "advancePlanetGraphics", "(Lcom/fs/starfarer/combat/entities/terrain/Planet;F)V");
-        return changes;
-    }
-
-    private int patchAuroraCaller(ClassNode node) {
-        if (!config.fastForwardAuroraAnimation) return 0;
-        MethodNode method = requireMethod(node, "advance", "(F)V");
-        return replaceCalls(node.name, method,
-                "com/fs/starfarer/api/impl/campaign/terrain/AuroraRenderer", "advance", "(F)V", 1,
-                "advanceAurora", "(Lcom/fs/starfarer/api/impl/campaign/terrain/AuroraRenderer;F)V");
-    }
-
-    private int patchHyperspaceTerrain(ClassNode node) {
-        if (!config.fastForwardContinuousSound) return 0;
-        MethodNode method = requireMethod(node, "advance", "(F)V");
-        return replaceLowPass(node.name, method, 1);
-    }
-
-    private int patchRadioChatter(ClassNode node) {
-        if (!config.fastForwardContinuousSound) return 0;
-        MethodNode method = requireMethod(node, "applyEffect",
-                "(Lcom/fs/starfarer/api/campaign/SectorEntityToken;F)V");
-        return replaceSuppressMusic(node.name, method, 1)
-                + replaceStandardPlayLoop(node.name, method, 1);
-    }
-
-    private int patchSlipstreamTerrain(ClassNode node) {
-        int changes = 0;
-        if (config.fastForwardSlipstreamParticles) {
-            MethodNode advance = requireMethod(node, "advance", "(F)V");
-            changes += replaceCalls(node.name, advance,
-                    node.name, "addParticles", "()V", 1,
-                    "addSlipstreamTerrainParticles",
-                    "(Lcom/fs/starfarer/api/impl/campaign/velfield/SlipstreamTerrainPlugin2;)V");
-            changes += replaceCalls(node.name, advance,
-                    node.name, "advanceParticles", "(F)V", 1,
-                    "advanceSlipstreamTerrainParticles",
-                    "(Lcom/fs/starfarer/api/impl/campaign/velfield/SlipstreamTerrainPlugin2;F)V");
-        }
-        if (config.fastForwardContinuousSound) {
-            MethodNode sound = requireMethod(node, "doSoundPlayback", "(F)V");
-            changes += replaceLowPass(node.name, sound, 1);
-            changes += replaceCalls(node.name, sound,
-                    "com/fs/starfarer/api/SoundPlayerAPI", "playLoop",
-                    "(Ljava/lang/String;Ljava/lang/Object;FFLorg/lwjgl/util/vector/Vector2f;Lorg/lwjgl/util/vector/Vector2f;FF)V", 2,
-                    "playLoopWithRange",
-                    "(Lcom/fs/starfarer/api/SoundPlayerAPI;Ljava/lang/String;Ljava/lang/Object;FFLorg/lwjgl/util/vector/Vector2f;Lorg/lwjgl/util/vector/Vector2f;FF)V");
-            changes += replaceSuppressMusic(node.name, sound, 1);
-        }
-        return changes;
-    }
-
-    private int patchSlipstreamEntity(ClassNode node) {
-        if (!config.fastForwardSlipstreamParticles) return 0;
-        MethodNode advance = requireMethod(node, "advance", "(F)V");
-        int changes = 0;
-        changes += replaceCalls(node.name, advance,
-                node.name, "addParticles", "()V", 1,
-                "addSlipstreamEntityParticles",
-                "(Lcom/fs/starfarer/api/impl/campaign/velfield/SlipstreamEntityPlugin2;)V");
-        changes += replaceCalls(node.name, advance,
-                node.name, "advanceParticles", "(F)V", 1,
-                "advanceSlipstreamEntityParticles",
-                "(Lcom/fs/starfarer/api/impl/campaign/velfield/SlipstreamEntityPlugin2;F)V");
-        return changes;
-    }
-
-    private int patchBaseTerrain(ClassNode node) {
-        if (!config.fastForwardContinuousSound) return 0;
-        MethodNode method = requireMethod(node, "advance", "(F)V");
-        return replaceSuppressMusic(node.name, method, 4) + replaceStandardPlayLoop(node.name, method, 4);
-    }
-
-    private int patchBaseAbility(ClassNode node) {
-        if (!config.fastForwardContinuousSound) return 0;
-        MethodNode method = requireMethod(node, "advance", "(F)V");
-        return replaceSuppressMusic(node.name, method, 2) + replaceStandardPlayLoop(node.name, method, 2);
-    }
-
-    private int patchSlipsurge(ClassNode node) {
-        if (!config.fastForwardContinuousSound) return 0;
-        MethodNode method = requireMethod(node, "advance", "(F)V");
-        return replaceSuppressMusic(node.name, method, 1) + replaceStandardPlayLoop(node.name, method, 1);
-    }
-
-    private int patchGateHauler(ClassNode node) {
-        if (!config.fastForwardContinuousSound) return 0;
-        MethodNode method = requireMethod(node, "advance", "(F)V");
-        return replaceStandardPlayLoop(node.name, method, 1);
-    }
-
-    private int patchGate(ClassNode node) {
-        int changes = 0;
-        if (config.fastForwardContinuousSound) {
-            MethodNode sound = requireMethod(node, "playProximityLoop", "()V");
-            changes += replaceSuppressMusic(node.name, sound, 1);
-            changes += replaceStandardPlayLoop(node.name, sound, 2);
-        }
-        MethodNode advance = requireMethod(node, "advance", "(F)V");
-        if (config.fastForwardGateJitter) {
-            changes += replaceCalls(node.name, advance,
-                    "com/fs/starfarer/api/util/FaderUtil", "advance", "(F)V", 3,
-                    "advanceGateFader", "(Lcom/fs/starfarer/api/util/FaderUtil;F)V");
-            changes += replaceCalls(node.name, advance,
-                    "com/fs/starfarer/api/util/WarpingSpriteRendererUtil", "advance", "(F)V", 1,
-                    "advanceGateWarp", "(Lcom/fs/starfarer/api/util/WarpingSpriteRendererUtil;F)V");
-            changes += replaceCalls(node.name, advance,
-                    "com/fs/starfarer/api/util/JitterUtil", "updateSeed", "()V", 1,
-                    "updateGateJitter", "(Lcom/fs/starfarer/api/util/JitterUtil;)V");
-        }
-        if (config.fastForwardParticleEmitters) {
-            changes += replaceEmitterInterval(node.name, advance, 1);
-        }
-        return changes;
-    }
-
-    private int patchEmitter(ClassNode node) {
-        if (!config.fastForwardParticleEmitters) return 0;
-        MethodNode method = requireMethod(node, "advance", "(F)V");
-        return replaceEmitterInterval(node.name, method, 1);
-    }
-
-    private static int replaceStandardPlayLoop(String className, MethodNode method, int expected) {
-        return replaceCalls(className, method,
-                "com/fs/starfarer/api/SoundPlayerAPI", "playLoop",
-                "(Ljava/lang/String;Ljava/lang/Object;FFLorg/lwjgl/util/vector/Vector2f;Lorg/lwjgl/util/vector/Vector2f;)V", expected,
-                "playLoop",
-                "(Lcom/fs/starfarer/api/SoundPlayerAPI;Ljava/lang/String;Ljava/lang/Object;FFLorg/lwjgl/util/vector/Vector2f;Lorg/lwjgl/util/vector/Vector2f;)V");
-    }
-
-    private static int replaceSuppressMusic(String className, MethodNode method, int expected) {
-        return replaceCalls(className, method,
-                "com/fs/starfarer/api/campaign/CampaignUIAPI", "suppressMusic", "(F)V", expected,
-                "suppressMusic", "(Lcom/fs/starfarer/api/campaign/CampaignUIAPI;F)V");
-    }
-
-    private static int replaceLowPass(String className, MethodNode method, int expected) {
-        return replaceCalls(className, method,
-                "com/fs/starfarer/api/SoundPlayerAPI", "applyLowPassFilter", "(FF)V", expected,
-                "applyLowPassFilter", "(Lcom/fs/starfarer/api/SoundPlayerAPI;FF)V");
-    }
-
-    private static int replaceEmitterInterval(String className, MethodNode method, int expected) {
-        return replaceCalls(className, method,
-                "com/fs/starfarer/api/util/IntervalUtil", "advance", "(F)V", expected,
-                "advanceEmitterInterval", "(Lcom/fs/starfarer/api/util/IntervalUtil;F)V");
-    }
-
-    private static void replaceOneCall(MethodInsnNode call,
-                                       String wrapperName, String wrapperDescriptor) {
-        call.setOpcode(Opcodes.INVOKESTATIC);
-        call.owner = RUNTIME;
-        call.name = wrapperName;
-        call.desc = wrapperDescriptor;
-        call.itf = false;
-    }
-
-    private static int replaceCalls(String className, MethodNode method,
-                                    String owner, String name, String descriptor, int expected,
-                                    String wrapperName, String wrapperDescriptor) {
-        java.util.List<MethodInsnNode> calls = findCalls(method, owner, name, descriptor);
-        requireCount(className + "." + method.name + method.desc + " -> " + owner + "." + name,
-                calls.size(), expected);
-        for (MethodInsnNode call : calls) {
-            call.setOpcode(Opcodes.INVOKESTATIC);
-            call.owner = RUNTIME;
-            call.name = wrapperName;
-            call.desc = wrapperDescriptor;
-            call.itf = false;
-        }
-        return calls.size();
-    }
-
-    private static java.util.List<MethodInsnNode> findCalls(MethodNode method,
-                                                             String owner, String name, String descriptor) {
-        java.util.ArrayList<MethodInsnNode> result = new java.util.ArrayList<>();
-        for (AbstractInsnNode insn = method.instructions.getFirst(); insn != null; insn = insn.getNext()) {
-            if (insn instanceof MethodInsnNode call
-                    && call.owner.equals(owner)
-                    && call.name.equals(name)
-                    && call.desc.equals(descriptor)) {
-                result.add(call);
+    List<TestCallSite> callSitesForTest(String className) {
+        PresentationClassPlan plan = PLANS.get(className);
+        if (plan == null) throw new IllegalArgumentException("not a target: " + className);
+        List<TestCallSite> result = new ArrayList<>();
+        for (Component component : plan.components) {
+            for (CallSiteSpec site : component.sites) {
+                result.add(new TestCallSite(site.methodName, site.methodDesc,
+                        site.originalOpcode, site.originalOwner, site.originalName,
+                        site.originalDesc, site.expectedCount));
             }
         }
-        return result;
+        return Collections.unmodifiableList(result);
     }
 
-    private static MethodNode requireMethod(ClassNode node, String name, String descriptor) {
-        for (MethodNode method : node.methods) {
-            if (method.name.equals(name) && method.desc.equals(descriptor)) return method;
-        }
-        throw new IllegalStateException("method not found: " + node.name + "." + name + descriptor);
+    boolean specialPlanForTest(String className) {
+        PresentationClassPlan plan = PLANS.get(className);
+        if (plan == null) throw new IllegalArgumentException("not a target: " + className);
+        return plan.kind != PlanKind.GENERIC;
     }
 
-    private static void requireCount(String what, int actual, int expected) {
-        if (actual != expected) throw new IllegalStateException(what + ": expected " + expected + ", found " + actual);
+    int expectedHookCountForTest(String className, PrepatcherConfig testConfig) {
+        PresentationClassPlan plan = PLANS.get(className);
+        if (plan == null) throw new IllegalArgumentException("not a target: " + className);
+        int mask = requestedMaskForClass(className, testConfig);
+        if (mask == 0) return 0;
+        int count = 0;
+        for (int value : expectedHooks(plan, mask).values()) count += value;
+        return count;
     }
 
-    boolean isTargetEnabled(String className) {
-        if (!config.fastForwardEnabled || !config.fastForwardFrameMarker
-                || !anyPresentationPatch()) {
-            return false;
-        }
+    static int requestedMaskForClass(String className, PrepatcherConfig config) {
+        if (!config.fastForwardEnabled || !config.fastForwardFrameMarker) return 0;
         return switch (className) {
-            case "com/fs/starfarer/campaign/CampaignState" -> true;
+            case "com/fs/starfarer/campaign/CampaignState" ->
+                    anyPresentationPatch(config) ? FRAME_MARKER : 0;
             case "com/fs/starfarer/campaign/CampaignEngine" ->
-                    config.fastForwardActionIndicators || config.fastForwardGlobalAnimations;
+                    (config.fastForwardActionIndicators ? ACTION_INDICATORS : 0)
+                            | (config.fastForwardGlobalAnimations ? GLOBAL_ANIMATIONS : 0);
             case "com/fs/starfarer/campaign/BaseLocation" ->
-                    config.fastForwardLocationVisuals;
+                    config.fastForwardLocationVisuals ? LOCATION_VISUALS : 0;
             case "com/fs/starfarer/campaign/BaseCampaignEntity" ->
-                    config.fastForwardFloatingText || config.fastForwardSensorIndicators
-                            || config.fastForwardSensorFaders;
+                    (config.fastForwardFloatingText ? FLOATING_TEXT : 0)
+                            | (config.fastForwardSensorIndicators ? SENSOR_INDICATORS : 0)
+                            | (config.fastForwardSensorFaders ? SENSOR_FADERS : 0);
             case "com/fs/starfarer/campaign/fleet/CampaignFleet" ->
-                    config.fastForwardFleetView || config.fastForwardFleetPresentation;
+                    (config.fastForwardFleetView ? FLEET_VIEW : 0)
+                            | (config.fastForwardFleetPresentation ? FLEET_PRESENTATION : 0);
             case "com/fs/starfarer/campaign/SensorContactIndicatorManager" ->
-                    config.fastForwardSensorIndicators;
+                    config.fastForwardSensorIndicators ? SENSOR_INDICATORS : 0;
             case "com/fs/starfarer/campaign/CampaignPlanet",
                  "com/fs/starfarer/campaign/JumpPoint" ->
-                    config.fastForwardCelestialVisuals;
+                    config.fastForwardCelestialVisuals ? CELESTIAL_VISUALS : 0;
             case "com/fs/starfarer/api/impl/campaign/terrain/StarCoronaTerrainPlugin",
                  "com/fs/starfarer/api/impl/campaign/terrain/MagneticFieldTerrainPlugin",
                  "com/fs/starfarer/api/impl/campaign/terrain/SpatialAnomalyTerrainPlugin" ->
-                    config.fastForwardAuroraAnimation;
+                    config.fastForwardAuroraAnimation ? AURORA_ANIMATION : 0;
             case "com/fs/starfarer/api/impl/campaign/terrain/HyperspaceTerrainPlugin",
                  "com/fs/starfarer/api/impl/campaign/terrain/RadioChatterTerrainPlugin",
                  "com/fs/starfarer/api/impl/campaign/terrain/BaseTerrain",
@@ -594,24 +466,520 @@ public final class FastForwardPresentationTransformer implements ClassFileTransf
                  "com/fs/starfarer/api/impl/campaign/abilities/BaseToggleAbility",
                  "com/fs/starfarer/api/impl/campaign/abilities/GenerateSlipsurgeAbility$SlipsurgeEffectScript",
                  "com/fs/starfarer/api/impl/campaign/entities/GateHaulerEntityPlugin" ->
-                    config.fastForwardContinuousSound;
+                    config.fastForwardContinuousSound ? CONTINUOUS_SOUND : 0;
             case "com/fs/starfarer/api/impl/campaign/velfield/SlipstreamTerrainPlugin2" ->
-                    config.fastForwardContinuousSound
-                            || config.fastForwardSlipstreamParticles;
+                    (config.fastForwardContinuousSound ? CONTINUOUS_SOUND : 0)
+                            | (config.fastForwardSlipstreamParticles ? SLIPSTREAM_PARTICLES : 0);
             case "com/fs/starfarer/api/impl/campaign/velfield/SlipstreamEntityPlugin2" ->
-                    config.fastForwardSlipstreamParticles;
+                    config.fastForwardSlipstreamParticles ? SLIPSTREAM_PARTICLES : 0;
             case "com/fs/starfarer/api/impl/campaign/GateEntityPlugin" ->
-                    config.fastForwardContinuousSound || config.fastForwardGateJitter
-                            || config.fastForwardParticleEmitters;
+                    (config.fastForwardContinuousSound ? CONTINUOUS_SOUND : 0)
+                            | (config.fastForwardGateJitter ? GATE_JITTER : 0)
+                            | (config.fastForwardParticleEmitters ? PARTICLE_EMITTERS : 0);
             case "com/fs/starfarer/api/impl/campaign/world/MoteParticleScript",
                  "com/fs/starfarer/api/impl/campaign/CoronalTapParticleScript",
                  "com/fs/starfarer/api/impl/campaign/world/ZigLeashAssignmentAI" ->
-                    config.fastForwardParticleEmitters;
-            default -> false;
+                    config.fastForwardParticleEmitters ? PARTICLE_EMITTERS : 0;
+            default -> 0;
         };
     }
 
-    private boolean anyPresentationPatch() {
+    boolean isTargetEnabled(String className) {
+        return requestedMaskForClass(className, config) != 0;
+    }
+
+    private byte[] transformStructural(String className, byte[] original) {
+        PresentationClassPlan plan = PLANS.get(className);
+        int requestedMask = requestedMaskForClass(className, config);
+        if (plan == null || requestedMask == 0) return null;
+
+        ClassNode input = read(original);
+        PresentationInspection inspection = inspect(plan, input, requestedMask);
+        if (inspection.state == State.COMPLETE_PATCHED) return null;
+
+        ClassNode candidate = cloneNode(input);
+        apply(plan, candidate, inspection);
+        addOwnership(candidate, requestedMask);
+        inspect(plan, candidate, requestedMask); // combined postcondition
+
+        ClassWriter writer = new ClassWriter(ClassWriter.COMPUTE_MAXS);
+        candidate.accept(writer);
+        byte[] transformed = writer.toByteArray();
+        inspect(plan, read(transformed), requestedMask);
+        return transformed;
+    }
+
+    private static PresentationInspection inspect(PresentationClassPlan plan, ClassNode node,
+                                                  int requestedMask) {
+        Ownership ownership = ownership(node);
+        Map<CallSiteSpec, List<SiteRef>> sites = new LinkedHashMap<>();
+        for (Component component : plan.components) {
+            boolean requested = (requestedMask & component.bit) != 0;
+            for (CallSiteSpec spec : component.sites) {
+                SiteClassification classification = classifyCallSite(node, spec);
+                if (ownership.present) {
+                    if (requested) classification.requirePatched(node.name, spec);
+                    else classification.requireOriginal(node.name, spec);
+                } else {
+                    classification.requireOriginal(node.name, spec);
+                }
+                if (requested && !ownership.present) sites.put(spec, classification.originalSites);
+            }
+        }
+
+        CampaignStateProtocol campaignState = null;
+        FleetPulseSite fleetPulse = null;
+        if (plan.kind == PlanKind.CAMPAIGN_STATE) {
+            campaignState = inspectCampaignState(node, ownership.present);
+        } else if (plan.kind == PlanKind.CAMPAIGN_FLEET) {
+            boolean requested = (requestedMask & FLEET_PRESENTATION) != 0;
+            fleetPulse = inspectFleetPulse(node, ownership.present && requested,
+                    ownership.present && !requested);
+        }
+
+        Map<HookKey, Integer> actualHooks = presentationHooks(node);
+        Map<HookKey, Integer> expectedHooks = expectedHooks(plan, requestedMask);
+        if (!ownership.present) {
+            if (!actualHooks.isEmpty()) {
+                throw mismatch(node.name + ": presentation hooks exist without ownership: "
+                        + actualHooks);
+            }
+            return new PresentationInspection(State.VANILLA, requestedMask, sites,
+                    campaignState, fleetPulse);
+        }
+
+        if (!OWNER_VALUE.equals(ownership.ownerValue)) {
+            throw mismatch(node.name + ": presentation owner mismatch: "
+                    + ownership.ownerValue);
+        }
+        if (ownership.mask != requestedMask) {
+            throw mismatch(node.name + ": presentation mask mismatch: expected="
+                    + requestedMask + ", actual=" + ownership.mask);
+        }
+        if (!actualHooks.equals(expectedHooks)) {
+            throw mismatch(node.name + ": presentation hook inventory mismatch: expected="
+                    + expectedHooks + ", actual=" + actualHooks);
+        }
+        return new PresentationInspection(State.COMPLETE_PATCHED, requestedMask, Map.of(),
+                campaignState, fleetPulse);
+    }
+
+    private static void apply(PresentationClassPlan plan, ClassNode candidate,
+                              PresentationInspection inspection) {
+        if (plan.kind == PlanKind.CAMPAIGN_STATE) {
+            applyCampaignState(candidate, inspection.campaignState);
+        }
+        for (Map.Entry<CallSiteSpec, List<SiteRef>> entry : inspection.sites.entrySet()) {
+            CallSiteSpec spec = entry.getKey();
+            for (SiteRef ref : entry.getValue()) {
+                MethodInsnNode call = methodCallAt(candidate, ref);
+                call.setOpcode(Opcodes.INVOKESTATIC);
+                call.owner = RUNTIME;
+                call.name = spec.wrapperName;
+                call.desc = spec.wrapperDesc;
+                call.itf = false;
+            }
+        }
+        if (plan.kind == PlanKind.CAMPAIGN_FLEET
+                && (inspection.requestedMask & FLEET_PRESENTATION) != 0) {
+            MethodInsnNode call = methodCallAt(candidate, inspection.fleetPulse.call);
+            call.setOpcode(Opcodes.INVOKESTATIC);
+            call.owner = RUNTIME;
+            call.name = "advanceFleetPulseFader";
+            call.desc = "(Lcom/fs/graphics/util/Fader;F)V";
+            call.itf = false;
+        }
+    }
+
+    private static void addOwnership(ClassNode node, int mask) {
+        if (countFields(node, OWNER_FIELD) != 0 || countFields(node, MASK_FIELD) != 0) {
+            throw mismatch(node.name + ": presentation ownership fields already exist");
+        }
+        int access = Opcodes.ACC_PRIVATE | Opcodes.ACC_STATIC | Opcodes.ACC_FINAL
+                | Opcodes.ACC_SYNTHETIC;
+        node.fields.add(new FieldNode(Opcodes.ASM8, access, OWNER_FIELD,
+                "Ljava/lang/String;", null, OWNER_VALUE));
+        node.fields.add(new FieldNode(Opcodes.ASM8, access, MASK_FIELD,
+                "I", null, mask));
+    }
+
+    private static CampaignStateProtocol inspectCampaignState(ClassNode node, boolean patched) {
+        MethodNode method = requireMethod(node, "advance", "(FLcom/fs/starfarer/util/A/new;)V");
+        List<MethodInsnNode> setters = calls(method, Opcodes.INVOKEVIRTUAL,
+                "com/fs/starfarer/campaign/CampaignEngine", "setFastForwardIteration", "(Z)V");
+        List<MethodInsnNode> advances = calls(method, Opcodes.INVOKEVIRTUAL,
+                "com/fs/starfarer/campaign/CampaignEngine", "advance",
+                "(FLcom/fs/starfarer/util/A/new;)V");
+        if (setters.size() != 3 || advances.size() != 1) {
+            throw mismatch(node.name + ".advance: expected setFastForwardIteration x3 and "
+                    + "CampaignEngine.advance x1, found " + setters.size() + "/" + advances.size());
+        }
+        MethodInsnNode first = setters.get(0);
+        MethodInsnNode middle = setters.get(1);
+        MethodInsnNode last = setters.get(2);
+        MethodInsnNode advance = advances.get(0);
+        Frame<SourceValue>[] frames = sourceFrames(node.name, method);
+        requireBooleanArgument(method, first, frames, false, "first fast-forward setter");
+        requireBooleanArgument(method, middle, frames, true, "loop fast-forward setter");
+        requireBooleanArgument(method, last, frames, false, "final fast-forward setter");
+        int firstIndex = method.instructions.indexOf(first);
+        int advanceIndex = method.instructions.indexOf(advance);
+        int middleIndex = method.instructions.indexOf(middle);
+        int lastIndex = method.instructions.indexOf(last);
+        if (!(firstIndex < advanceIndex && advanceIndex < middleIndex && middleIndex < lastIndex)) {
+            throw mismatch(node.name + ".advance: fast-forward protocol order changed");
+        }
+        JumpInsnNode backedge = uniqueBackedge(method, middleIndex, lastIndex, advanceIndex);
+        int targetIndex = method.instructions.indexOf(backedge.label);
+        LoopLocals loop = inferLoopLocals(node.name, method, frames, targetIndex,
+                method.instructions.indexOf(backedge));
+
+        List<MethodInsnNode> beginHooks = calls(method, Opcodes.INVOKESTATIC,
+                RUNTIME, "beginOuterFrame", "(I)V");
+        List<MethodInsnNode> beforeHooks = calls(method, Opcodes.INVOKESTATIC,
+                RUNTIME, "beforeSubstep", "(II)V");
+        List<MethodInsnNode> endHooks = calls(method, Opcodes.INVOKESTATIC,
+                RUNTIME, "endOuterFrame", "()V");
+        if (!patched) {
+            if (!beginHooks.isEmpty() || !beforeHooks.isEmpty() || !endHooks.isEmpty()) {
+                throw mismatch(node.name + ".advance: partial frame-marker hooks without owner");
+            }
+        } else {
+            if (beginHooks.size() != 1 || beforeHooks.size() != 1 || endHooks.size() != 1) {
+                throw mismatch(node.name + ".advance: frame-marker hook counts are not 1/1/1");
+            }
+            MethodInsnNode begin = beginHooks.get(0);
+            MethodInsnNode before = beforeHooks.get(0);
+            MethodInsnNode end = endHooks.get(0);
+            requireLoadedArgument(method, begin, frames, 0, loop.totalLocal,
+                    "beginOuterFrame total count");
+            requireLoadedArgument(method, before, frames, 0, loop.substepLocal,
+                    "beforeSubstep index");
+            requireLoadedArgument(method, before, frames, 1, loop.totalLocal,
+                    "beforeSubstep total count");
+            if (nextMeaningful(begin) != first || nextMeaningful(before) != advance
+                    || previousMeaningful(end) != last) {
+                throw mismatch(node.name + ".advance: frame-marker hooks moved outside protocol anchors");
+            }
+        }
+        return new CampaignStateProtocol(ref(method, first), ref(method, advance),
+                ref(method, middle), ref(method, last), loop.substepLocal, loop.totalLocal);
+    }
+
+    private record LoopLocals(int substepLocal, int totalLocal) {}
+
+    private static LoopLocals inferLoopLocals(String owner, MethodNode method,
+                                              Frame<SourceValue>[] frames,
+                                              int loopTargetIndex,
+                                              int backedgeIndex) {
+        List<LoopLocals> proven = new ArrayList<>();
+        for (AbstractInsnNode insn = method.instructions.get(loopTargetIndex);
+             insn != null && method.instructions.indexOf(insn) <= backedgeIndex;
+             insn = insn.getNext()) {
+            if (!(insn instanceof JumpInsnNode jump) || !isIntegerCompare(jump.getOpcode())) {
+                continue;
+            }
+            int target = method.instructions.indexOf(jump.label);
+            // Accept either a pre-tested loop exit or the real game's post-tested
+            // backedge, but ignore comparisons whose two successors remain inside
+            // the loop body. This keeps unrelated body predicates out of the proof.
+            if (target > loopTargetIndex && target <= backedgeIndex) continue;
+            Frame<SourceValue> frame = frames[method.instructions.indexOf(jump)];
+            if (frame == null || frame.getStackSize() < 2) continue;
+            int left = loadedLocal(frame.getStack(frame.getStackSize() - 2));
+            int right = loadedLocal(frame.getStack(frame.getStackSize() - 1));
+            if (left < 0 || right < 0 || left == right) continue;
+            boolean leftMutated = incrementedInRange(method, left, loopTargetIndex, backedgeIndex);
+            boolean rightMutated = incrementedInRange(method, right, loopTargetIndex, backedgeIndex);
+            if (leftMutated == rightMutated) continue;
+            LoopLocals candidate = leftMutated
+                    ? new LoopLocals(left, right) : new LoopLocals(right, left);
+            if (!proven.contains(candidate)) proven.add(candidate);
+        }
+        if (proven.size() != 1) {
+            throw mismatch(owner + ".advance: loop substep/total dataflow is "
+                    + (proven.isEmpty() ? "missing" : "ambiguous: " + proven));
+        }
+        return proven.get(0);
+    }
+
+    private static void applyCampaignState(ClassNode node, CampaignStateProtocol protocol) {
+        MethodNode method = requireMethod(node, "advance", "(FLcom/fs/starfarer/util/A/new;)V");
+        AbstractInsnNode first = instructionAt(method, protocol.firstFalse.instructionIndex);
+        AbstractInsnNode advance = instructionAt(method, protocol.engineAdvance.instructionIndex);
+        AbstractInsnNode last = instructionAt(method, protocol.finalFalse.instructionIndex);
+        InsnList begin = new InsnList();
+        begin.add(new VarInsnNode(Opcodes.ILOAD, protocol.totalLocal));
+        begin.add(new MethodInsnNode(Opcodes.INVOKESTATIC, RUNTIME,
+                "beginOuterFrame", "(I)V", false));
+        method.instructions.insertBefore(first, begin);
+        InsnList before = new InsnList();
+        before.add(new VarInsnNode(Opcodes.ILOAD, protocol.substepLocal));
+        before.add(new VarInsnNode(Opcodes.ILOAD, protocol.totalLocal));
+        before.add(new MethodInsnNode(Opcodes.INVOKESTATIC, RUNTIME,
+                "beforeSubstep", "(II)V", false));
+        method.instructions.insertBefore(advance, before);
+        method.instructions.insert(last, new MethodInsnNode(Opcodes.INVOKESTATIC, RUNTIME,
+                "endOuterFrame", "()V", false));
+    }
+
+    private static FleetPulseSite inspectFleetPulse(ClassNode node, boolean patched,
+                                                    boolean disabledInOwnedClass) {
+        MethodNode method = requireMethod(node, "advance", "(F)V");
+        List<MethodInsnNode> originals = calls(method, Opcodes.INVOKEVIRTUAL,
+                "com/fs/graphics/util/Fader", "advance", "(F)V");
+        List<MethodInsnNode> wrappers = calls(method, Opcodes.INVOKESTATIC,
+                RUNTIME, "advanceFleetPulseFader", "(Lcom/fs/graphics/util/Fader;F)V");
+        MethodInsnNode speedAnchor = uniqueCall(method, Opcodes.INVOKEVIRTUAL,
+                node.name, "updateSpeedBonus", "()V",
+                "fleet speed-update anchor");
+        if (patched) {
+            if (originals.size() != 1 || wrappers.size() != 1) {
+                throw mismatch(node.name + ".advance: fleet pulse fader patched state must contain "
+                        + "one vanilla Fader.advance and one wrapper");
+            }
+            MethodInsnNode wrapper = wrappers.get(0);
+            requireSameStraightLineRegion(method, wrapper, speedAnchor,
+                    "fleet pulse fader wrapper");
+            return new FleetPulseSite(ref(method, wrapper));
+        }
+        if (disabledInOwnedClass) {
+            if (originals.size() != 2 || !wrappers.isEmpty()) {
+                throw mismatch(node.name + ".advance: disabled fleet-presentation component is not vanilla");
+            }
+            return null;
+        }
+        if (originals.size() != 2 || !wrappers.isEmpty()) {
+            throw mismatch(node.name + ".advance: expected two vanilla fleet Fader.advance calls");
+        }
+        List<MethodInsnNode> semantic = new ArrayList<>();
+        for (MethodInsnNode call : originals) {
+            if (sameStraightLineRegion(method, call, speedAnchor)
+                    && method.instructions.indexOf(call) < method.instructions.indexOf(speedAnchor)) {
+                semantic.add(call);
+            }
+        }
+        if (semantic.size() != 1) {
+            throw mismatch(node.name + ".advance: fleet pulse fader receiver is ambiguous relative "
+                    + "to the speed-update block: " + semantic.size());
+        }
+        requireReceiverIsFieldOrLocal(node.name, method, semantic.get(0));
+        return new FleetPulseSite(ref(method, semantic.get(0)));
+    }
+
+    private record CallKey(int opcode, String owner, String name, String desc) {}
+    private record HookKey(String methodName, String methodDesc,
+                           String hookName, String hookDesc) {}
+    private record Ownership(boolean present, String ownerValue, int mask) {}
+
+    private static final class SiteClassification {
+        final List<SiteRef> originalSites;
+        final int wrapperCount;
+
+        SiteClassification(List<SiteRef> originalSites, int wrapperCount) {
+            this.originalSites = originalSites;
+            this.wrapperCount = wrapperCount;
+        }
+
+        void requireOriginal(String className, CallSiteSpec spec) {
+            if (originalSites.size() != spec.expectedCount || wrapperCount != 0) {
+                throw mismatch(className + "." + spec.methodName + spec.methodDesc + ": expected "
+                        + spec.expectedCount + " original " + spec.originalOwner + "."
+                        + spec.originalName + spec.originalDesc + " and no " + spec.wrapperName
+                        + " wrappers; found original=" + originalSites.size()
+                        + ", wrapper=" + wrapperCount);
+            }
+        }
+
+        void requirePatched(String className, CallSiteSpec spec) {
+            if (!originalSites.isEmpty() || wrapperCount != spec.expectedCount) {
+                throw mismatch(className + "." + spec.methodName + spec.methodDesc + ": expected "
+                        + spec.expectedCount + " " + spec.wrapperName + " wrappers and no original "
+                        + "calls; found original=" + originalSites.size()
+                        + ", wrapper=" + wrapperCount);
+            }
+        }
+    }
+
+    private static SiteClassification classifyCallSite(ClassNode node, CallSiteSpec spec) {
+        MethodNode method = requireMethod(node, spec.methodName, spec.methodDesc);
+        Frame<SourceValue>[] frames = sourceFrames(node.name, method);
+        List<SiteRef> originals = new ArrayList<>();
+        int wrappers = 0;
+        for (AbstractInsnNode insn : method.instructions.toArray()) {
+            if (!(insn instanceof MethodInsnNode call)) continue;
+            if (call.getOpcode() == spec.originalOpcode
+                    && call.owner.equals(spec.originalOwner)
+                    && call.name.equals(spec.originalName)
+                    && call.desc.equals(spec.originalDesc)) {
+                validateOriginalCall(node.name, method, call, frames, spec);
+                originals.add(ref(method, call));
+            } else if (call.getOpcode() == Opcodes.INVOKESTATIC
+                    && call.owner.equals(RUNTIME)
+                    && call.name.equals(spec.wrapperName)
+                    && call.desc.equals(spec.wrapperDesc)) {
+                validateWrapperCall(node.name, method, call, frames, spec);
+                wrappers++;
+            }
+        }
+        return new SiteClassification(Collections.unmodifiableList(originals), wrappers);
+    }
+
+    private static void validateOriginalCall(String owner, MethodNode method,
+                                             MethodInsnNode call,
+                                             Frame<SourceValue>[] frames,
+                                             CallSiteSpec spec) {
+        Frame<SourceValue> frame = frames[method.instructions.indexOf(call)];
+        if (frame == null) throw mismatch(owner + "." + method.name + method.desc
+                + ": analysis frame missing for " + spec.originalName);
+        int args = Type.getArgumentTypes(call.desc).length;
+        if (frame.getStackSize() < args + 1) {
+            throw mismatch(owner + "." + method.name + method.desc
+                    + ": receiver/argument stack is incomplete for " + spec.originalName);
+        }
+        SourceValue receiver = frame.getStack(frame.getStackSize() - args - 1);
+        if (receiver == null || receiver.insns == null || receiver.insns.isEmpty()) {
+            throw mismatch(owner + "." + method.name + method.desc
+                    + ": receiver source is unresolved for " + spec.originalName);
+        }
+        for (int i = 0; i < args; i++) {
+            SourceValue argument = frame.getStack(frame.getStackSize() - args + i);
+            if (argument == null || argument.insns == null || argument.insns.isEmpty()) {
+                throw mismatch(owner + "." + method.name + method.desc
+                        + ": argument source is unresolved for " + spec.originalName);
+            }
+        }
+        if (spec.originalOwner.equals(owner)) {
+            int local = loadedLocal(receiver, Opcodes.ALOAD);
+            if (local != 0) {
+                throw mismatch(owner + "." + method.name + method.desc
+                        + ": self-call receiver is not ALOAD 0 for " + spec.originalName);
+            }
+        }
+    }
+
+    private static void validateWrapperCall(String owner, MethodNode method,
+                                            MethodInsnNode call,
+                                            Frame<SourceValue>[] frames,
+                                            CallSiteSpec spec) {
+        Frame<SourceValue> frame = frames[method.instructions.indexOf(call)];
+        int args = Type.getArgumentTypes(call.desc).length;
+        if (frame == null || frame.getStackSize() < args) {
+            throw mismatch(owner + "." + method.name + method.desc
+                    + ": wrapper argument stack is incomplete for " + spec.wrapperName);
+        }
+        for (int i = 0; i < args; i++) {
+            SourceValue argument = frame.getStack(frame.getStackSize() - args + i);
+            if (argument == null || argument.insns == null || argument.insns.isEmpty()) {
+                throw mismatch(owner + "." + method.name + method.desc
+                        + ": wrapper argument source is unresolved for " + spec.wrapperName);
+            }
+        }
+    }
+
+    private static Ownership ownership(ClassNode node) {
+        List<FieldNode> owners = fields(node, OWNER_FIELD);
+        List<FieldNode> masks = fields(node, MASK_FIELD);
+        if (owners.isEmpty() && masks.isEmpty()) return new Ownership(false, null, 0);
+        if (owners.size() != 1 || masks.size() != 1) {
+            throw mismatch(node.name + ": presentation ownership is partial: ownerFields="
+                    + owners.size() + ", maskFields=" + masks.size());
+        }
+        FieldNode owner = owners.get(0);
+        FieldNode mask = masks.get(0);
+        if (!(owner.value instanceof String ownerValue) || !(mask.value instanceof Integer value)) {
+            throw mismatch(node.name + ": presentation ownership fields are not constants");
+        }
+        return new Ownership(true, ownerValue, value);
+    }
+
+    private static Map<HookKey, Integer> expectedHooks(PresentationClassPlan plan,
+                                                       int requestedMask) {
+        Map<HookKey, Integer> result = new LinkedHashMap<>();
+        if (plan.kind == PlanKind.CAMPAIGN_STATE) {
+            addHook(result, "advance", "(FLcom/fs/starfarer/util/A/new;)V",
+                    "beginOuterFrame", "(I)V", 1);
+            addHook(result, "advance", "(FLcom/fs/starfarer/util/A/new;)V",
+                    "beforeSubstep", "(II)V", 1);
+            addHook(result, "advance", "(FLcom/fs/starfarer/util/A/new;)V",
+                    "endOuterFrame", "()V", 1);
+        }
+        for (Component component : plan.components) {
+            if ((requestedMask & component.bit) == 0) continue;
+            for (CallSiteSpec spec : component.sites) {
+                addHook(result, spec.methodName, spec.methodDesc,
+                        spec.wrapperName, spec.wrapperDesc, spec.expectedCount);
+            }
+        }
+        if (plan.kind == PlanKind.CAMPAIGN_FLEET
+                && (requestedMask & FLEET_PRESENTATION) != 0) {
+            addHook(result, "advance", "(F)V", "advanceFleetPulseFader",
+                    "(Lcom/fs/graphics/util/Fader;F)V", 1);
+        }
+        return Collections.unmodifiableMap(result);
+    }
+
+    private static Map<HookKey, Integer> presentationHooks(ClassNode node) {
+        Map<HookKey, Integer> result = new LinkedHashMap<>();
+        for (MethodNode method : node.methods) {
+            for (AbstractInsnNode insn : method.instructions.toArray()) {
+                if (insn instanceof MethodInsnNode call && call.owner.equals(RUNTIME)) {
+                    HookKey key = new HookKey(method.name, method.desc, call.name, call.desc);
+                    result.merge(key, 1, Integer::sum);
+                }
+            }
+        }
+        return Collections.unmodifiableMap(result);
+    }
+
+    private static void addHook(Map<HookKey, Integer> map, String methodName,
+                                String methodDesc, String hookName, String hookDesc, int count) {
+        map.put(new HookKey(methodName, methodDesc, hookName, hookDesc), count);
+    }
+
+    private static PresentationClassPlan generic(Container container, Component... components) {
+        return new PresentationClassPlan(container, PlanKind.GENERIC, List.of(components));
+    }
+
+    private static Component component(int bit, CallSiteSpec... sites) {
+        return new Component(bit, List.of(sites));
+    }
+
+    private static CallSiteSpec site(String methodName, String methodDesc, int originalOpcode,
+                                     String owner, String name, String desc,
+                                     String wrapper, String wrapperDesc, int count) {
+        return new CallSiteSpec(methodName, methodDesc, originalOpcode, owner, name, desc,
+                wrapper, wrapperDesc, count);
+    }
+
+    private static CallSiteSpec suppressMusic(String method, String desc, int count) {
+        return site(method, desc, Opcodes.INVOKEINTERFACE,
+                "com/fs/starfarer/api/campaign/CampaignUIAPI", "suppressMusic", "(F)V",
+                "suppressMusic", "(Lcom/fs/starfarer/api/campaign/CampaignUIAPI;F)V", count);
+    }
+
+    private static CallSiteSpec playLoop(String method, String desc, int count) {
+        return site(method, desc, Opcodes.INVOKEINTERFACE,
+                "com/fs/starfarer/api/SoundPlayerAPI", "playLoop",
+                "(Ljava/lang/String;Ljava/lang/Object;FFLorg/lwjgl/util/vector/Vector2f;Lorg/lwjgl/util/vector/Vector2f;)V",
+                "playLoop",
+                "(Lcom/fs/starfarer/api/SoundPlayerAPI;Ljava/lang/String;Ljava/lang/Object;FFLorg/lwjgl/util/vector/Vector2f;Lorg/lwjgl/util/vector/Vector2f;)V",
+                count);
+    }
+
+    private static CallSiteSpec lowPass(String method, String desc, int count) {
+        return site(method, desc, Opcodes.INVOKEINTERFACE,
+                "com/fs/starfarer/api/SoundPlayerAPI", "applyLowPassFilter", "(FF)V",
+                "applyLowPassFilter", "(Lcom/fs/starfarer/api/SoundPlayerAPI;FF)V", count);
+    }
+
+    private static CallSiteSpec emitter(String method, String desc, int count) {
+        return site(method, desc, Opcodes.INVOKEVIRTUAL,
+                "com/fs/starfarer/api/util/IntervalUtil", "advance", "(F)V",
+                "advanceEmitterInterval", "(Lcom/fs/starfarer/api/util/IntervalUtil;F)V", count);
+    }
+
+    private static boolean anyPresentationPatch(PrepatcherConfig config) {
         return config.fastForwardActionIndicators || config.fastForwardLocationVisuals
                 || config.fastForwardFloatingText || config.fastForwardFleetView
                 || config.fastForwardFleetPresentation || config.fastForwardSensorIndicators
@@ -619,6 +987,258 @@ public final class FastForwardPresentationTransformer implements ClassFileTransf
                 || config.fastForwardContinuousSound || config.fastForwardGateJitter
                 || config.fastForwardGlobalAnimations || config.fastForwardSensorFaders
                 || config.fastForwardSlipstreamParticles || config.fastForwardParticleEmitters;
+    }
+
+    private static Frame<SourceValue>[] sourceFrames(String owner, MethodNode method) {
+        try {
+            MethodNode analysis = new MethodNode(Opcodes.ASM8, method.access, method.name,
+                    method.desc, method.signature,
+                    method.exceptions == null ? null : method.exceptions.toArray(String[]::new));
+            method.accept(analysis);
+            // ClassNode candidates are inspected before ClassWriter recomputes max stack.
+            analysis.maxStack = Math.max(analysis.maxStack, 64);
+            return new Analyzer<SourceValue>(new SourceInterpreter()).analyze(owner, analysis);
+        } catch (AnalyzerException failure) {
+            throw mismatch(owner + "." + method.name + method.desc
+                    + ": source analysis failed: " + failure.getMessage());
+        }
+    }
+
+    private static void requireBooleanArgument(MethodNode method, MethodInsnNode call,
+                                               Frame<SourceValue>[] frames,
+                                               boolean expected, String what) {
+        Frame<SourceValue> frame = frames[method.instructions.indexOf(call)];
+        if (frame == null || frame.getStackSize() < 1) throw mismatch(what + ": no stack frame");
+        SourceValue value = frame.getStack(frame.getStackSize() - 1);
+        int opcode = expected ? Opcodes.ICONST_1 : Opcodes.ICONST_0;
+        if (value == null || value.insns == null || value.insns.size() != 1
+                || value.insns.iterator().next().getOpcode() != opcode) {
+            throw mismatch(what + ": expected constant " + expected);
+        }
+    }
+
+    private static void requireLoadedArgument(MethodNode method, MethodInsnNode call,
+                                              Frame<SourceValue>[] frames, int argument,
+                                              int expectedLocal, String what) {
+        Frame<SourceValue> frame = frames[method.instructions.indexOf(call)];
+        int count = Type.getArgumentTypes(call.desc).length;
+        if (frame == null || frame.getStackSize() < count) throw mismatch(what + ": no frame");
+        SourceValue value = frame.getStack(frame.getStackSize() - count + argument);
+        if (loadedLocal(value) != expectedLocal) {
+            throw mismatch(what + ": expected ILOAD " + expectedLocal);
+        }
+    }
+
+    private static int loadedLocal(SourceValue value) {
+        return loadedLocal(value, Opcodes.ILOAD);
+    }
+
+    private static int loadedLocal(SourceValue value, int expectedOpcode) {
+        if (value == null || value.insns == null || value.insns.isEmpty()) return -1;
+        int local = -1;
+        for (AbstractInsnNode source : value.insns) {
+            if (!(source instanceof VarInsnNode load) || load.getOpcode() != expectedOpcode) {
+                return -1;
+            }
+            if (local < 0) local = load.var;
+            else if (local != load.var) return -1;
+        }
+        return local;
+    }
+
+    private static boolean incrementedInRange(MethodNode method, int local,
+                                              int startIndex, int endIndex) {
+        for (int i = Math.max(0, startIndex); i <= endIndex && i < method.instructions.size(); i++) {
+            AbstractInsnNode insn = method.instructions.get(i);
+            if (insn instanceof IincInsnNode increment && increment.var == local) return true;
+        }
+        return false;
+    }
+
+    private static boolean isIntegerCompare(int opcode) {
+        return opcode >= Opcodes.IF_ICMPEQ && opcode <= Opcodes.IF_ICMPLE;
+    }
+
+    private static JumpInsnNode uniqueBackedge(MethodNode method, int start, int end,
+                                               int advanceIndex) {
+        List<JumpInsnNode> candidates = new ArrayList<>();
+        for (int i = start + 1; i < end; i++) {
+            AbstractInsnNode insn = method.instructions.get(i);
+            if (insn instanceof JumpInsnNode jump
+                    && method.instructions.indexOf(jump.label) <= advanceIndex) {
+                candidates.add(jump);
+            }
+        }
+        if (candidates.size() != 1) {
+            throw mismatch(method.name + method.desc + ": loop backedge is ambiguous: "
+                    + candidates.size());
+        }
+        return candidates.get(0);
+    }
+
+    private static boolean sameStraightLineRegion(MethodNode method,
+                                                  AbstractInsnNode anchor,
+                                                  AbstractInsnNode candidate) {
+        int a = method.instructions.indexOf(anchor);
+        int b = method.instructions.indexOf(candidate);
+        if (a < 0 || b < 0) return false;
+        int from = Math.min(a, b) + 1;
+        int to = Math.max(a, b);
+        for (int i = from; i < to; i++) {
+            AbstractInsnNode insn = method.instructions.get(i);
+            if (insn instanceof JumpInsnNode || insn instanceof LookupSwitchInsnNode
+                    || insn instanceof TableSwitchInsnNode || isExit(insn.getOpcode())) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static void requireSameStraightLineRegion(MethodNode method,
+                                                      AbstractInsnNode anchor,
+                                                      AbstractInsnNode candidate,
+                                                      String what) {
+        if (!sameStraightLineRegion(method, anchor, candidate)
+                || method.instructions.indexOf(candidate) <= method.instructions.indexOf(anchor)) {
+            throw mismatch(method.name + method.desc + ": " + what
+                    + " is not in the required straight-line semantic block");
+        }
+    }
+
+    private static boolean isExit(int opcode) {
+        return opcode >= Opcodes.IRETURN && opcode <= Opcodes.RETURN || opcode == Opcodes.ATHROW;
+    }
+
+    private static void requireReceiverIsFieldOrLocal(String owner, MethodNode method,
+                                                      MethodInsnNode call) {
+        Frame<SourceValue>[] frames = sourceFrames(owner, method);
+        Frame<SourceValue> frame = frames[method.instructions.indexOf(call)];
+        int args = Type.getArgumentTypes(call.desc).length;
+        if (frame == null || frame.getStackSize() < args + 1) {
+            throw mismatch(owner + "." + method.name + method.desc
+                    + ": fleet pulse receiver frame missing");
+        }
+        SourceValue receiver = frame.getStack(frame.getStackSize() - args - 1);
+        if (receiver == null || receiver.insns == null || receiver.insns.isEmpty()) {
+            throw mismatch(owner + "." + method.name + method.desc
+                    + ": fleet pulse receiver source unresolved");
+        }
+        for (AbstractInsnNode source : receiver.insns) {
+            int opcode = source.getOpcode();
+            if (opcode != Opcodes.ALOAD && opcode != Opcodes.GETFIELD) {
+                throw mismatch(owner + "." + method.name + method.desc
+                        + ": fleet pulse receiver is not a field/local source");
+            }
+        }
+    }
+
+    private static MethodInsnNode uniqueEither(MethodNode method, CallKey first, CallKey second,
+                                               String what) {
+        List<MethodInsnNode> found = new ArrayList<>();
+        for (AbstractInsnNode insn : method.instructions.toArray()) {
+            if (insn instanceof MethodInsnNode call
+                    && (matches(call, first) || matches(call, second))) found.add(call);
+        }
+        if (found.size() != 1) throw mismatch(method.name + method.desc + ": " + what
+                + " is ambiguous: " + found.size());
+        return found.get(0);
+    }
+
+    private static MethodInsnNode uniqueCall(MethodNode method, int opcode,
+                                             String owner, String name, String desc,
+                                             String what) {
+        List<MethodInsnNode> found = calls(method, opcode, owner, name, desc);
+        if (found.size() != 1) throw mismatch(method.name + method.desc + ": " + what
+                + " is ambiguous: " + found.size());
+        return found.get(0);
+    }
+
+    private static boolean matches(MethodInsnNode call, CallKey key) {
+        return call.getOpcode() == key.opcode && call.owner.equals(key.owner)
+                && call.name.equals(key.name) && call.desc.equals(key.desc);
+    }
+
+    private static List<MethodInsnNode> calls(MethodNode method, int opcode,
+                                              String owner, String name, String desc) {
+        List<MethodInsnNode> result = new ArrayList<>();
+        for (AbstractInsnNode insn : method.instructions.toArray()) {
+            if (insn instanceof MethodInsnNode call && call.getOpcode() == opcode
+                    && call.owner.equals(owner) && call.name.equals(name)
+                    && call.desc.equals(desc)) result.add(call);
+        }
+        return result;
+    }
+
+    private static MethodNode requireMethod(ClassNode node, String name, String desc) {
+        MethodNode result = null;
+        for (MethodNode method : node.methods) {
+            if (!method.name.equals(name) || !method.desc.equals(desc)) continue;
+            if (result != null) throw mismatch(node.name + ": duplicate method " + name + desc);
+            result = method;
+        }
+        if (result == null) throw mismatch(node.name + ": method not found: " + name + desc);
+        return result;
+    }
+
+    private static SiteRef ref(MethodNode method, AbstractInsnNode insn) {
+        return new SiteRef(method.name, method.desc, method.instructions.indexOf(insn));
+    }
+
+    private static MethodInsnNode methodCallAt(ClassNode node, SiteRef ref) {
+        MethodNode method = requireMethod(node, ref.methodName, ref.methodDesc);
+        AbstractInsnNode insn = instructionAt(method, ref.instructionIndex);
+        if (!(insn instanceof MethodInsnNode call)) {
+            throw mismatch(node.name + "." + ref.methodName + ref.methodDesc
+                    + ": planned call site is no longer a method call");
+        }
+        return call;
+    }
+
+    private static AbstractInsnNode instructionAt(MethodNode method, int index) {
+        if (index < 0 || index >= method.instructions.size()) {
+            throw mismatch(method.name + method.desc + ": instruction index out of range: " + index);
+        }
+        return method.instructions.get(index);
+    }
+
+    private static AbstractInsnNode nextMeaningful(AbstractInsnNode insn) {
+        for (AbstractInsnNode cursor = insn.getNext(); cursor != null; cursor = cursor.getNext()) {
+            if (cursor.getOpcode() >= 0) return cursor;
+        }
+        return null;
+    }
+
+    private static AbstractInsnNode previousMeaningful(AbstractInsnNode insn) {
+        for (AbstractInsnNode cursor = insn.getPrevious(); cursor != null; cursor = cursor.getPrevious()) {
+            if (cursor.getOpcode() >= 0) return cursor;
+        }
+        return null;
+    }
+
+    private static List<FieldNode> fields(ClassNode node, String name) {
+        List<FieldNode> result = new ArrayList<>();
+        for (FieldNode field : node.fields) if (field.name.equals(name)) result.add(field);
+        return result;
+    }
+
+    private static int countFields(ClassNode node, String name) {
+        return fields(node, name).size();
+    }
+
+    private static ClassNode read(byte[] bytes) {
+        ClassNode node = new ClassNode(Opcodes.ASM8);
+        new ClassReader(bytes).accept(node, 0);
+        return node;
+    }
+
+    private static ClassNode cloneNode(ClassNode input) {
+        ClassNode clone = new ClassNode(Opcodes.ASM8);
+        input.accept(clone);
+        return clone;
+    }
+
+    private static StructuralMismatch mismatch(String message) {
+        return new StructuralMismatch(message);
     }
 
     private static void recordStatus(String className, String status) {
@@ -629,109 +1249,6 @@ public final class FastForwardPresentationTransformer implements ClassFileTransf
     private static String loaderName(ClassLoader loader) {
         return loader == null ? "bootstrap" : loader.getClass().getName() + "@"
                 + Integer.toHexString(System.identityHashCode(loader));
-    }
-
-    private static boolean validContainer(ClassLoader loader, String className,
-                                          byte[] classfileBuffer,
-                                          ProtectionDomain protectionDomain,
-                                          Container expected) {
-        String resourceName = className + ".class";
-
-        // Normal JVM loaders expose the defining JAR here.
-        if (protectionDomain != null && protectionDomain.getCodeSource() != null
-                && protectionDomain.getCodeSource().getLocation() != null) {
-            try {
-                Path codeSource = Path.of(
-                                protectionDomain.getCodeSource().getLocation().toURI())
-                        .toAbsolutePath().normalize();
-                return matchesContainer(
-                        codeSource, resourceName, classfileBuffer, expected);
-            } catch (Throwable ignored) {
-                // An exposed but unusable CodeSource is not safe to bypass.
-                return false;
-            }
-        }
-
-        // FasterRendering defines com.fs classes with a null CodeSource, but reads
-        // their bytes through this same resource lookup. Resolve that resource to
-        // its JAR and then verify both the entire container and the exact entry.
-        try {
-            URL resource = loader == null
-                    ? ClassLoader.getSystemResource(resourceName)
-                    : loader.getResource(resourceName);
-            Path resourceJar = jarPath(resource, resourceName);
-            return resourceJar != null && matchesContainer(
-                    resourceJar, resourceName, classfileBuffer, expected);
-        } catch (Throwable ignored) {
-            // A loader that cannot expose its source remains fail-closed.
-            return false;
-        }
-    }
-
-    private static Path jarPath(URL resource, String expectedEntry) {
-        try {
-            if (resource == null || !"jar".equalsIgnoreCase(resource.getProtocol())) return null;
-            JarURLConnection connection = (JarURLConnection) resource.openConnection();
-            connection.setUseCaches(false);
-            if (!expectedEntry.equals(connection.getEntryName())) return null;
-            URL jarUrl = connection.getJarFileURL();
-            if (!"file".equalsIgnoreCase(jarUrl.getProtocol())) return null;
-            return Path.of(jarUrl.toURI()).toAbsolutePath().normalize();
-        } catch (Throwable ignored) {
-            return null;
-        }
-    }
-
-    private static boolean matchesContainer(Path path, String resourceName,
-                                            byte[] classfileBuffer,
-                                            Container expected) {
-        try {
-            if (!Files.isRegularFile(path)
-                    || !path.getFileName().toString().equalsIgnoreCase(expected.fileName)) {
-                return false;
-            }
-            String actual = CONTAINER_HASH_CACHE.computeIfAbsent(
-                    path, FastForwardPresentationTransformer::hashFile);
-            if (!actual.equals(expected.sha256)) return false;
-
-            try (JarFile jar = new JarFile(path.toFile())) {
-                JarEntry entry = jar.getJarEntry(resourceName);
-                if (entry == null || entry.isDirectory()) return false;
-                try (InputStream input = jar.getInputStream(entry)) {
-                    return MessageDigest.isEqual(input.readAllBytes(), classfileBuffer);
-                }
-            }
-        } catch (Throwable ignored) {
-            return false;
-        }
-    }
-
-    private static String hashFile(Path path) {
-        try (InputStream input = Files.newInputStream(path)) {
-            MessageDigest digest = MessageDigest.getInstance("SHA-256");
-            byte[] buffer = new byte[131072];
-            int read;
-            while ((read = input.read(buffer)) >= 0) {
-                if (read > 0) digest.update(buffer, 0, read);
-            }
-            return hex(digest.digest());
-        } catch (Throwable ignored) {
-            return "";
-        }
-    }
-
-    private static String sha256(byte[] bytes) {
-        try {
-            return hex(MessageDigest.getInstance("SHA-256").digest(bytes));
-        } catch (Exception impossible) {
-            throw new IllegalStateException(impossible);
-        }
-    }
-
-    private static String hex(byte[] bytes) {
-        StringBuilder result = new StringBuilder(bytes.length * 2);
-        for (byte value : bytes) result.append(String.format("%02x", value & 0xff));
-        return result.toString();
     }
 
     private static void logOnce(String key, String message) {

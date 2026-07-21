@@ -34,7 +34,7 @@ import java.lang.reflect.Method;
 import java.util.Locale;
 import java.util.concurrent.atomic.AtomicLong;
 
-/** Runtime helpers for exact-build fast-forward presentation coalescing. */
+/** Runtime helpers for structurally matched fast-forward presentation coalescing. */
 public final class StarsectorPrepatcherPresentationHooks {
     // Disabled until the target-loader bridge configures the payload. A missed
     // initialization or frame marker therefore preserves vanilla call cadence.
@@ -75,7 +75,7 @@ public final class StarsectorPrepatcherPresentationHooks {
 
     /**
      * The supplied obfuscated build contains a public method literally named "new".
-     * Java source cannot call that identifier, so the exact-hash bridge uses a cached
+     * Java source cannot call that identifier, so the structural presentation bridge uses a cached
      * MethodHandle adapted to (Object,float)void. Resolution is lazy and occurs only
      * when an entity actually owns a selection indicator.
      */

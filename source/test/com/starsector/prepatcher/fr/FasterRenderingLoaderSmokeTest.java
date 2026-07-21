@@ -46,7 +46,7 @@ public final class FasterRenderingLoaderSmokeTest {
             "com.starsector.prepatcher.agent.PrepatcherAgent";
     private static final String RUNTIME_ENTRY_PREFIX =
             "com/fs/starfarer/api/StarsectorPrepatcher";
-    private static final int EXPECTED_RUNTIME_CLASS_COUNT = 80;
+    private static final int EXPECTED_RUNTIME_CLASS_COUNT = 83;
 
     private FasterRenderingLoaderSmokeTest() {}
 
@@ -124,8 +124,8 @@ public final class FasterRenderingLoaderSmokeTest {
         String frMutatedPresentationStatus = System.getProperty(
                 "starsector.prepatcher.patchStatus." + HYPERSPACE_TERRAIN
                         + ".fastForwardPresentation");
-        require("SKIPPED_CLASS_HASH".equals(frMutatedPresentationStatus),
-                "FR-mutated presentation target did not fail open on its exact class hash: status="
+        require("APPLIED".equals(frMutatedPresentationStatus),
+                "FR-mutated presentation target did not match its unchanged local sound surface: status="
                         + frMutatedPresentationStatus);
 
         Class<?> agent = load(system, AGENT);

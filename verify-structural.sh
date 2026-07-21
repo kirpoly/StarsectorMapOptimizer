@@ -59,6 +59,10 @@ java "${EXPORTS[@]}" -cp "$CLASS_PATH" \
   2>&1 | tee "$REPORT_DIR/structural-verification.txt"
 
 java "${EXPORTS[@]}" -cp "$CLASS_PATH" \
+  com.starsector.prepatcher.agent.FastForwardPresentationStructuralPlanTest \
+  2>&1 | tee "$REPORT_DIR/fast-forward-presentation-structural-plan.txt"
+
+java "${EXPORTS[@]}" -cp "$CLASS_PATH" \
   com.starsector.prepatcher.agent.FastForwardPresentationCompatibilityTest \
   "$CORE/starfarer_obf.jar" "$CORE/starfarer.api.jar" \
   2>&1 | tee "$REPORT_DIR/fast-forward-presentation-compatibility.txt"

@@ -106,6 +106,27 @@ $structuralLines
 [IO.File]::WriteAllLines($structuralReport, [string[]] $structuralLines, $utf8)
 if ($structuralExitCode -ne 0) { throw 'Structural compatibility verification failed.' }
 
+$presentationStructuralPlanReport =
+    Join-Path $reportDir 'fast-forward-presentation-structural-plan.txt'
+$ErrorActionPreference = 'Continue'
+try {
+    $presentationStructuralPlanOutput = @(& java @exports -cp $classPath `
+        com.starsector.prepatcher.agent.FastForwardPresentationStructuralPlanTest 2>&1)
+    $presentationStructuralPlanExitCode = $LASTEXITCODE
+} finally {
+    $ErrorActionPreference = $savedErrorActionPreference
+}
+$presentationStructuralPlanLines = @(
+    $presentationStructuralPlanOutput | ForEach-Object { $_.ToString() })
+$presentationStructuralPlanLines
+[IO.File]::WriteAllLines(
+    $presentationStructuralPlanReport,
+    [string[]] $presentationStructuralPlanLines,
+    $utf8)
+if ($presentationStructuralPlanExitCode -ne 0) {
+    throw 'Fast-forward presentation structural-plan verification failed.'
+}
+
 $presentationCompatibilityReport = Join-Path $reportDir 'fast-forward-presentation-compatibility.txt'
 $ErrorActionPreference = 'Continue'
 try {

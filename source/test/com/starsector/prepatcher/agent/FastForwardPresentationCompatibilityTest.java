@@ -14,12 +14,8 @@ import jdk.internal.org.objectweb.asm.tree.analysis.BasicValue;
 import jdk.internal.org.objectweb.asm.tree.analysis.BasicVerifier;
 
 import java.lang.reflect.Constructor;
-import java.net.URL;
-import java.security.CodeSource;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.security.ProtectionDomain;
-import java.security.cert.Certificate;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.Map;
@@ -28,7 +24,7 @@ import java.util.Set;
 import java.util.TreeMap;
 import java.util.jar.JarFile;
 
-/** Offline exact-build verification for fast-forward presentation coalescing. */
+/** Offline structural verification for fast-forward presentation coalescing. */
 public final class FastForwardPresentationCompatibilityTest {
     private static final String PRESENTATION_HOOKS =
             "com/fs/starfarer/api/StarsectorPrepatcherPresentationHooks";
@@ -84,11 +80,11 @@ public final class FastForwardPresentationCompatibilityTest {
                         + aggressiveResult.callSites());
 
         verifyDisabledGroups(originals);
-        verifyContainerGuard(originals, coreJar, apiJar);
-        verifyHashMismatch(safe, originals);
+        verifyStructuralMutationTolerance(safe, originals);
+        verifyFeatureMasks(originals);
         verifyTransformerChain(originals);
 
-        System.out.println("OK fast-forward presentation exact targets=" + EXPECTED.size()
+        System.out.println("OK fast-forward presentation structuralTargets=" + EXPECTED.size()
                 + " safeClasses=" + safeResult.classes()
                 + " safeCallSites=" + safeResult.callSites()
                 + " aggressiveClasses=" + aggressiveResult.classes()
@@ -130,12 +126,23 @@ public final class FastForwardPresentationCompatibilityTest {
             require(actualCalls == expectedCalls,
                     label + " " + name + ": expected " + expectedCalls
                             + " presentation calls, found " + actualCalls);
+            require(FastForwardPresentationTransformer.OWNER_VALUE.equals(
+                            fieldValue(transformed,
+                                    FastForwardPresentationTransformer.OWNER_FIELD)),
+                    label + " presentation owner missing for " + name);
+            require(((Integer) fieldValue(transformed,
+                            FastForwardPresentationTransformer.MASK_FIELD))
+                            == FastForwardPresentationTransformer.requestedMaskForClass(
+                                    name, config),
+                    label + " presentation feature mask mismatch for " + name);
             PresentationStructuralContract.State composition =
                     PresentationStructuralContract.inspect(name, transformed, config);
             require(composition.present()
                             == PresentationStructuralContract.OVERLAP_CLASSES.contains(name),
-                    label + " presentation ownership mismatch for " + name + ": "
+                    label + " presentation/structural ownership mismatch for " + name + ": "
                             + composition);
+            require(transformer.transformBytesForTest(name, transformed) == null,
+                    label + " presentation plan is not idempotent for " + name);
             verifyMethods(transformed);
             classes++;
             callSites += actualCalls;
@@ -168,121 +175,100 @@ public final class FastForwardPresentationCompatibilityTest {
         }
     }
 
-    private static void verifyHashMismatch(PrepatcherConfig config,
-                                           Map<String, byte[]> originals) {
-        String name = "com/fs/starfarer/campaign/CampaignState";
-        byte[] changed = originals.get(name).clone();
-        changed[changed.length - 1] ^= 1;
+    private static void verifyStructuralMutationTolerance(
+            PrepatcherConfig config, Map<String, byte[]> originals) {
         FastForwardPresentationTransformer transformer =
                 new FastForwardPresentationTransformer(config);
-
-        try {
-            transformer.transformBytesForTest(name, changed);
-            throw new AssertionError("test entry point accepted a class hash mismatch");
-        } catch (IllegalArgumentException expected) {
-            require(expected.getMessage().contains("class hash mismatch"),
-                    "unexpected hash-mismatch exception: " + expected);
+        for (String name : Set.of(
+                "com/fs/starfarer/campaign/CampaignState",
+                "com/fs/starfarer/campaign/CampaignEngine",
+                "com/fs/starfarer/api/impl/campaign/terrain/BaseTerrain")) {
+            ClassNode node = read(originals.get(name));
+            node.fields.add(new FieldNode(Opcodes.ASM8,
+                    Opcodes.ACC_PRIVATE | Opcodes.ACC_SYNTHETIC,
+                    "smo$test$unrelated", "I", null, null));
+            MethodNode helper = new MethodNode(Opcodes.ASM8, Opcodes.ACC_PRIVATE,
+                    "smo$test$unrelated", "()V", null, null);
+            helper.instructions.add(new jdk.internal.org.objectweb.asm.tree.InsnNode(
+                    Opcodes.RETURN));
+            helper.maxStack = 0;
+            helper.maxLocals = 1;
+            node.methods.add(helper);
+            byte[] transformed = transformer.transformBytesForTest(name, write(node));
+            require(transformed != null,
+                    "unrelated field/method mutation blocked structural plan for " + name);
         }
 
-        String statusKey = "starsector.prepatcher.patchStatus."
-                + name.replace('/', '.') + ".fastForwardPresentation";
-        System.clearProperty(statusKey);
-        require(transformer.transform(null, name, null, null, changed) == null,
-                "runtime transformer did not fail open on a class hash mismatch");
-        require("SKIPPED_CLASS_HASH".equals(System.getProperty(statusKey)),
-                "runtime transformer did not report SKIPPED_CLASS_HASH");
-    }
-
-    private static void verifyContainerGuard(Map<String, byte[]> originals,
-                                             Path coreJar, Path apiJar)
-            throws Exception {
-        String coreName = "com/fs/starfarer/campaign/CampaignState";
-        String apiName =
-                "com/fs/starfarer/api/impl/campaign/terrain/StarCoronaTerrainPlugin";
-        String coreStatus = statusKey(coreName);
-        String apiStatus = statusKey(apiName);
-
-        Properties guardedProperties = profileProperties(false);
-        guardedProperties.setProperty("fastForward.guardJar", "true");
-        FastForwardPresentationTransformer guarded =
-                new FastForwardPresentationTransformer(config(guardedProperties));
-
-        System.clearProperty(coreStatus);
-        require(guarded.transform(null, coreName, null, null,
-                        originals.get(coreName)) == null,
-                "container guard accepted a null ProtectionDomain");
-        require("SKIPPED_CONTAINER_HASH".equals(System.getProperty(coreStatus)),
-                "null ProtectionDomain did not report SKIPPED_CONTAINER_HASH");
-
-        System.clearProperty(coreStatus);
-        require(guarded.transform(null, coreName, null, domain(apiJar),
-                        originals.get(coreName)) == null,
-                "container guard accepted the API JAR for a core target");
-        require("SKIPPED_CONTAINER_HASH".equals(System.getProperty(coreStatus)),
-                "wrong container did not report SKIPPED_CONTAINER_HASH");
-
-        System.clearProperty(coreStatus);
-        byte[] guardedCore = guarded.transform(null, coreName, null, domain(coreJar),
-                originals.get(coreName));
-        require(guardedCore != null && countPresentationCalls(guardedCore) == 3,
-                "valid core container hash did not pass the guard");
-        require("APPLIED".equals(System.getProperty(coreStatus)),
-                "valid core container did not report APPLIED");
-
-        System.clearProperty(apiStatus);
-        byte[] guardedApi = guarded.transform(null, apiName, null, domain(apiJar),
-                originals.get(apiName));
-        require(guardedApi != null && countPresentationCalls(guardedApi) == 1,
-                "valid API container hash did not pass the guard");
-        require("APPLIED".equals(System.getProperty(apiStatus)),
-                "valid API container did not report APPLIED");
-
-        ClassLoader resourceOnlyLoader = resourceLoader(coreJar, coreName + ".class");
-        System.clearProperty(coreStatus);
-        require(guarded.transform(resourceOnlyLoader, coreName, null, domain(apiJar),
-                        originals.get(coreName)) == null,
-                "defining-loader resource bypassed an exposed wrong CodeSource");
-        require("SKIPPED_CONTAINER_HASH".equals(System.getProperty(coreStatus)),
-                "wrong CodeSource with a valid resource did not remain fail-closed");
-
-        System.clearProperty(coreStatus);
-        byte[] resourceGuardedCore = guarded.transform(resourceOnlyLoader, coreName,
-                null, null, originals.get(coreName));
-        require(resourceGuardedCore != null
-                        && countPresentationCalls(resourceGuardedCore) == 3,
-                "valid defining-loader resource did not replace a missing CodeSource");
-        require("APPLIED".equals(System.getProperty(coreStatus)),
-                "valid defining-loader resource did not report APPLIED");
-
-        Properties unguardedProperties = profileProperties(false);
-        unguardedProperties.setProperty("fastForward.guardJar", "false");
-        FastForwardPresentationTransformer unguarded =
-                new FastForwardPresentationTransformer(config(unguardedProperties));
-        require(unguarded.transform(null, coreName, null, null,
-                        originals.get(coreName)) != null,
-                "guardJar=false did not bypass the missing container domain");
-    }
-
-    private static ProtectionDomain domain(Path jar) throws Exception {
-        CodeSource source = new CodeSource(
-                jar.toUri().toURL(), (Certificate[]) null);
-        return new ProtectionDomain(source, null);
-    }
-
-    private static ClassLoader resourceLoader(Path jar, String resourceName)
-            throws Exception {
-        URL resource = new URL("jar:" + jar.toUri().toURL() + "!/" + resourceName);
-        return new ClassLoader(null) {
-            @Override
-            public URL getResource(String name) {
-                return resourceName.equals(name) ? resource : null;
+        String damagedName = "com/fs/starfarer/campaign/CampaignPlanet";
+        ClassNode damaged = read(originals.get(damagedName));
+        MethodNode method = method(damaged, "advance", "(F)V");
+        boolean changed = false;
+        for (AbstractInsnNode insn : method.instructions.toArray()) {
+            if (insn instanceof MethodInsnNode call
+                    && call.owner.equals("com/fs/starfarer/combat/entities/terrain/Planet")
+                    && call.name.equals("advance") && call.desc.equals("(F)V")) {
+                call.name = "structurallyChanged";
+                changed = true;
+                break;
             }
-        };
+        }
+        require(changed, "relevant CampaignPlanet call not found for mutation");
+        String status = statusKey(damagedName);
+        System.clearProperty(status);
+        require(transformer.transform(null, damagedName, null, null,
+                        write(damaged)) == null,
+                "relevant semantic damage did not fail open");
+        require("SKIPPED_STRUCTURAL".equals(System.getProperty(status)),
+                "relevant semantic damage did not report SKIPPED_STRUCTURAL: "
+                        + System.getProperty(status));
     }
 
-    private static String statusKey(String name) {
-        return "starsector.prepatcher.patchStatus."
-                + name.replace('/', '.') + ".fastForwardPresentation";
+    private static void verifyFeatureMasks(Map<String, byte[]> originals) throws Exception {
+        verifyMaskMatrix(originals, "com/fs/starfarer/campaign/CampaignEngine",
+                new String[]{"patch.fastForwardActionIndicators",
+                        "patch.fastForwardGlobalAnimations"});
+        verifyMaskMatrix(originals, "com/fs/starfarer/campaign/BaseCampaignEntity",
+                new String[]{"patch.fastForwardFloatingText",
+                        "patch.fastForwardSensorIndicators",
+                        "patch.fastForwardSensorFaders"});
+        verifyMaskMatrix(originals, "com/fs/starfarer/campaign/fleet/CampaignFleet",
+                new String[]{"patch.fastForwardFleetView",
+                        "patch.fastForwardFleetPresentation"});
+        verifyMaskMatrix(originals,
+                "com/fs/starfarer/api/impl/campaign/velfield/SlipstreamTerrainPlugin2",
+                new String[]{"patch.fastForwardContinuousSound",
+                        "patch.fastForwardSlipstreamParticles"});
+        verifyMaskMatrix(originals,
+                "com/fs/starfarer/api/impl/campaign/GateEntityPlugin",
+                new String[]{"patch.fastForwardContinuousSound",
+                        "patch.fastForwardGateJitter",
+                        "patch.fastForwardParticleEmitters"});
+    }
+
+    private static void verifyMaskMatrix(Map<String, byte[]> originals, String name,
+                                         String[] flags) throws Exception {
+        int combinations = 1 << flags.length;
+        for (int combination = 1; combination < combinations; combination++) {
+            Properties properties = profileProperties(false);
+            setPresentationGroups(properties, false);
+            for (int bit = 0; bit < flags.length; bit++) {
+                properties.setProperty(flags[bit],
+                        Boolean.toString((combination & (1 << bit)) != 0));
+            }
+            PrepatcherConfig config = config(properties);
+            FastForwardPresentationTransformer transformer =
+                    new FastForwardPresentationTransformer(config);
+            byte[] transformed = transformer.transformBytesForTest(name, originals.get(name));
+            require(transformed != null,
+                    name + " feature-mask combination " + combination + " did not apply");
+            require(((Integer) fieldValue(transformed,
+                            FastForwardPresentationTransformer.MASK_FIELD))
+                            == FastForwardPresentationTransformer.requestedMaskForClass(
+                                    name, config),
+                    name + " feature-mask combination " + combination + " mismatch");
+            require(transformer.transformBytesForTest(name, transformed) == null,
+                    name + " feature-mask combination " + combination + " is not idempotent");
+        }
     }
 
     private static void verifyTransformerChain(Map<String, byte[]> originals)
@@ -341,14 +327,14 @@ public final class FastForwardPresentationCompatibilityTest {
                     "transformer chain changed class version for " + name);
             verifyMethods(chained);
 
-            try {
-                presentation.transformBytesForTest(name, direct);
-                throw new AssertionError("reverse structural->presentation order was accepted for "
-                        + name);
-            } catch (IllegalArgumentException expected) {
-                require(expected.getMessage().contains("class hash mismatch"),
-                        "reverse-order rejection was not an exact-hash failure for " + name);
-            }
+            String reverseStatus = statusKey(name);
+            System.clearProperty(reverseStatus);
+            byte[] reverse = presentation.transform(null, name, null, null, direct);
+            String reverseResult = System.getProperty(reverseStatus);
+            require(reverse != null || "SKIPPED_STRUCTURAL".equals(reverseResult),
+                    "reverse structural->presentation order failed non-structurally for "
+                            + name + ": status=" + reverseResult);
+            if (reverse != null) verifyMethods(reverse);
 
             byte[] ownerless = removeField(presentationBytes,
                     PresentationStructuralContract.OWNER_FIELD);
@@ -459,9 +445,31 @@ public final class FastForwardPresentationCompatibilityTest {
     private static Set<String> patchMarkers(byte[] bytes) {
         Set<String> markers = new LinkedHashSet<>();
         for (FieldNode field : read(bytes).fields) {
-            if (field.name.startsWith(PATCH_MARKER_PREFIX)) markers.add(field.name);
+            if (field.name.startsWith(PATCH_MARKER_PREFIX)
+                    && !field.name.equals(FastForwardPresentationTransformer.OWNER_FIELD)) {
+                markers.add(field.name);
+            }
         }
         return markers;
+    }
+
+    private static String statusKey(String name) {
+        return "starsector.prepatcher.patchStatus."
+                + name.replace('/', '.') + ".fastForwardPresentation";
+    }
+
+    private static Object fieldValue(byte[] bytes, String fieldName) {
+        for (FieldNode field : read(bytes).fields) {
+            if (field.name.equals(fieldName)) return field.value;
+        }
+        throw new AssertionError("field not found: " + fieldName);
+    }
+
+    private static MethodNode method(ClassNode node, String name, String desc) {
+        for (MethodNode method : node.methods) {
+            if (method.name.equals(name) && method.desc.equals(desc)) return method;
+        }
+        throw new AssertionError("method not found: " + node.name + "." + name + desc);
     }
 
     private static byte[] removeField(byte[] bytes, String fieldName) {
@@ -525,7 +533,6 @@ public final class FastForwardPresentationCompatibilityTest {
         Properties properties = new Properties();
         properties.setProperty("patch.fastForwardPresentation", "true");
         properties.setProperty("patch.fastForwardFrameMarker", "true");
-        properties.setProperty("fastForward.guardJar", "false");
         properties.setProperty("fastForward.verbose", "false");
         properties.setProperty("fastForward.metrics", "false");
         properties.setProperty("fastForward.visualTime", "realtime");

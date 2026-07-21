@@ -229,6 +229,8 @@ industry недостаточно. Полный scan проверяет:
 
 ```properties
 market.remote.constructionAuditBatches=60
+observer.marketConstructionDiagnostics=false
+observer.marketConstructionDiagnosticsMaxSamplesPerReason=32
 ```
 
 Save flush всегда принудительно выполняет свежий audit. При активном construction mode:
@@ -241,6 +243,25 @@ Save flush всегда принудительно выполняет свежи
 mode. Наличие отрасли, которая когда-либо строилась, не делает режим постоянным.
 
 Ошибка compatibility probe трактуется консервативно как активное строительство.
+
+Detector публикует причины отдельно. Текущие gauges различают queue, building, upgrading,
+uncertain и multiple-reason markets. Накопительные counters различают dirty, safety-audit и forced
+scans, cached decisions, queue/items/industries null cases, число просмотренных элементов,
+false→true/true→false transitions, изменения reason mask и mutation races. Это позволяет отличить
+реальное массовое строительство от постоянного `isBuilding()` у модовой industry или от
+консервативного probe failure без включения подробного CSV.
+
+Опциональная выборка:
+
+```properties
+observer.marketConstructionDiagnostics=true
+observer.marketConstructionDiagnosticsMaxSamplesPerReason=32
+```
+
+создаёт `logs/market-construction-diagnostics/session-*/samples.csv`. Выборка bounded отдельно по
+категории причины и хранит только строки/числа: identity hash, market id/name, queue size/class,
+первую подходящую industry, epochs и transition state. Сильные ссылки на game objects не
+сохраняются, diagnostic writer не участвует в scheduler policy.
 
 ## 11. Construction mutation barriers
 
@@ -394,9 +415,26 @@ observer.marketAdvanceSemanticRisks=false
 
 - `constructionFullRateCalls`;
 - `constructionFullRateMarkets`;
+- `constructionMarketsQueueNonEmpty`;
+- `constructionMarketsIndustryBuilding`;
+- `constructionMarketsIndustryUpgrading`;
+- `constructionMarketsUncertain`;
+- `constructionMarketsMultipleReasons`;
 - `constructionModeEntries`;
 - `constructionModeExits`;
-- `constructionBoundaryExactReplays`.
+- `constructionBoundaryExactReplays`;
+- `constructionScans`, `constructionDirtyScans`, `constructionSafetyAuditScans`,
+  `constructionForcedScans`, `constructionCachedDecisions`;
+- `constructionDetectedQueueNonEmpty`, `constructionDetectedIndustryBuilding`,
+  `constructionDetectedIndustryUpgrading`, `constructionDetectedMultipleReasons`,
+  `constructionDetectedProbeFailure`;
+- `constructionQueueNullScans`, `constructionQueueItemsNullScans`,
+  `constructionIndustriesNullScans`, `constructionQueueItemsObserved`,
+  `constructionIndustriesScanned`, `constructionMaxQueueItems`,
+  `constructionMaxIndustriesScanned`;
+- `constructionAuditStateChanges`, `constructionAuditFalseToTrue`,
+  `constructionAuditTrueToFalse`, `constructionReasonChanges`, `constructionMutationRaces`,
+  `constructionDiagnosticSamplesDropped`.
 
 ### Save
 

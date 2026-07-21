@@ -50,22 +50,39 @@ public final class DirectMarketObserveTransformerTest {
     }
 
     private static void run(Path root) throws Exception {
+        Path gameRoot = root.resolve("Starsector");
+        Path modsRoot = gameRoot.resolve("mods");
+        Path prepatcherRoot = modsRoot.resolve("StarsectorPrepatcher");
+        Path testModRoot = modsRoot.resolve("TestMod");
+        Path otherModRoot = modsRoot.resolve("OtherMod");
+        Path testModJar = testModRoot.resolve("jars").resolve("test.jar");
+        Path otherModJar = otherModRoot.resolve("jars").resolve("test.jar");
+        Files.createDirectories(prepatcherRoot);
+        Files.createDirectories(testModJar.getParent());
+        Files.createDirectories(otherModJar.getParent());
+        Files.writeString(testModRoot.resolve("mod_info.json"),
+                "{\"id\":\"test_mod\",\"name\":\"Test Mod Display\"}",
+                StandardCharsets.UTF_8);
+        Files.writeString(otherModRoot.resolve("mod_info.json"),
+                "{\"id\":\"other_mod\",\"name\":\"Other Mod Display\"}",
+                StandardCharsets.UTF_8);
+
         PrepatcherConfig config = config(true, false);
-        StarsectorPrepatcherRuntimeBridge.configure(config, root);
+        StarsectorPrepatcherRuntimeBridge.configure(config, prepatcherRoot);
         ClassLoader parent = ClassLoader.getSystemClassLoader();
         ChildLoader loader = new ChildLoader(parent);
         ProtectionDomain domain = new ProtectionDomain(
-                new CodeSource(new URL("file:/test/Starsector/mods/TestMod/jars/test.jar"),
+                new CodeSource(testModJar.toUri().toURL(),
                         (Certificate[]) null), null, loader, null);
         byte[] original = generateClass();
         DirectMarketObserveTransformer transformer =
-                new DirectMarketObserveTransformer(config, parent, null);
+                new DirectMarketObserveTransformer(config, parent, prepatcherRoot);
         byte[] transformed = transformer.transform(loader, CLASS_NAME, null, domain, original);
         require(transformed != null, "candidate mod class was not transformed");
 
         PrepatcherConfig syncOnlyConfig = config(false, true);
         DirectMarketObserveTransformer syncOnlyTransformer =
-                new DirectMarketObserveTransformer(syncOnlyConfig, parent, null);
+                new DirectMarketObserveTransformer(syncOnlyConfig, parent, prepatcherRoot);
         byte[] syncOnly = syncOnlyTransformer.transform(
                 loader, CLASS_NAME, null, domain, original);
         require(syncOnly != null && countHooks(syncOnly) == 4,
@@ -73,8 +90,14 @@ public final class DirectMarketObserveTransformerTest {
                         + " when observation was disabled");
 
         PrepatcherConfig riskConfig = config(false, false, true);
+        Path riskLog = prepatcherRoot.resolve("logs")
+                .resolve("market-advance-semantic-risks.csv");
+        Files.createDirectories(riskLog.getParent());
+        Files.writeString(riskLog,
+                "modId,className,methodName,descriptor,componentType,riskCategory,calledOwner,calledMethod,bytecodeOffset\n",
+                StandardCharsets.UTF_8);
         DirectMarketObserveTransformer riskTransformer =
-                new DirectMarketObserveTransformer(riskConfig, parent, root);
+                new DirectMarketObserveTransformer(riskConfig, parent, prepatcherRoot);
         byte[] riskResult = riskTransformer.transform(loader,
                 "test/mod/RiskyIndustry", null, domain, generateRiskClass());
         require(riskResult == null,
@@ -83,7 +106,7 @@ public final class DirectMarketObserveTransformerTest {
                 "observer-only negative test no longer contains a direct Market.advance call");
 
         ProtectionDomain otherDomain = new ProtectionDomain(
-                new CodeSource(new URL("file:/test/Starsector/mods/OtherMod/jars/test.jar"),
+                new CodeSource(otherModJar.toUri().toURL(),
                         (Certificate[]) null), null, loader, null);
         riskTransformer.transform(loader,
                 "test/mod/RiskyIndustry", null, otherDomain, generateRiskClass());
@@ -96,9 +119,16 @@ public final class DirectMarketObserveTransformerTest {
         riskTransformer.transform(loader,
                 "test/mod/UnrelatedAdvance", null, domain,
                 generateUnrelatedAdvanceClass());
-        String risks = Files.readString(root.resolve("logs")
+        String risks = Files.readString(prepatcherRoot.resolve("logs")
                 .resolve("market-advance-semantic-risks.csv"), StandardCharsets.UTF_8);
-        require(risks.contains("TestMod")
+        try (Stream<Path> files = Files.list(riskLog.getParent())) {
+            require(files.anyMatch(path -> path.getFileName().toString()
+                            .startsWith("market-advance-semantic-risks-legacy-")),
+                    "legacy semantic-risk CSV was not rotated during schema upgrade");
+        }
+        require(risks.contains("test_mod")
+                        && risks.contains("Test Mod Display")
+                        && risks.contains("TestMod")
                         && risks.contains("test.mod.RiskyIndustry")
                         && risks.contains("Industry")
                         && risks.contains("INTERVAL_SINGLE_ELAPSE")
@@ -106,7 +136,9 @@ public final class DirectMarketObserveTransformerTest {
                         && risks.contains("SINGLE_THRESHOLD_TRANSITION")
                         && risks.contains("MARKET_STRUCTURE_MUTATION"),
                 "semantic-risk observer report is incomplete: " + risks);
-        require(risks.contains("OtherMod"),
+        require(risks.contains("other_mod")
+                        && risks.contains("Other Mod Display")
+                        && risks.contains("OtherMod"),
                 "semantic-risk dedup collapsed equal class names from different mods: " + risks);
         require(risks.contains("test.mod.IndirectRiskIndustry"),
                 "semantic-risk hierarchy classification did not follow an indirect superclass");
@@ -121,7 +153,12 @@ public final class DirectMarketObserveTransformerTest {
                 "eager transformer registration did not persist four call sites before define: "
                         + manifest);
         require(manifest.contains("test.mod.DirectMarketCaller")
-                        && manifest.contains("mods/TestMod/jars/test.jar"),
+                        && manifest.contains("mods/TestMod/jars/test.jar")
+                        && manifest.contains("mod_id,mod_name,mod_directory,jar_name")
+                        && manifest.contains("test_mod")
+                        && manifest.contains("Test Mod Display")
+                        && manifest.contains("TestMod")
+                        && manifest.contains("test.jar"),
                 "eager transformer manifest lost class/source metadata: " + manifest);
 
         ClassNode node = read(transformed);

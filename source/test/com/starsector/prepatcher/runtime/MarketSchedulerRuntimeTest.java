@@ -2,6 +2,7 @@ package com.starsector.prepatcher.runtime;
 
 import com.fs.starfarer.api.Global;
 import com.fs.starfarer.api.StarsectorPrepatcherHooks;
+import com.fs.starfarer.api.StarsectorPrepatcherRuntimeBridge;
 import com.fs.starfarer.api.campaign.CampaignClockAPI;
 import com.fs.starfarer.api.campaign.CampaignUIAPI;
 import com.fs.starfarer.api.campaign.InteractionDialogAPI;
@@ -21,6 +22,9 @@ import java.lang.reflect.Field;
 import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Properties;
@@ -66,6 +70,8 @@ public final class MarketSchedulerRuntimeTest {
             assertPendingRunOverflowFlush(sector, remoteLocation);
             assertConstructionModeAndMutationBoundary(sector, remoteLocation);
             assertConstructionPolicyDirtyAudit(sector, remoteLocation);
+            assertConstructionReasonCounters(sector, remoteLocation);
+            assertConstructionDiagnosticsCsv(sector, remoteLocation);
             assertSaveExactReplayMode(sector, remoteLocation);
             assertWeakStateDoesNotRetainMarket(sector, remoteLocation);
             assertDisabledFallback(sector, remoteLocation);
@@ -85,7 +91,7 @@ public final class MarketSchedulerRuntimeTest {
                 + " outside-tick/lifecycle/nested/reentrant/duplicate ordering"
                 + " advance-failure/save-abort/direct-sync/finite-overflow-split"
                 + " exact-RLE/batch-context/differential-sequences/run-overflow"
-                + " construction-full-rate/mutation-boundary/save-exact"
+                + " construction-full-rate/mutation-boundary/reason-counters/diagnostic-csv/save-exact"
                 + " weak-key/disabled metrics");
     }
 
@@ -1110,6 +1116,137 @@ public final class MarketSchedulerRuntimeTest {
         StarsectorPrepatcherHooks.marketSchedulerFastForwardIterationChanged(false);
     }
 
+    private static void assertConstructionReasonCounters(
+            SectorContext sector, MutableLocation remote) throws Exception {
+        installConfig(config(true, 32, false));
+        resetSchedulerGeneration();
+        sector.currentLocation = null;
+
+        long queueBefore = metric("CONSTRUCTION_DETECTED_QUEUE_NON_EMPTY");
+        long buildingBefore = metric("CONSTRUCTION_DETECTED_INDUSTRY_BUILDING");
+        long upgradingBefore = metric("CONSTRUCTION_DETECTED_INDUSTRY_UPGRADING");
+        long multipleBefore = metric("CONSTRUCTION_DETECTED_MULTIPLE_REASONS");
+        long failureBefore = metric("CONSTRUCTION_DETECTED_PROBE_FAILURE");
+        long scansBefore = metric("CONSTRUCTION_SCANS");
+
+        MutableMarket queueMarket = new MutableMarket(
+                "construction-reason-queue", remote.proxy, false, false);
+        queueMarket.constructionQueue.addToEnd("queued_industry", 1);
+
+        MutableMarket buildingMarket = new MutableMarket(
+                "construction-reason-building", remote.proxy, false, false);
+        MutableIndustry building = new MutableIndustry();
+        building.building = true;
+        buildingMarket.industries.add(building);
+
+        MutableMarket upgradingMarket = new MutableMarket(
+                "construction-reason-upgrading", remote.proxy, false, false);
+        MutableIndustry upgrading = new MutableIndustry();
+        upgrading.upgrading = true;
+        upgradingMarket.industries.add(upgrading);
+
+        MutableMarket multipleMarket = new MutableMarket(
+                "construction-reason-multiple", remote.proxy, false, false);
+        multipleMarket.constructionQueue.addToEnd("queued_multiple", 1);
+        MutableIndustry both = new MutableIndustry();
+        both.building = true;
+        both.upgrading = true;
+        multipleMarket.industries.add(both);
+
+        MutableMarket failureMarket = new MutableMarket(
+                "construction-reason-failure", remote.proxy, false, false);
+        failureMarket.throwConstructionProbe = true;
+
+        MutableMarket[] markets = {
+                queueMarket, buildingMarket, upgradingMarket, multipleMarket, failureMarket
+        };
+        for (MutableMarket market : markets) {
+            beginSyntheticSchedulerTick();
+            try {
+                StarsectorPrepatcherHooks.advanceMarketScheduled(market.proxy, 0.01f, 0);
+            } finally {
+                endSyntheticSchedulerTick();
+            }
+        }
+
+        require(metric("CONSTRUCTION_SCANS") >= scansBefore + markets.length,
+                "construction reason scenarios did not run one scan per market");
+        require(metric("CONSTRUCTION_DETECTED_QUEUE_NON_EMPTY") >= queueBefore + 2L,
+                "queue reason counter did not include queue-only and multi-reason markets");
+        require(metric("CONSTRUCTION_DETECTED_INDUSTRY_BUILDING") >= buildingBefore + 2L,
+                "building reason counter did not include building and multi-reason markets");
+        require(metric("CONSTRUCTION_DETECTED_INDUSTRY_UPGRADING") >= upgradingBefore + 2L,
+                "upgrading reason counter did not include upgrading and multi-reason markets");
+        require(metric("CONSTRUCTION_DETECTED_MULTIPLE_REASONS") >= multipleBefore + 1L,
+                "multiple construction reasons were not counted");
+        require(metric("CONSTRUCTION_DETECTED_PROBE_FAILURE") >= failureBefore + 1L,
+                "construction probe failure was not counted");
+
+        Object gauges = invokePrivateStatic("marketSchedulerGaugeSnapshot");
+        require(recordInt(gauges, "constructionMarketsQueueNonEmpty") >= 2,
+                "queue reason gauge is incomplete");
+        require(recordInt(gauges, "constructionMarketsIndustryBuilding") >= 2,
+                "building reason gauge is incomplete");
+        require(recordInt(gauges, "constructionMarketsIndustryUpgrading") >= 2,
+                "upgrading reason gauge is incomplete");
+        require(recordInt(gauges, "constructionMarketsMultipleReasons") >= 1,
+                "multiple-reason gauge is incomplete");
+        require(recordInt(gauges, "constructionMarketsUncertain") >= 1,
+                "probe-failure market was not included in uncertain gauge");
+    }
+
+    private static void assertConstructionDiagnosticsCsv(
+            SectorContext sector, MutableLocation remote) throws Exception {
+        Path root = Files.createTempDirectory("prepatcher-construction-diagnostics-");
+        PrepatcherConfig original = config(true, 32, false);
+        try {
+            PrepatcherConfig diagnosticsConfig = config(true, 32, false, true, 1);
+            StarsectorPrepatcherRuntimeBridge.configure(diagnosticsConfig, root);
+            resetSchedulerGeneration();
+            sector.currentLocation = null;
+
+            long droppedBefore = metric("CONSTRUCTION_DIAGNOSTIC_SAMPLES_DROPPED");
+            for (int i = 0; i < 2; i++) {
+                MutableMarket market = new MutableMarket(
+                        "diagnostic-building-" + i, remote.proxy, false, false);
+                MutableIndustry industry = new MutableIndustry();
+                industry.building = true;
+                market.industries.add(industry);
+                beginSyntheticSchedulerTick();
+                try {
+                    StarsectorPrepatcherHooks.advanceMarketScheduled(market.proxy, 0.01f, 0);
+                } finally {
+                    endSyntheticSchedulerTick();
+                }
+            }
+
+            Object diagnostics = staticField("CONSTRUCTION_DIAGNOSTICS");
+            require(diagnostics != null, "construction diagnostics were not initialized");
+            Method writePending = diagnostics.getClass().getDeclaredMethod("writePending");
+            writePending.setAccessible(true);
+            writePending.invoke(diagnostics);
+
+            Path directory = Path.of(System.getProperty(
+                    "starsector.prepatcher.marketConstructionDiagnosticsDir"));
+            String csv = Files.readString(directory.resolve("samples.csv"),
+                    StandardCharsets.UTF_8);
+            require(csv.contains("market_identity_hash,market_id,market_name,trigger")
+                            && csv.contains("reason_mask,reasons,queue_class,queue_size")
+                            && csv.contains("INDUSTRY_BUILDING")
+                            && csv.contains("diagnostic-building-"),
+                    "construction diagnostics CSV is incomplete: " + csv);
+            require(dataRows(csv) == 1,
+                    "per-reason sample limit did not bound diagnostic CSV: " + csv);
+            require(metric("CONSTRUCTION_DIAGNOSTIC_SAMPLES_DROPPED")
+                            >= droppedBefore + 1L,
+                    "diagnostic sample overflow was not counted");
+        } finally {
+            installConfig(original);
+            setStaticField("CONSTRUCTION_DIAGNOSTICS", null);
+            deleteRecursively(root);
+        }
+    }
+
     private static void assertSaveExactReplayMode(
             SectorContext sector, MutableLocation remote) throws Exception {
         installConfig(config(true, 32, true));
@@ -1304,6 +1441,12 @@ public final class MarketSchedulerRuntimeTest {
 
     private static PrepatcherConfig config(
             boolean enabled, int maxPendingRuns, boolean exactReplayBeforeSave) throws Exception {
+        return config(enabled, maxPendingRuns, exactReplayBeforeSave, false, 32);
+    }
+
+    private static PrepatcherConfig config(
+            boolean enabled, int maxPendingRuns, boolean exactReplayBeforeSave,
+            boolean constructionDiagnostics, int maxSamplesPerReason) throws Exception {
         Properties properties = new Properties();
         properties.setProperty("patch.marketScheduler", Boolean.toString(enabled));
         properties.setProperty("market.scheduler.batches", "4");
@@ -1317,6 +1460,10 @@ public final class MarketSchedulerRuntimeTest {
         properties.setProperty("market.remote.maxPendingRuns", Integer.toString(maxPendingRuns));
         properties.setProperty("market.remote.exactReplayBeforeSave",
                 Boolean.toString(exactReplayBeforeSave));
+        properties.setProperty("observer.marketConstructionDiagnostics",
+                Boolean.toString(constructionDiagnostics));
+        properties.setProperty("observer.marketConstructionDiagnosticsMaxSamplesPerReason",
+                Integer.toString(maxSamplesPerReason));
         properties.setProperty("logging.statsIntervalSeconds", "0");
         Constructor<PrepatcherConfig> constructor =
                 PrepatcherConfig.class.getDeclaredConstructor(Properties.class);
@@ -1326,9 +1473,55 @@ public final class MarketSchedulerRuntimeTest {
                         && config.marketSchedulerBatches == 4
                         && config.marketSchedulerHiddenBatches == 8
                         && config.marketSchedulerMaxPendingRuns == maxPendingRuns
-                        && config.marketSchedulerExactReplayBeforeSave == exactReplayBeforeSave,
+                        && config.marketSchedulerExactReplayBeforeSave == exactReplayBeforeSave
+                        && config.marketConstructionDiagnostics == constructionDiagnostics
+                        && config.marketConstructionDiagnosticsMaxSamplesPerReason
+                        == maxSamplesPerReason,
                 "scheduler test configuration was not parsed correctly");
         return config;
+    }
+
+    private static Object invokePrivateStatic(String methodName) throws Exception {
+        Method method = StarsectorPrepatcherHooks.class.getDeclaredMethod(methodName);
+        method.setAccessible(true);
+        return method.invoke(null);
+    }
+
+    private static int recordInt(Object record, String accessor) throws Exception {
+        Method method = record.getClass().getDeclaredMethod(accessor);
+        method.setAccessible(true);
+        return (Integer) method.invoke(record);
+    }
+
+    private static Object staticField(String fieldName) throws Exception {
+        Field field = StarsectorPrepatcherHooks.class.getDeclaredField(fieldName);
+        field.setAccessible(true);
+        return field.get(null);
+    }
+
+    private static void setStaticField(String fieldName, Object value) throws Exception {
+        Field field = StarsectorPrepatcherHooks.class.getDeclaredField(fieldName);
+        field.setAccessible(true);
+        field.set(null, value);
+    }
+
+    private static int dataRows(String csv) {
+        int rows = 0;
+        for (String line : csv.split("\\R")) {
+            if (!line.isBlank()) rows++;
+        }
+        return Math.max(0, rows - 1);
+    }
+
+    private static void deleteRecursively(Path root) throws Exception {
+        if (root == null || !Files.exists(root)) return;
+        try (var paths = Files.walk(root)) {
+            paths.sorted((left, right) -> right.compareTo(left))
+                    .forEach(path -> {
+                        try { Files.deleteIfExists(path); }
+                        catch (Exception ignored) {}
+                    });
+        }
     }
 
     private static long metric(String fieldName) throws Exception {
@@ -1486,6 +1679,7 @@ public final class MarketSchedulerRuntimeTest {
         boolean reenterPlanetOnce;
         boolean throwBeforeApplyOnce;
         boolean throwAfterApplyOnce;
+        boolean throwConstructionProbe;
         boolean inHandler;
         int constructionQueueReads;
         int industryListReads;
@@ -1506,12 +1700,16 @@ public final class MarketSchedulerRuntimeTest {
             }
             return switch (method.getName()) {
                 case "getId" -> id;
+                case "getName" -> id + " name";
                 case "getContainingLocation" -> location;
                 case "isPlayerOwned" -> playerOwned;
                 case "isHidden" -> hidden;
                 case "getMemoryWithoutUpdate" -> memory.proxy;
                 case "getConstructionQueue" -> {
                     constructionQueueReads++;
+                    if (throwConstructionProbe) {
+                        throw new IllegalStateException("synthetic construction probe failure");
+                    }
                     yield constructionQueue;
                 }
                 case "getIndustries" -> {

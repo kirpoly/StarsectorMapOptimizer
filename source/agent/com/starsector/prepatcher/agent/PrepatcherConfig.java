@@ -64,7 +64,6 @@ public final class PrepatcherConfig {
     public final boolean fastForwardSensorFaders;
     public final boolean fastForwardSlipstreamParticles;
     public final boolean fastForwardParticleEmitters;
-    public final boolean fastForwardGuardJar;
     public final boolean fastForwardVerbose;
     public final boolean fastForwardMetrics;
     public final boolean fastForwardVisualTimeSimulation;
@@ -99,6 +98,8 @@ public final class PrepatcherConfig {
     public final int marketSchedulerMaxPendingRuns;
     public final boolean marketSchedulerExactReplayBeforeSave;
     public final boolean marketAdvanceSemanticRiskObserver;
+    public final boolean marketConstructionDiagnostics;
+    public final int marketConstructionDiagnosticsMaxSamplesPerReason;
     public final int directMarketTimingSampleEvery;
     public final int directMarketStackSampleEvery;
     public final int directMarketMaxStacksPerSite;
@@ -178,7 +179,6 @@ public final class PrepatcherConfig {
         fastForwardSensorFaders = bool("patch.fastForwardSensorFaders", false);
         fastForwardSlipstreamParticles = bool("patch.fastForwardSlipstreamParticles", false);
         fastForwardParticleEmitters = bool("patch.fastForwardParticleEmitters", false);
-        fastForwardGuardJar = bool("fastForward.guardJar", true);
         fastForwardVerbose = bool("fastForward.verbose", true);
         fastForwardMetrics = bool("fastForward.metrics", false);
         String fastForwardVisualTime = string("fastForward.visualTime", "realtime")
@@ -236,6 +236,11 @@ public final class PrepatcherConfig {
                 "market.remote.exactReplayBeforeSave", false);
         marketAdvanceSemanticRiskObserver = bool(
                 "observer.marketAdvanceSemanticRisks", false);
+        marketConstructionDiagnostics = bool(
+                "observer.marketConstructionDiagnostics", false);
+        marketConstructionDiagnosticsMaxSamplesPerReason = integer(
+                "observer.marketConstructionDiagnosticsMaxSamplesPerReason",
+                32, 1, 1024);
         directMarketTimingSampleEvery = integer(
                 "directMarket.timingSampleEvery", 128, 0, 1_000_000);
         directMarketStackSampleEvery = integer(

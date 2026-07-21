@@ -32,12 +32,12 @@ The distribution contains a sandbox-safe mod bootstrap and one startup agent:
 agent/StarsectorPrepatcherAgent.jar
 ```
 
-The agent matches and verifies every patch independently, including the hyperspace patches. Most
-patches use local structural contracts, so compatible original or localized game files are accepted.
-The integrated FastForward Presentation Patch `1.1.0` is the deliberate exception: its call-site
-replacements require exact whole-class hashes and support only the current `starfarer_obf.jar` and
-`starfarer.api.jar` hashes listed in [`docs/PATCHES.md`](docs/PATCHES.md). Unknown, ambiguous, or
-changed targets remain vanilla and the reason is written to the diagnostic log.
+The agent matches and verifies every patch independently, including hyperspace and fast-forward
+presentation patches. Compatibility is decided from local method structure, data flow, control flow,
+ownership markers, feature masks, and combined postconditions. Compatible localized or otherwise
+repacked class files remain supported when the owned semantic surface is unchanged. Unknown,
+ambiguous, partial, or foreign hook-shaped targets remain vanilla and the reason is written to the
+diagnostic log.
 
 The agent control code and the typed runtime are deliberately separated. At startup the agent reads
 the `com.fs.starfarer.api.StarsectorPrepatcher*` runtime classfiles from its own JAR and defines them
@@ -125,8 +125,8 @@ enabled=false
 because they participated in confirmed mission-startup failures. They will not be re-enabled until
 their fixes pass an isolated startup and mission suite.
 
-The default and safe profiles enable the exact-hash fast-forward presentation master, frame marker,
-and narrower visual/audio groups. Global animations, sensor faders, slipstream particles, and
+The default and safe profiles enable the structurally matched fast-forward presentation master,
+frame marker, and narrower visual/audio groups. Global animations, sensor faders, slipstream particles, and
 particle emitters remain opt-in because they can change callback, lifetime, RNG, or emission cadence;
 the aggressive profile enables them. `fastForward.visualTime=realtime` keeps presentation at one
 ordinary update per outer frame, while `simulation` accumulates substep time and may produce visible
@@ -157,7 +157,9 @@ Runtime statistics use one `marketScheduler*` family. `marketSchedulerSimulation
 shows the largest observed batch. Work counters distinguish accumulated input calls, delivered
 callbacks, per-simulation-tick opt-outs, and synchronous debt consumption. Failure counters remain
 split by concrete cause. A failed normal callback disables batching only for that market; a failed
-pre-save flush restores pending debt and aborts the save. Periodic counters use `sumThenReset()`.
+pre-save callback discards the already-detached ambiguous debt, switches that market to immediate
+execution, and aborts the save so a partially applied callback is never retried automatically.
+Periodic counters use `sumThenReset()`.
 
 `patch.directMarketObservation` is also enabled in the default/aggressive profile in 0.9.3. It does
 not throttle direct mod calls: each call remains synchronous and immediate. Known planet-condition
@@ -165,7 +167,15 @@ engine calls are reported separately from unknown entries, transformed call site
 manifest before first execution, and the unknown-stack budget renews every report interval. Per-run
 CSV/stacks are written under `logs/direct-market-observe/session-*/`; validation-smoke directories are
 visibly labelled and `session.json` records `sessionOrigin`. Disable observation after collecting data
-to remove sampling overhead.
+to remove sampling overhead. `call-sites.csv` and `observations.csv` contain explicit `mod_id`,
+`mod_name`, mod-directory, and JAR columns resolved from the owning mod's `mod_info.json`; `source`
+remains available as the exact code-source path rather than being the only way to identify a mod.
+
+Construction classification always publishes aggregate reason/scan counters in the periodic stats
+line. Optional bounded samples can be enabled with
+`observer.marketConstructionDiagnostics=true`; they are written under
+`logs/market-construction-diagnostics/session-*/`, retain no game objects, and do not change scheduler
+behavior.
 
 Run `uninstall-agent.bat` for vanilla, `uninstall-agent.bat -Target FasterRendering` for FR, or
 `uninstall-agent.bat -Target Both` to remove both managed entries. Each changed file is backed up.
@@ -177,12 +187,12 @@ Runtime logs:
 ```text
 mods\StarsectorPrepatcher\logs\prepatcher.log
 mods\StarsectorPrepatcher\logs\direct-market-observe\session-*\
+mods\StarsectorPrepatcher\logs\market-construction-diagnostics\session-*\
 ```
 
 The agent records `APPLIED`, `ALREADY_APPLIED`, `SKIPPED_STRUCTURAL`, `SKIPPED_COMPOSITION`,
-`SKIPPED_LOADER`, or `SKIPPED_ERROR` for structural patches. Exact-build presentation targets additionally report
-`SKIPPED_CLASS_HASH` or `SKIPPED_CONTAINER_HASH`. Hyperspace targets use the same structural,
-per-patch status model as the other structural targets. Every skip is fail-open; `SKIPPED_LOADER`
+`SKIPPED_LOADER`, `SKIPPED_ALREADY_LOADED`, or `SKIPPED_ERROR`. Presentation and hyperspace targets
+use the same local structural status model as the other patches. Every skip is fail-open; `SKIPPED_LOADER`
 must be investigated before calling that launch path compatible.
 
 Run `verify-structural.bat` on Windows or `./verify-structural.sh` on Linux/macOS for the complete

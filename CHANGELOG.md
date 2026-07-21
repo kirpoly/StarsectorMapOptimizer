@@ -35,15 +35,33 @@
 
 ## [Unreleased]
 
+### Изменено
+
+- Direct-market call-site metadata переведены на schema 2: `call-sites.csv` и
+  `observations.csv` теперь содержат отдельные `mod_id`, `mod_name`, `mod_directory` и `jar_name`,
+  разрешённые из `mod_info.json` владельца code source. Точный `source` path сохранён отдельным
+  полем; runtime parser продолжает принимать прежнюю schema 1.
+- Construction detector получил полную reason telemetry: queue/building/upgrading/uncertain gauges,
+  dirty/safety/forced scan counters, стоимость обходов, state/reason transitions и mutation races.
+  Отдельный выключенный по умолчанию `observer.marketConstructionDiagnostics` пишет bounded
+  per-reason CSV без сильных ссылок на market/industry objects и не влияет на scheduler policy.
+- `FastForwardPresentationTransformer` переведён с whole-class/JAR SHA-256 gating на 24 локальных
+  structural class plans. Все включённые компоненты класса применяются одной транзакцией; каждый
+  transformed target получает общий owner и global feature mask. `CampaignState` выводит substep и
+  total locals через data-flow/loop protocol, а `CampaignFleet` выбирает pulse fader относительно
+  sensor-range presentation block, не по порядковому номеру. Удалены прежняя JAR-hash guard setting и
+  hash-specific statuses; unrelated classfile changes больше не блокируют compatible call sites.
+
+
 ### Объединено
 
-- Пересечения exact-hash presentation transformer и structural transformer закрыты единым
+- Пересечения presentation transformer и structural transformer закрыты единым
   ownership/postcondition контрактом для `CampaignState`, `CampaignEngine`, `BaseLocation`,
   `BaseCampaignEntity` и `HyperspaceTerrainPlugin`. Presentation-stage публикует private synthetic
   owner и feature mask; structural-stage принимает только полностью vanilla или полностью
   подтверждённое presentation-состояние, перепроверяет его после каждого structural commit и в
   финальной композиции. Partial/foreign hooks отклоняют structural invocation до любых изменений;
-  обратный порядок structural → presentation явно невозможен из-за exact whole-class hash.
+  обратный порядок не является runtime-контрактом и проверяется локально structural matcher-ом.
 - Save method `CampaignGameManager.o00000(CampaignEngine$o,J,Z)` разделён на correctness-critical
   `saveMethodPlan` и ordered optional `saveOutputBufferDedup`. `saveMethodPlan` атомарно владеет только
   forced cache maintenance и scheduler pre-save flush/registration. Output-chain rewrite применяется
@@ -79,7 +97,7 @@
   policy, одним pending debt и одним pre-save flush для Economy-loop и planet-condition источников.
   Режим `FRAME_CONTEXT_ONLY`, отдельные runtime hooks/state maps и агрегированные fallback counters
   удалены. Source id используется только для диагностики.
-- FastForward Presentation Patch `1.1.0` интегрирован как exact-build transformer внутри единого
+- FastForward Presentation Patch `1.1.0` интегрирован как structural transformer внутри единого
   `StarsectorPrepatcherAgent.jar`. Его hooks входят в общий target/game-loader runtime payload;
   отдельный FFP-agent, вторая `-javaagent` запись и дублирующая startup-инфраструктура не нужны.
 - Presentation transformer регистрируется перед structural transformer Prepatcher, чтобы проверять
@@ -159,7 +177,7 @@
   text, fleet, sensor, celestial/aurora, continuous sound и gate presentation. Simulation продолжает
   выполняться на каждом substep; подтверждённые presentation calls выполняются один раз на финальном
   substep outer frame.
-- Опции `fastForward.visualTime`, `fastForward.guardJar`, `fastForward.verbose` и
+- Опции `fastForward.visualTime`, `fastForward.verbose` и
   `fastForward.metrics`. Режим `realtime` оставляет один обычный visual-time шаг, а opt-in
   `simulation` накапливает время substeps и может давать заметные нелинейные скачки.
 - Global animations, sensor faders, slipstream particles и particle emitters выделены в aggressive
@@ -168,21 +186,15 @@
 
 ### Совместимость
 
-- Presentation targets поддерживаются только для текущих exact SHA-256 containers:
-  `starfarer_obf.jar` — `5dd222b9e266d2ac2d63b3dad4983eb05caaf5a247d7dfb82aaeba47ea774cc8`,
-  `starfarer.api.jar` — `a7ba18f3476ffe704729bd0a7a47443f035fea98a32ac2930eae8b391d013c2a`,
-  и зафиксированных whole-class hashes. Переводные, перепакованные и другие game builds этим
-  exact-hash блоком не объявляются совместимыми.
-- Несовпадение target/container hash оставляет original bytes со статусом
-  `SKIPPED_CLASS_HASH`/`SKIPPED_CONTAINER_HASH`. Отключение `fastForward.guardJar` снимает только
-  container guard; обязательный exact class hash сохраняется.
+- Presentation targets используют локальные structural contracts и не зависят от SHA-256
+  classfile/JAR. Partial/ambiguous/foreign hook-shaped states получают `SKIPPED_STRUCTURAL`.
 - Уже загруженный presentation-only target получает локальный `SKIPPED_ALREADY_LOADED` и больше не
   отменяет установку прежних structural patches. Если до premain уже загружен обязательный
   `CampaignState` frame marker, выключается только presentation transformer.
 - Faster Rendering с пустым `CodeSource` проверяется через exact defining-loader JAR resource.
-  Классы, которые сам FR изменил до Instrumentation (в текущем `fr.jar` это, в частности,
-  `HyperspaceTerrainPlugin`), по-прежнему безопасно получают `SKIPPED_CLASS_HASH`; их независимые
-  structural patches продолжают применяться.
+  Классы, которые FR изменил до Instrumentation, применяются при неизменной local presentation
+  surface либо получают локальный `SKIPPED_STRUCTURAL`; независимые structural patches продолжают
+  применяться.
 
 ## [0.9.5] - 2026-07-18
 
