@@ -35,7 +35,7 @@ agent JAR как обычные entries `com/fs/starfarer/api/StarsectorPrepatch
 не должен иметь на них статических ссылок: `RuntimeInstaller` читает эти entries как bytes и через
 `MethodHandles.Lookup.defineClass()` определяет их в system/game loader. Build завершается ошибкой,
 если в JAR нет обязательных top-level entries или exact inventory текущего payload отличается от
-67 top-level/nested class entries:
+80 top-level/nested class entries:
 
 ```text
 com/fs/starfarer/api/StarsectorPrepatcherHooks.class
@@ -82,8 +82,8 @@ Linux/macOS:
 4. трансформирует `starfarer_obf.jar`, `fs.common_obf.jar`, `fs.sound_obf.jar` в памяти;
 5. выполняет ASM `Analyzer + BasicVerifier` для concrete methods;
 6. проверяет idempotency/ownership/negative structural cases, затем exact-hash safe/aggressive
-   presentation profiles, 24 target-класса и цепочку с четырьмя пересекающимися structural patches;
-7. запускает presentation scheduler/actual-agent smoke, lifecycle, exp6/exp8, remote-market
+   presentation profiles, 24 target-класса и цепочку с пятью пересекающимися presentation/structural targets;
+7. запускает presentation scheduler/actual-agent smoke, lifecycle, exp6/exp8, unified market
    scheduler, direct-market observation, persistent
    economy, commodity temporal, dormant-industry, temp-mod и loading/save runtime suites;
 8. отдельно прогоняет actual-agent smokes commodity/temp-mod/no-op и XStream save, затем проверяет
@@ -103,6 +103,7 @@ profile и только там включает known-disabled loading/startup p
 `fast-forward-presentation-compatibility.txt`, `fast-forward-presentation-runtime.txt`,
 `fast-forward-presentation-actual-agent.txt`, `direct-market-transformer.txt`,
 `runtime-regression.txt`, `temp-mod-actual-agent-smoke.txt`,
+`market-step-replay-actual-agent-smoke.txt`,
 `commodity-temporal-agent-smoke.txt`, `market-noop-actual-agent-smoke.txt`,
 `temp-mod-xstream-save-smoke.txt`, `hyperspace-verification.txt`, `startup-smoke.txt` и
 `faster-rendering-loader-smoke.txt` создаются в `.build/reports/` и намеренно не входят в

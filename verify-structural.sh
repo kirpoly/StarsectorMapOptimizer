@@ -71,12 +71,14 @@ RUNTIME_CP="$TEST_CLASSES:$MOD_ROOT/agent/StarsectorPrepatcherAgent.jar:$CORE/st
 {
   echo '== LifecycleGcRegressionTest =='
   java -cp "$RUNTIME_CP" com.starsector.prepatcher.runtime.LifecycleGcRegressionTest
+  echo '== CacheMaintenanceRuntimeTest =='
+  java -cp "$RUNTIME_CP" com.starsector.prepatcher.runtime.CacheMaintenanceRuntimeTest
   echo '== Exp6RuntimeRegressionTest =='
   java -cp "$RUNTIME_CP" com.starsector.prepatcher.runtime.Exp6RuntimeRegressionTest
   echo '== Exp8RuntimeRegressionTest =='
   java -cp "$RUNTIME_CP" com.starsector.prepatcher.runtime.Exp8RuntimeRegressionTest
-  echo '== RemoteMarketSchedulerRuntimeTest =='
-  java -cp "$RUNTIME_CP" com.starsector.prepatcher.runtime.RemoteMarketSchedulerRuntimeTest
+  echo '== MarketSchedulerRuntimeTest =='
+  java -cp "$RUNTIME_CP" com.starsector.prepatcher.runtime.MarketSchedulerRuntimeTest
   echo '== DirectMarketObservationRuntimeTest =='
   java -cp "$RUNTIME_CP" com.starsector.prepatcher.runtime.DirectMarketObservationRuntimeTest
   echo '== PersistentEconomyRuntimeRegressionTest =='
@@ -110,6 +112,13 @@ java \
   -cp "$RUNTIME_CP" \
   com.starsector.prepatcher.runtime.TempModActualAgentSmokeTest \
   2>&1 | tee "$REPORT_DIR/temp-mod-actual-agent-smoke.txt"
+
+java \
+  -Dstarsector.prepatcher.sessionOrigin=market-step-replay-smoke \
+  "-javaagent:$MOD_ROOT/agent/StarsectorPrepatcherAgent.jar" \
+  -cp "$RUNTIME_CP" \
+  com.starsector.prepatcher.runtime.MarketStepReplayActualAgentSmokeTest \
+  2>&1 | tee "$REPORT_DIR/market-step-replay-actual-agent-smoke.txt"
 
 # Exercise the active-set dependency contract with every other patch, including
 # the standalone temp-mod switch, disabled. The transformer must still install

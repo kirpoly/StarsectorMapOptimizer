@@ -1,3 +1,22 @@
+## Market.advance step semantics
+
+- Added raw-float RLE pending history and reusable market-specific batch-context stack.
+- Added local exact-step replay wrappers for `MilitaryBase`, `LionsGuardHQ`, and `RecentUnrest`.
+- Added temporary construction full-rate mode plus exact mutation barriers for `Market`, `BaseIndustry`, and `ConstructionQueue`.
+- Added coalesced/exact save modes, scheduler semantic metrics, and a behavior-neutral mod risk observer.
+- Fixed the scheduler capability gate so deferral requires all eleven core/semantic components,
+  including `Market.advancePlan`, the three replay wrappers and both construction-barrier groups.
+  Missing registration or a structurally skipped wrapper now keeps the scheduler synchronous.
+- Made semantic-risk observer-only mode strictly static even when the inspected class contains a
+  direct `Market.advance()` call; hierarchy classification is transitive and report dedup includes
+  source/mod identity.
+- Replaced per-input construction scans with mutation epochs plus a bounded safety audit, removed
+  duplicate queue-owner registration, and added a JAR-wide construction-mutator inventory test.
+- Defined save callback failure as non-retriable once invocation begins: ambiguous detached debt is
+  discarded, the market is disabled into synchronous fail-open, and the save exception propagates.
+- Documented that local component replay does not prove global intercomponent/RNG ordering without
+  campaign-level differential tests.
+
 # Журнал изменений
 
 Здесь фиксируются заметные пользовательские изменения StarsectorPrepatcher. Формат основан на
@@ -18,14 +37,124 @@
 
 ### Объединено
 
+- Пересечения exact-hash presentation transformer и structural transformer закрыты единым
+  ownership/postcondition контрактом для `CampaignState`, `CampaignEngine`, `BaseLocation`,
+  `BaseCampaignEntity` и `HyperspaceTerrainPlugin`. Presentation-stage публикует private synthetic
+  owner и feature mask; structural-stage принимает только полностью vanilla или полностью
+  подтверждённое presentation-состояние, перепроверяет его после каждого structural commit и в
+  финальной композиции. Partial/foreign hooks отклоняют structural invocation до любых изменений;
+  обратный порядок structural → presentation явно невозможен из-за exact whole-class hash.
+- Save method `CampaignGameManager.o00000(CampaignEngine$o,J,Z)` разделён на correctness-critical
+  `saveMethodPlan` и ordered optional `saveOutputBufferDedup`. `saveMethodPlan` атомарно владеет только
+  forced cache maintenance и scheduler pre-save flush/registration. Output-chain rewrite применяется
+  после него с отдельным marker и обязан сохранить barrier postcondition. Несовместимость 1 MiB
+  allocation pattern теперь пропускает только dedup и больше не отключает scheduler capability;
+  malformed barrier, напротив, не может зарегистрировать save-компонент, но не блокирует независимый
+  buffer patch.
+- `Economy.advance(F)V` и связанное owner-local состояние теперь имеют единый structural patch plan
+  `economyAdvancePlan`. Независимые config keys persistent snapshots, location cache и market
+  scheduler source формируют точную feature mask, но анализируются и коммитятся одной транзакцией
+  в порядке snapshots → location cache → scheduler source. Legacy split markers, unowned partial
+  state, повреждённая combined postcondition или несовместимость любого компонента оставляют весь
+  класс `Economy` неизменённым.
+- `Market.advance(F)V` теперь имеет единый structural patch plan и ownership marker
+  `marketAdvancePlan`. Независимые config keys persistent snapshots, commodity temporal fast path и
+  direct entry observation формируют точную feature mask, но анализируются и коммитятся одной
+  транзакцией в явном порядке. Legacy split markers, unowned partial state, повреждённая combined
+  postcondition или несовместимость любого запрошенного компонента оставляют весь класс `Market`
+  неизменённым.
+- `Z.o00000(FF)V` теперь принадлежит одному атомарному `patch.intelArrowRendering`: `getArrowData` cache, две reusable `Vector2f` и общий reentrant scratch scope анализируются и устанавливаются вместе. Старый `patch.arrowVectorPool` удалён без alias; `patch.intelCallbackCache` продолжает владеть только независимыми `getMapLocation` sites в `A` и `EventsPanel`. Mixed/partial state оставляет весь arrow-rendering path vanilla.
+- `EventsPanel.addMissingIconsAndRows()` теперь принадлежит одному атомарному `patch.intelReconciliation`: missing-plugin membership, direct existing-icon candidates и общий reentrant scratch scope анализируются и устанавливаются вместе. Старые `patch.intelFastContains` и `patch.intelExistingIconLookup` удалены без aliases; mixed/partial state оставляет всю reconciliation-группу vanilla, не отменяя независимый `patch.intelCallbackCache`.
+- Весь `A.OO0000(FFF)` hit-test теперь принадлежит одному атомарному `patch.mapHitTest`: reusable
+  hit list, reusable hit point, reentrant scratch scope, preserved original method и bounded exact-result
+  cache wrapper анализируются и устанавливаются вместе. Старые `patch.scratchCollections` и
+  `patch.hoverHitTestCache` удалены без aliases; mixed/partial wrapper, scope или allocation state
+  оставляет весь hit-test vanilla, не отменяя независимый Intel callback patch класса `A`.
+- `H.renderStuff(FZ)V` теперь изменяется одним атомарным `patch.mapRenderStuff`: semantic
+  `retainAllFast`, reusable entity list, reusable class set и общий reentrant scratch scope
+  анализируются и устанавливаются как одна группа. Старый `patch.retainAll` удалён.
+  Mixed/partial state отклоняет всю группу без потери других патчей класса `H`.
+- Старые `patch.remoteMarketScheduler` и `patch.planetConditionMarketScheduler` удалены без aliases.
+  Их заменяет один `patch.marketScheduler` с единым hook, одной identity-keyed state map, одной
+  policy, одним pending debt и одним pre-save flush для Economy-loop и planet-condition источников.
+  Режим `FRAME_CONTEXT_ONLY`, отдельные runtime hooks/state maps и агрегированные fallback counters
+  удалены. Source id используется только для диагностики.
 - FastForward Presentation Patch `1.1.0` интегрирован как exact-build transformer внутри единого
   `StarsectorPrepatcherAgent.jar`. Его hooks входят в общий target/game-loader runtime payload;
   отдельный FFP-agent, вторая `-javaagent` запись и дублирующая startup-инфраструктура не нужны.
 - Presentation transformer регистрируется перед structural transformer Prepatcher, чтобы проверять
   исходные bytes каждого target, сохраняя общий classloader guard для vanilla и Faster Rendering.
 
+### Удалено
+
+- Удалён отдельный `patch.economySnapshotReuse`: config field, transformer paths, ownership markers,
+  scratch runtime hooks и метрика `economySnapshotElements` больше не входят в агент. Старый key
+  только выдаёт предупреждение и не выбирает трансформацию.
+- `patch.economyPersistentSnapshots` больше не скрывает scratch-оптимизацию paused-condition loop;
+  этот редкий участок сохраняет vanilla fresh-copy поведение.
+
+### Исправлено
+
+- Scratch high-water теперь фиксируется в ASM-доказанных mutation sites, а не только при
+  `ScratchFrame.clear()`: peak retained list/set сохраняется даже после caller `clear()` до выхода
+  из scope. Возвращаемые коллекции остаются exact `ArrayList`/`HashSet`; tracked subclasses не
+  используются.
+- После `scratch.trimGraceMs` удаляются trailing inactive frames, созданные патологической глубокой
+  реентерабельностью; сохраняются четыре обычных frame для штатной вложенности. Active/nested frame
+  не удаляется.
+- Starfield `PooledList.add/addAll` больше не вызывает `nanoTime()` на каждой операции: hot path
+  обновляет только integer high-water, а oversized timestamp ставится одним clock read при release.
+- `scratchRetainedListCapacity` и `scratchRetainedSetCapacity` теперь суммируют high-water каждой
+  retained коллекции. Campaign generation reset немедленно сбрасывает scratch gauges в EMPTY
+  snapshot.
+- Hover freshness и physical pruning используют одинаковую границу: `age < TTL` валиден,
+  `age >= TTL` просрочен.
+
+- Market scheduler cadence переведён с simulation ticks на render batches. Граница batch определяется
+  через `CampaignEngine.setFastForwardIteration(false)`, поэтому при постоянном `amount` и ускорении
+  ×4/×10/×100 число callback-ов batch-managed markets не растёт пропорционально числу simulation
+  iterations; весь accumulated amount доставляется на batch boundary.
+- Шесть оставшихся core create/remove `MarketAPI.advance(0f)` call sites направлены через дешёвый
+  synchronous debt hook. Coverage test требует два periodic и шесть synchronized core sites и падает
+  при появлении нового неизвестного call site.
+- Full-rate memory opt-out заменён явным per-simulation-tick key
+  `$starsectorPrepatcher_perSimulationTickMarket`; stats показывают текущее число таких рынков, их
+  callbacks и изменения флага. Routine game-day/deferred-call caps удалены.
+- `patch.hyperspaceCulling` и `patch.hyperspaceYClamp` объединены в атомарный
+  `patch.hyperspaceViewportBounds`: обе связанные части вычисления вертикальной границы во всех
+  ожидаемых viewport-методах сначала структурно проверяются и только затем изменяются вместе.
+  Частично исправленное или неоднозначное состояние больше не допускает применения второй половины.
+- Старые два config key принимаются как deprecated aliases только при одинаковом значении; при
+  расхождении атомарный патч выключается вместо частичного исправления.
+
 ### Добавлено
 
+- Campaign-thread cache maintenance для `LABEL_INDEXES`, `INTEL_ENTITY_INDEXES` и `HIT_CACHES`:
+  отдельные owner idle TTL, линейный LRU при лимитах 32/32/64, интервальное удаление expired hover
+  cells и generation-safe throttle. Forced sweep встроен первой save-boundary операцией перед
+  market-debt flush и XStream serialization; отдельного maintenance thread и `System.gc()` нет.
+- Delayed high-water trimming reusable `ScratchFrame` и hyperspace/starfield `ListPool`. Oversized
+  storage сохраняется в течение configurable grace period, никогда не заменяется внутри active или
+  nested scope и затем освобождается заменой свободного frame/drop списка. Добавлены gauges retained
+  capacity/pool sizes и cumulative idle/LRU/prune/trim counters.
+- Детерминированный `CacheMaintenanceRuntimeTest` с synthetic clock покрывает TTL boundaries, LRU,
+  hover prune interval, generation isolation, forced maintenance, nested/exceptional scratch close и
+  starfield grace trimming.
+
+- Единая telemetry market scheduler: source counters используются только для attribution, а причины
+  fail-open разделены на not-ready tick/call, nested tick, outside tick, lifecycle, frame capture,
+  invalid input, state, reentrant, duplicate tick, policy, callback, direct synchronization и
+  save-flush counters. Агрегированного fallback counter нет; все периодические counters используют
+  `sumThenReset()`.
+- Четыре обязательных market-scheduler component регистрируются после нормальной инициализации
+  классов. Deferral включается только после готовности CampaignEngine tick/lifecycle, Economy source,
+  entity source и save flush; частичная установка остаётся synchronous-immediate и не создаёт debt.
+- Scheduler tick перенесён с `Economy.advance()` на весь `CampaignEngine.advance()`, поэтому
+  planet-condition source не зависит от чужого scratch scope. State map использует weak identity
+  keys, duplicate same-tick call потребляет ранний debt, direct mod calls синхронизируют pending,
+  callback failure отключает scheduling конкретного market, а failed pre-save flush прерывает save.
+- Runtime regression защищает capability/lifecycle gate, реальную tick boundary, deferred duplicate
+  ordering, callback exception policy, save-abort/restore, direct synchronization и weak-key GC.
 - Master/frame marker и отдельные переключатели fast-forward coalescing для action/location/floating
   text, fleet, sensor, celestial/aurora, continuous sound и gate presentation. Simulation продолжает
   выполняться на каждом substep; подтверждённые presentation calls выполняются один раз на финальном

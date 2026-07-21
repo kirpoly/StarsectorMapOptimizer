@@ -1,6 +1,7 @@
 package com.starsector.prepatcher.agent;
 
 import jdk.internal.org.objectweb.asm.ClassReader;
+import jdk.internal.org.objectweb.asm.ClassWriter;
 import jdk.internal.org.objectweb.asm.Opcodes;
 import jdk.internal.org.objectweb.asm.tree.AbstractInsnNode;
 import jdk.internal.org.objectweb.asm.tree.ClassNode;
@@ -37,13 +38,17 @@ public final class FastForwardPresentationCompatibilityTest {
 
     private static final Map<String, Expected> EXPECTED = expectedTargets();
     private static final Map<String, Set<String>> CHAIN_MARKERS = Map.of(
+            "com/fs/starfarer/campaign/CampaignState", Set.of(
+                    "smo$patched$marketScheduler"),
             "com/fs/starfarer/campaign/CampaignEngine", Set.of(
                     "smo$patched$campaignCacheLifecycle",
+                    "smo$patched$marketScheduler",
                     "smo$patched$campaignListenerThrottle"),
             "com/fs/starfarer/campaign/BaseLocation", Set.of(
                     "smo$patched$campaignSnapshotReuse"),
             "com/fs/starfarer/campaign/BaseCampaignEntity", Set.of(
-                    "smo$patched$entityScriptSnapshotReuse"),
+                    "smo$patched$entityScriptSnapshotReuse",
+                    "smo$patched$marketScheduler"),
             "com/fs/starfarer/api/impl/campaign/terrain/HyperspaceTerrainPlugin", Set.of(
                     "smo$patched$skipNoOpTerrainLayer"));
 
@@ -125,6 +130,12 @@ public final class FastForwardPresentationCompatibilityTest {
             require(actualCalls == expectedCalls,
                     label + " " + name + ": expected " + expectedCalls
                             + " presentation calls, found " + actualCalls);
+            PresentationStructuralContract.State composition =
+                    PresentationStructuralContract.inspect(name, transformed, config);
+            require(composition.present()
+                            == PresentationStructuralContract.OVERLAP_CLASSES.contains(name),
+                    label + " presentation ownership mismatch for " + name + ": "
+                            + composition);
             verifyMethods(transformed);
             classes++;
             callSites += actualCalls;
@@ -300,10 +311,20 @@ public final class FastForwardPresentationCompatibilityTest {
             require(direct != null,
                     "structural transformer did not transform vanilla overlap " + name);
 
+            PresentationStructuralContract.State presentationState =
+                    PresentationStructuralContract.inspect(name, presentationBytes, config);
+            require(presentationState.present(),
+                    "presentation stage did not publish composition ownership for " + name);
+
             byte[] chained = new PrepatcherTransformer(config).transform(
                     null, name, null, null, presentationBytes);
             require(chained != null,
                     "structural transformer rejected presentation-patched overlap " + name);
+            presentationState.validate(chained, config);
+            require("PASSED".equals(System.getProperty(
+                            "starsector.prepatcher.patchStatus." + name.replace('/', '.')
+                                    + ".presentationStructuralComposition")),
+                    "combined presentation/structural status did not pass for " + name);
             require(countPresentationCalls(chained) == presentationCalls,
                     "structural transformer lost presentation hooks in " + name);
             require(patchMarkers(direct).equals(entry.getValue()),
@@ -319,7 +340,40 @@ public final class FastForwardPresentationCompatibilityTest {
             require(classVersion(original) == classVersion(chained),
                     "transformer chain changed class version for " + name);
             verifyMethods(chained);
+
+            try {
+                presentation.transformBytesForTest(name, direct);
+                throw new AssertionError("reverse structural->presentation order was accepted for "
+                        + name);
+            } catch (IllegalArgumentException expected) {
+                require(expected.getMessage().contains("class hash mismatch"),
+                        "reverse-order rejection was not an exact-hash failure for " + name);
+            }
+
+            byte[] ownerless = removeField(presentationBytes,
+                    PresentationStructuralContract.OWNER_FIELD);
+            String compositionStatus = "starsector.prepatcher.patchStatus."
+                    + name.replace('/', '.') + ".presentationStructuralComposition";
+            System.clearProperty(compositionStatus);
+            require(new PrepatcherTransformer(config).transform(
+                            null, name, null, null, ownerless) == null,
+                    "structural transformer accepted ownerless presentation hooks in " + name);
+            require("SKIPPED_COMPOSITION".equals(System.getProperty(compositionStatus)),
+                    "ownerless presentation state did not report SKIPPED_COMPOSITION in "
+                            + name);
         }
+
+        String tamperName = "com/fs/starfarer/campaign/CampaignEngine";
+        byte[] tamperedHooks = renameFirstPresentationHook(
+                presentation.transformBytesForTest(tamperName, originals.get(tamperName)));
+        String tamperStatus = "starsector.prepatcher.patchStatus."
+                + tamperName.replace('/', '.') + ".presentationStructuralComposition";
+        System.clearProperty(tamperStatus);
+        require(new PrepatcherTransformer(config).transform(
+                        null, tamperName, null, null, tamperedHooks) == null,
+                "structural transformer accepted a tampered presentation hook inventory");
+        require("SKIPPED_COMPOSITION".equals(System.getProperty(tamperStatus)),
+                "tampered presentation hook inventory did not fail composition");
     }
 
     private static Properties chainProperties() {
@@ -338,13 +392,12 @@ public final class FastForwardPresentationCompatibilityTest {
         properties.setProperty("patch.labelSpatialCandidates", "false");
         properties.setProperty("patch.intelCallbackCache", "false");
         properties.setProperty("patch.intelEntityIndex", "false");
-        properties.setProperty("patch.hoverHitTestCache", "false");
+        properties.setProperty("patch.mapHitTest", "false");
         properties.setProperty("patch.systemNebulaCache", "false");
         properties.setProperty("patch.sampleCacheClearThrottle", "false");
         properties.setProperty("patch.routeJumpPointIndex", "false");
         properties.setProperty("patch.economyLocationCache", "false");
-        properties.setProperty("patch.remoteMarketScheduler", "false");
-        properties.setProperty("patch.planetConditionMarketScheduler", "false");
+        properties.setProperty("patch.marketScheduler", "true");
         properties.setProperty("patch.directMarketObservation", "false");
         properties.setProperty("patch.commRelaySystemIndex", "false");
         properties.setProperty("patch.commodityTemporalFastPath", "false");
@@ -409,6 +462,33 @@ public final class FastForwardPresentationCompatibilityTest {
             if (field.name.startsWith(PATCH_MARKER_PREFIX)) markers.add(field.name);
         }
         return markers;
+    }
+
+    private static byte[] removeField(byte[] bytes, String fieldName) {
+        ClassNode node = read(bytes);
+        require(node.fields.removeIf(field -> field.name.equals(fieldName)),
+                "field not found for removal: " + fieldName);
+        return write(node);
+    }
+
+    private static byte[] renameFirstPresentationHook(byte[] bytes) {
+        ClassNode node = read(bytes);
+        for (MethodNode method : node.methods) {
+            for (AbstractInsnNode insn : method.instructions.toArray()) {
+                if (insn instanceof MethodInsnNode call
+                        && call.owner.equals(PRESENTATION_HOOKS)) {
+                    call.name = call.name + "$tampered";
+                    return write(node);
+                }
+            }
+        }
+        throw new AssertionError("presentation hook not found for tamper");
+    }
+
+    private static byte[] write(ClassNode node) {
+        ClassWriter writer = new ClassWriter(ClassWriter.COMPUTE_MAXS);
+        node.accept(writer);
+        return writer.toByteArray();
     }
 
     private static void verifyMethods(byte[] bytes) throws Exception {

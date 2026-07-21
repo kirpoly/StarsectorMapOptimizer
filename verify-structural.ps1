@@ -161,9 +161,10 @@ $runtimeReport = Join-Path $reportDir 'runtime-regression.txt'
 $runtimeLines = [System.Collections.Generic.List[string]]::new()
 foreach ($test in @(
     'com.starsector.prepatcher.runtime.LifecycleGcRegressionTest',
+    'com.starsector.prepatcher.runtime.CacheMaintenanceRuntimeTest',
     'com.starsector.prepatcher.runtime.Exp6RuntimeRegressionTest',
     'com.starsector.prepatcher.runtime.Exp8RuntimeRegressionTest',
-    'com.starsector.prepatcher.runtime.RemoteMarketSchedulerRuntimeTest',
+    'com.starsector.prepatcher.runtime.MarketSchedulerRuntimeTest',
     'com.starsector.prepatcher.runtime.DirectMarketObservationRuntimeTest',
     'com.starsector.prepatcher.runtime.PersistentEconomyRuntimeRegressionTest',
     'com.starsector.prepatcher.runtime.MarketNoOpRuntimeRegressionTest',
@@ -248,6 +249,25 @@ $tempModAgentLines = @($tempModAgentOutput | ForEach-Object { $_.ToString() })
 $tempModAgentLines
 [IO.File]::WriteAllLines($tempModAgentReport, [string[]] $tempModAgentLines, $utf8)
 if ($tempModAgentExitCode -ne 0) { throw 'Temp-mod actual-agent smoke failed.' }
+
+$marketStepReplayReport = Join-Path $reportDir 'market-step-replay-actual-agent-smoke.txt'
+$ErrorActionPreference = 'Continue'
+try {
+    $marketStepReplayOutput = @(& java `
+        '-Dstarsector.prepatcher.sessionOrigin=market-step-replay-smoke' `
+        "-javaagent:$mainAgentJar" -cp $runtimeCp `
+        com.starsector.prepatcher.runtime.MarketStepReplayActualAgentSmokeTest 2>&1)
+    $marketStepReplayExitCode = $LASTEXITCODE
+} finally {
+    $ErrorActionPreference = $savedErrorActionPreference
+}
+$marketStepReplayLines = @($marketStepReplayOutput | ForEach-Object { $_.ToString() })
+$marketStepReplayLines
+[IO.File]::WriteAllLines(
+    $marketStepReplayReport, [string[]] $marketStepReplayLines, $utf8)
+if ($marketStepReplayExitCode -ne 0) {
+    throw 'Market step-replay actual-agent smoke failed.'
+}
 
 $commoditySmokeConfig = Join-Path $build 'commodity-temporal-agent-smoke.properties'
 $commoditySmokeText = [IO.File]::ReadAllText((Join-Path $modRoot 'prepatcher.properties'))

@@ -94,8 +94,8 @@ The prepatcher does not modify save data, and its runtime caches are never seria
 
 - sector, system, and Intel maps: reconciliation, spatial candidates, callbacks, hover checks,
   entity indexes, nebula metadata, scratch collections, and grid LOD;
-- campaign and economy: lifecycle-bound caches, listener refresh, reusable snapshots, aggressive
-  staggered schedulers for central remote markets and planet-condition-only markets, corrected
+- campaign and economy: lifecycle-bound caches, listener refresh, reusable snapshots, one unified
+  scheduler for all transformed engine-owned market updates, corrected
   observation of direct mod `Market.advance()` calls, owner-local persistent copy-on-write
   market/condition/industry snapshots with structure epochs and bounded audits, an owner-local
   ReachEconomy fingerprint, an ordered inactive-commodity fast path combined with the direct
@@ -132,16 +132,32 @@ the aggressive profile enables them. `fastForward.visualTime=realtime` keeps pre
 ordinary update per outer frame, while `simulation` accumulates substep time and may produce visible
 jumps. Simulation itself still runs on every substep.
 
-`patch.remoteMarketScheduler` is enabled in the default/aggressive profile and intentionally changes
-`MarketAPI.advance()` cadence for markets reached through the central economy loop. The current
-location, interaction market, and player-owned markets remain full-rate.
+`patch.marketScheduler` is enabled in the default/aggressive profile and routes every known core
+`MarketAPI.advance(float)` call through one scheduler contract. The periodic Economy-loop and
+planet-condition sources accumulate `amount` during each simulation tick, but cadence is evaluated
+once per render batch. Starsector performs multiple `CampaignEngine.advance()` calls per rendered
+frame when campaign speed is increased; the scheduler detects the final iteration through
+`CampaignEngine.setFastForwardIteration(false)`, so ordinary and hot markets receive at most one
+callback per render batch instead of scaling callback count with acceleration. Remote visible markets
+use `market.scheduler.batches`; hidden remote markets use `market.scheduler.hiddenBatches`; current-
+location, interaction, and player-owned markets use one callback per batch.
 
-`patch.planetConditionMarketScheduler` independently covers the vanilla
-`BaseCampaignEntity.advance()` path used by `planetConditionMarketOnly` markets. It preserves exact
-accumulated `amount`, runs the first tick immediately, keeps the player's current location at full
-cadence, and flushes pending time before save. Both schedulers honor the memory key
-`$starsectorPrepatcher_fullRateMarket=true`. Use `profiles/safe.properties` or disable the relevant
-switches for fully conservative callback cadence.
+A market may explicitly opt out with the memory key
+`$starsectorPrepatcher_perSimulationTickMarket=true`. Only these compatibility markets retain one
+callback per simulation tick. Statistics report both the current number of opted-out markets and their
+callback cost. Six rare vanilla create/remove call sites, direct mod calls, scheduler fail-open paths,
+and pre-save flushes use a cheaper synchronous hook that consumes existing pending debt before the
+original event callback. The scheduler activates only after its CampaignEngine lifecycle/batch,
+validated `CampaignState` batch protocol, Economy source, entity source, and save-flush components
+initialize; before that calls remain synchronous and accumulate no debt. The complete runtime
+contract is documented in [docs/architecture/MARKET_SCHEDULER.md](docs/architecture/MARKET_SCHEDULER.md).
+
+Runtime statistics use one `marketScheduler*` family. `marketSchedulerSimulationTicks` and
+`marketSchedulerRenderBatches` expose the actual acceleration ratio; `marketSchedulerMaxTicksPerBatch`
+shows the largest observed batch. Work counters distinguish accumulated input calls, delivered
+callbacks, per-simulation-tick opt-outs, and synchronous debt consumption. Failure counters remain
+split by concrete cause. A failed normal callback disables batching only for that market; a failed
+pre-save flush restores pending debt and aborts the save. Periodic counters use `sumThenReset()`.
 
 `patch.directMarketObservation` is also enabled in the default/aggressive profile in 0.9.3. It does
 not throttle direct mod calls: each call remains synchronous and immediate. Known planet-condition
@@ -163,8 +179,8 @@ mods\StarsectorPrepatcher\logs\prepatcher.log
 mods\StarsectorPrepatcher\logs\direct-market-observe\session-*\
 ```
 
-The agent records `APPLIED`, `ALREADY_APPLIED`, `SKIPPED_STRUCTURAL`, `SKIPPED_LOADER`, or
-`SKIPPED_ERROR` for structural patches. Exact-build presentation targets additionally report
+The agent records `APPLIED`, `ALREADY_APPLIED`, `SKIPPED_STRUCTURAL`, `SKIPPED_COMPOSITION`,
+`SKIPPED_LOADER`, or `SKIPPED_ERROR` for structural patches. Exact-build presentation targets additionally report
 `SKIPPED_CLASS_HASH` or `SKIPPED_CONTAINER_HASH`. Hyperspace targets use the same structural,
 per-patch status model as the other structural targets. Every skip is fail-open; `SKIPPED_LOADER`
 must be investigated before calling that launch path compatible.
@@ -176,6 +192,7 @@ Build details are in [`BUILDING.md`](BUILDING.md).
 
 ## Documentation
 
+- [`AGENTS.md`](AGENTS.md) — repository rules for patch composition and transformation surfaces;
 - [`README_RU.md`](README_RU.md) — Russian version of this overview;
 - [`CHANGELOG.md`](CHANGELOG.md) — public `X.Y.Z` release history;
 - [`BUILDING.md`](BUILDING.md) — build and verification workflow;

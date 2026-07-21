@@ -11,29 +11,25 @@ public final class PrepatcherConfig {
     private final Properties properties = new Properties();
 
     public final boolean enabled;
-    public final boolean retainAll;
-    public final boolean scratchCollections;
+    public final boolean mapRenderStuff;
+    public final boolean mapHitTest;
     public final boolean labelSpatialCandidates;
     public final boolean intelCallbackCache;
-    public final boolean intelExistingIconLookup;
+    public final boolean intelArrowRendering;
+    public final boolean intelReconciliation;
     public final boolean intelEntityIndex;
-    public final boolean intelFastContains;
-    public final boolean hoverHitTestCache;
     public final boolean systemNebulaCache;
     public final boolean sampleCacheClearThrottle;
     public final boolean gridLineCap;
-    public final boolean arrowVectorPool;
     public final boolean campaignListenerThrottle;
     public final boolean routeJumpPointIndex;
     public final boolean campaignSnapshotReuse;
     public final boolean entityScriptSnapshotReuse;
     public final boolean emptyMemoryAdvanceFastPath;
     public final boolean economyLocationCache;
-    public final boolean economySnapshotReuse;
     public final boolean economyPersistentSnapshots;
     public final boolean commodityEventModDirtyCache;
-    public final boolean remoteMarketScheduler;
-    public final boolean planetConditionMarketScheduler;
+    public final boolean marketScheduler;
     public final boolean directMarketObservation;
     public final boolean commodityTemporalFastPath;
     public final boolean marketNoOpCallbacks;
@@ -46,8 +42,7 @@ public final class PrepatcherConfig {
     public final boolean rulesLiteralParser;
     public final boolean saveLoadProgressThrottle;
     public final boolean saveOutputBufferDedup;
-    public final boolean hyperspaceCulling;
-    public final boolean hyperspaceYClamp;
+    public final boolean hyperspaceViewportBounds;
     public final boolean skipNoOpTerrainLayer;
     public final boolean terrainRandomReuse;
     public final boolean automatonBufferReuse;
@@ -76,11 +71,16 @@ public final class PrepatcherConfig {
     public final int intelMapLocationCacheMs;
     public final int intelArrowDataCacheMs;
     public final int intelEntityIndexTtlMs;
+    public final int cacheMaintenanceIntervalMs;
+    public final int intelEntityIndexOwnerIdleTtlMs;
     public final int hoverMaxHz;
     public final float hoverCellPixels;
     public final int hoverCellTtlMs;
+    public final int hoverOwnerIdleTtlMs;
+    public final int hoverCellPruneIntervalMs;
     public final int hoverMaxCells;
     public final int labelIndexTtlMs;
+    public final int labelOwnerIdleTtlMs;
     public final int systemNebulaMaxAgeMs;
     public final int sampleCacheClearMinIntervalMs;
     public final int gridMaxLinesPerAxis;
@@ -88,21 +88,17 @@ public final class PrepatcherConfig {
     public final int campaignListenerAuditMs;
     public final int routeIndexTtlMs;
     public final int commRelayIndexTtlMs;
-    public final int remoteMarketFrames;
-    public final int remoteMarketHiddenFrames;
-    public final int remoteMarketMaxDeferredFrames;
-    public final float remoteMarketMaxDeferredGameDays;
-    public final boolean remoteMarketHotCurrentLocation;
-    public final boolean remoteMarketHotPlayerOwned;
-    public final boolean remoteMarketHotInteraction;
-    public final int remoteMarketPolicyAuditFrames;
-    public final String remoteMarketFullRateMemoryKey;
-    public final int planetConditionMarketFrames;
-    public final int planetConditionMarketCurrentLocationFrames;
-    public final int planetConditionMarketMaxDeferredFrames;
-    public final float planetConditionMarketMaxDeferredGameDays;
-    public final int planetConditionMarketPolicyAuditFrames;
-    public final String planetConditionMarketFullRateMemoryKey;
+    public final int marketSchedulerBatches;
+    public final int marketSchedulerHiddenBatches;
+    public final boolean marketSchedulerHotCurrentLocation;
+    public final boolean marketSchedulerHotPlayerOwned;
+    public final boolean marketSchedulerHotInteraction;
+    public final int marketSchedulerPolicyAuditBatches;
+    public final int marketSchedulerConstructionAuditBatches;
+    public final String marketSchedulerPerSimulationTickMemoryKey;
+    public final int marketSchedulerMaxPendingRuns;
+    public final boolean marketSchedulerExactReplayBeforeSave;
+    public final boolean marketAdvanceSemanticRiskObserver;
     public final int directMarketTimingSampleEvery;
     public final int directMarketStackSampleEvery;
     public final int directMarketMaxStacksPerSite;
@@ -116,33 +112,38 @@ public final class PrepatcherConfig {
     public final int statsLogIntervalSeconds;
     public final int saveLoadProgressHz;
     public final int starfieldRemoveAllThreshold;
+    public final boolean scratchTrimEnabled;
+    public final int scratchTrimGraceMs;
+    public final int scratchTrimMaxListCapacity;
+    public final int scratchTrimMaxIdentityEntries;
+    public final int scratchTrimMaxSetEntries;
+    public final int scratchTrimMaxPooledCollections;
+    public final int starfieldPoolMaxRetainedCapacity;
+    public final int starfieldPoolOversizedGraceMs;
 
     private PrepatcherConfig(Properties p) {
         properties.putAll(p);
         enabled = bool("enabled", true);
-        retainAll = bool("patch.retainAll", true);
-        scratchCollections = bool("patch.scratchCollections", true);
+        mapRenderStuff = bool("patch.mapRenderStuff", true);
+        mapHitTest = bool("patch.mapHitTest", true);
         labelSpatialCandidates = bool("patch.labelSpatialCandidates", true);
         intelCallbackCache = bool("patch.intelCallbackCache", true);
-        intelExistingIconLookup = bool("patch.intelExistingIconLookup", true);
+        intelArrowRendering = bool("patch.intelArrowRendering", true);
+        intelReconciliation = bool("patch.intelReconciliation", true);
         intelEntityIndex = bool("patch.intelEntityIndex", true);
-        intelFastContains = bool("patch.intelFastContains", true);
-        hoverHitTestCache = bool("patch.hoverHitTestCache", true);
         systemNebulaCache = bool("patch.systemNebulaCache", true);
         sampleCacheClearThrottle = bool("patch.sampleCacheClearThrottle", true);
         gridLineCap = bool("patch.gridLineCap", true);
-        arrowVectorPool = bool("patch.arrowVectorPool", true);
         campaignListenerThrottle = bool("patch.campaignListenerThrottle", true);
         routeJumpPointIndex = bool("patch.routeJumpPointIndex", true);
         campaignSnapshotReuse = bool("patch.campaignSnapshotReuse", true);
         entityScriptSnapshotReuse = bool("patch.entityScriptSnapshotReuse", true);
         emptyMemoryAdvanceFastPath = bool("patch.emptyMemoryAdvanceFastPath", true);
         economyLocationCache = bool("patch.economyLocationCache", true);
-        economySnapshotReuse = bool("patch.economySnapshotReuse", true);
+        warnRemovedEconomySnapshotReuse();
         economyPersistentSnapshots = bool("patch.economyPersistentSnapshots", false);
         commodityEventModDirtyCache = bool("patch.commodityEventModDirtyCache", false);
-        remoteMarketScheduler = bool("patch.remoteMarketScheduler", false);
-        planetConditionMarketScheduler = bool("patch.planetConditionMarketScheduler", false);
+        marketScheduler = bool("patch.marketScheduler", false);
         directMarketObservation = bool("patch.directMarketObservation", false);
         commodityTemporalFastPath = bool("patch.commodityTemporalFastPath", false);
         marketNoOpCallbacks = bool("patch.marketNoOpCallbacks", false);
@@ -155,8 +156,7 @@ public final class PrepatcherConfig {
         rulesLiteralParser = bool("patch.rulesLiteralParser", true);
         saveLoadProgressThrottle = bool("patch.saveLoadProgressThrottle", true);
         saveOutputBufferDedup = bool("patch.saveOutputBufferDedup", true);
-        hyperspaceCulling = bool("patch.hyperspaceCulling", true);
-        hyperspaceYClamp = bool("patch.hyperspaceYClamp", true);
+        hyperspaceViewportBounds = mergedHyperspaceViewportBounds();
         skipNoOpTerrainLayer = bool("patch.skipNoOpTerrainLayer", true);
         terrainRandomReuse = bool("patch.terrainRandomReuse", true);
         automatonBufferReuse = bool("patch.automatonBufferReuse", true);
@@ -193,11 +193,21 @@ public final class PrepatcherConfig {
         intelMapLocationCacheMs = integer("intel.mapLocationCacheMs", 120, 0, 10_000);
         intelArrowDataCacheMs = integer("intel.arrowDataCacheMs", 120, 0, 10_000);
         intelEntityIndexTtlMs = integer("intel.entityIndexTtlMs", 500, 0, 60_000);
+        cacheMaintenanceIntervalMs = integer("cache.maintenanceIntervalMs",
+                30_000, 0, 3_600_000);
+        intelEntityIndexOwnerIdleTtlMs = integer(
+                "intel.entityIndexOwnerIdleTtlMs", 600_000, 0, 86_400_000);
         hoverMaxHz = integer("hover.maxHz", 60, 0, 1000);
         hoverCellPixels = decimal("hover.cellPixels", 3f, 0f, 100f);
         hoverCellTtlMs = integer("hover.cellTtlMs", 140, 0, 10_000);
+        hoverOwnerIdleTtlMs = integer("hover.ownerIdleTtlMs",
+                300_000, 0, 86_400_000);
+        hoverCellPruneIntervalMs = integer("hover.cellPruneIntervalMs",
+                30_000, 0, 3_600_000);
         hoverMaxCells = integer("hover.maxCells", 768, 0, 100_000);
         labelIndexTtlMs = integer("label.indexTtlMs", 750, 0, 60_000);
+        labelOwnerIdleTtlMs = integer("label.ownerIdleTtlMs",
+                600_000, 0, 86_400_000);
         systemNebulaMaxAgeMs = integer("systemNebula.maxAgeMs", 600_000, 0, 86_400_000);
         sampleCacheClearMinIntervalMs = integer("hyperspace.sampleCacheClearMinIntervalMs", 1500, 0, 60_000);
         gridMaxLinesPerAxis = integer("grid.maxLinesPerAxis", 180, 0, 10_000);
@@ -205,31 +215,27 @@ public final class PrepatcherConfig {
         campaignListenerAuditMs = integer("campaign.listenerAuditMs", 1000, 0, 60_000);
         routeIndexTtlMs = integer("route.indexTtlMs", 250, 0, 60_000);
         commRelayIndexTtlMs = integer("commRelay.indexTtlMs", 250, 0, 60_000);
-        remoteMarketFrames = integer("market.remote.frames", 4, 1, 120);
-        remoteMarketHiddenFrames = integer("market.remote.hiddenFrames", 8, 1, 240);
-        remoteMarketMaxDeferredFrames = integer("market.remote.maxDeferredFrames", 8, 1, 240);
-        remoteMarketMaxDeferredGameDays = decimal(
-                "market.remote.maxDeferredGameDays", 0.02f, 0f, 30f);
-        remoteMarketHotCurrentLocation = bool("market.hot.currentLocation", true);
-        remoteMarketHotPlayerOwned = bool("market.hot.playerOwned", true);
-        remoteMarketHotInteraction = bool("market.hot.interaction", true);
-        remoteMarketPolicyAuditFrames = integer(
-                "market.remote.policyAuditFrames", 60, 1, 36_000);
-        remoteMarketFullRateMemoryKey = string(
-                "market.remote.fullRateMemoryKey", "$starsectorPrepatcher_fullRateMarket");
-        planetConditionMarketFrames = integer(
-                "market.planetCondition.frames", 4, 1, 240);
-        planetConditionMarketCurrentLocationFrames = integer(
-                "market.planetCondition.currentLocationFrames", 1, 1, 240);
-        planetConditionMarketMaxDeferredFrames = integer(
-                "market.planetCondition.maxDeferredFrames", 8, 1, 240);
-        planetConditionMarketMaxDeferredGameDays = decimal(
-                "market.planetCondition.maxDeferredGameDays", 0.02f, 0f, 30f);
-        planetConditionMarketPolicyAuditFrames = integer(
-                "market.planetCondition.policyAuditFrames", 60, 1, 36_000);
-        planetConditionMarketFullRateMemoryKey = string(
-                "market.planetCondition.fullRateMemoryKey",
-                "$starsectorPrepatcher_fullRateMarket");
+        marketSchedulerBatches = integer("market.scheduler.batches", 4, 1, 120);
+        marketSchedulerHiddenBatches = integer("market.scheduler.hiddenBatches", 8, 1, 240);
+        marketSchedulerHotCurrentLocation = bool(
+                "market.scheduler.hot.currentLocation", true);
+        marketSchedulerHotPlayerOwned = bool(
+                "market.scheduler.hot.playerOwned", true);
+        marketSchedulerHotInteraction = bool(
+                "market.scheduler.hot.interaction", true);
+        marketSchedulerPolicyAuditBatches = integer(
+                "market.scheduler.policyAuditBatches", 60, 1, 36_000);
+        marketSchedulerConstructionAuditBatches = integer(
+                "market.remote.constructionAuditBatches", 60, 1, 36_000);
+        marketSchedulerPerSimulationTickMemoryKey = string(
+                "market.scheduler.perSimulationTickMemoryKey",
+                "$starsectorPrepatcher_perSimulationTickMarket");
+        marketSchedulerMaxPendingRuns = integer(
+                "market.remote.maxPendingRuns", 32, 1, 4096);
+        marketSchedulerExactReplayBeforeSave = bool(
+                "market.remote.exactReplayBeforeSave", false);
+        marketAdvanceSemanticRiskObserver = bool(
+                "observer.marketAdvanceSemanticRisks", false);
         directMarketTimingSampleEvery = integer(
                 "directMarket.timingSampleEvery", 128, 0, 1_000_000);
         directMarketStackSampleEvery = integer(
@@ -249,6 +255,21 @@ public final class PrepatcherConfig {
         statsLogIntervalSeconds = integer("logging.statsIntervalSeconds", 30, 0, 3600);
         saveLoadProgressHz = integer("saveLoad.progressHz", 15, 0, 240);
         starfieldRemoveAllThreshold = integer("starfield.removeAllThreshold", 8, 1, 4096);
+        scratchTrimEnabled = bool("scratch.trim.enabled", true);
+        scratchTrimGraceMs = integer("scratch.trimGraceMs",
+                300_000, 0, 86_400_000);
+        scratchTrimMaxListCapacity = integer("scratch.trim.maxListCapacity",
+                32_768, 16, 10_000_000);
+        scratchTrimMaxIdentityEntries = integer("scratch.trim.maxIdentityEntries",
+                32_768, 16, 10_000_000);
+        scratchTrimMaxSetEntries = integer("scratch.trim.maxSetEntries",
+                32_768, 16, 10_000_000);
+        scratchTrimMaxPooledCollections = integer("scratch.trim.maxPooledCollections",
+                32, 1, 4096);
+        starfieldPoolMaxRetainedCapacity = integer(
+                "starfield.pool.maxRetainedCapacity", 32_768, 16, 10_000_000);
+        starfieldPoolOversizedGraceMs = integer(
+                "starfield.pool.oversizedGraceMs", 300_000, 0, 86_400_000);
     }
 
     public static PrepatcherConfig load(Path file) {
@@ -264,6 +285,40 @@ public final class PrepatcherConfig {
             PrepatcherLog.warn("Configuration file not found; defaults will be used: " + file);
         }
         return new PrepatcherConfig(p);
+    }
+
+    private void warnRemovedEconomySnapshotReuse() {
+        if (!properties.containsKey("patch.economySnapshotReuse")) return;
+        PrepatcherLog.warn("Removed setting patch.economySnapshotReuse is ignored; "
+                + "use patch.economyPersistentSnapshots for owner-local snapshots");
+    }
+
+    private boolean mergedHyperspaceViewportBounds() {
+        String unified = properties.getProperty("patch.hyperspaceViewportBounds");
+        if (unified != null) {
+            boolean enabled = bool("patch.hyperspaceViewportBounds", true);
+            if (properties.containsKey("patch.hyperspaceCulling")
+                    || properties.containsKey("patch.hyperspaceYClamp")) {
+                PrepatcherLog.warn("Deprecated patch.hyperspaceCulling/patch.hyperspaceYClamp "
+                        + "are ignored because patch.hyperspaceViewportBounds is present");
+            }
+            return enabled;
+        }
+
+        boolean hasCull = properties.containsKey("patch.hyperspaceCulling");
+        boolean hasClamp = properties.containsKey("patch.hyperspaceYClamp");
+        if (!hasCull && !hasClamp) return true;
+
+        boolean cull = bool("patch.hyperspaceCulling", true);
+        boolean clamp = bool("patch.hyperspaceYClamp", true);
+        PrepatcherLog.warn("patch.hyperspaceCulling and patch.hyperspaceYClamp are deprecated; "
+                + "use the atomic patch.hyperspaceViewportBounds setting");
+        if (cull != clamp) {
+            PrepatcherLog.warn("The legacy hyperspace bounds settings disagree; the atomic "
+                    + "viewport-bounds patch is disabled rather than applying a partial fix");
+            return false;
+        }
+        return cull;
     }
 
     private boolean bool(String key, boolean fallback) {

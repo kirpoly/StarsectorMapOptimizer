@@ -204,9 +204,19 @@ public final class FastForwardPresentationTransformer implements ClassFileTransf
         };
         if (changes == 0) return null;
 
+        int compositionMask = PresentationStructuralContract.expectedMask(className, config);
+        if (compositionMask != 0) {
+            PresentationStructuralContract.addOwnership(node, compositionMask);
+            PresentationStructuralContract.inspectNode(className, node, config);
+        }
+
         ClassWriter writer = new ClassWriter(ClassWriter.COMPUTE_MAXS);
         node.accept(writer);
-        return writer.toByteArray();
+        byte[] transformed = writer.toByteArray();
+        if (compositionMask != 0) {
+            PresentationStructuralContract.inspect(className, transformed, config);
+        }
+        return transformed;
     }
 
     private int patchCampaignState(ClassNode node) {

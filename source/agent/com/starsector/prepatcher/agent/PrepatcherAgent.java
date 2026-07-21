@@ -84,12 +84,20 @@ public final class PrepatcherAgent {
             }
             ClassFileTransformer transformer = new PrepatcherTransformer(config, runtimeLoader);
             instrumentation.addTransformer(transformer, false);
-            if (config.directMarketObservation) {
+            System.setProperty("starsector.prepatcher.presentationStructuralOrder",
+                    presentationMarkerLoaded ? "structural-only" : "presentation->structural");
+            if (config.directMarketObservation || config.marketScheduler
+                    || config.marketAdvanceSemanticRiskObserver) {
                 instrumentation.addTransformer(
                         new DirectMarketObserveTransformer(config, runtimeLoader, modRoot), false);
-                System.setProperty("starsector.prepatcher.directMarketObservation", "enabled");
-                PrepatcherLog.info("Direct Market.advance observation transformer installed; "
-                        + "mod call sites remain synchronous and are only measured.");
+                System.setProperty("starsector.prepatcher.directMarketObservation",
+                        config.directMarketObservation ? "enabled"
+                                : (config.marketScheduler ? "scheduler-sync-only" : "risk-observer-only"));
+                PrepatcherLog.info(config.directMarketObservation
+                        ? "Direct Market.advance transformer installed for telemetry and scheduler debt synchronization."
+                        : (config.marketScheduler
+                                ? "Direct Market.advance transformer installed to synchronize scheduler debt before mod-owned calls."
+                                : "Static Market.advance semantic-risk observer installed."));
             } else {
                 System.setProperty("starsector.prepatcher.directMarketObservation", "disabled");
             }
@@ -98,9 +106,10 @@ public final class PrepatcherAgent {
                 PrepatcherLog.info("Structural transformer installed; presentation transformer"
                         + " stayed disabled because its frame marker was already loaded.");
             } else {
-                PrepatcherLog.info("Presentation and structural transformers installed in guarded"
-                        + " order. Presentation patches require exact vanilla hashes; structural"
-                        + " patches are matched and verified independently as target classes load.");
+                PrepatcherLog.info("Presentation and structural transformers installed in explicit"
+                        + " presentation->structural order. Overlapping targets publish a"
+                        + " presentation ownership/mask contract that the structural transformer"
+                        + " revalidates after every commit and at final composition.");
             }
         } catch (Throwable ex) {
             System.setProperty("starsector.prepatcher.status", "agent-error");

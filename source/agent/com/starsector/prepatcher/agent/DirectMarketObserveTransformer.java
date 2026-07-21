@@ -7,8 +7,10 @@ import jdk.internal.org.objectweb.asm.Type;
 import jdk.internal.org.objectweb.asm.tree.AbstractInsnNode;
 import jdk.internal.org.objectweb.asm.tree.ClassNode;
 import jdk.internal.org.objectweb.asm.tree.FrameNode;
+import jdk.internal.org.objectweb.asm.tree.FieldInsnNode;
 import jdk.internal.org.objectweb.asm.tree.InsnList;
 import jdk.internal.org.objectweb.asm.tree.InsnNode;
+import jdk.internal.org.objectweb.asm.tree.JumpInsnNode;
 import jdk.internal.org.objectweb.asm.tree.LabelNode;
 import jdk.internal.org.objectweb.asm.tree.LdcInsnNode;
 import jdk.internal.org.objectweb.asm.tree.LineNumberNode;
@@ -20,11 +22,15 @@ import jdk.internal.org.objectweb.asm.tree.analysis.AnalyzerException;
 import jdk.internal.org.objectweb.asm.tree.analysis.BasicValue;
 import jdk.internal.org.objectweb.asm.tree.analysis.BasicVerifier;
 
+import java.io.InputStream;
 import java.lang.instrument.ClassFileTransformer;
 import java.lang.reflect.Method;
 import java.net.URI;
 import java.net.URL;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 import java.security.CodeSource;
 import java.security.ProtectionDomain;
 import java.util.ArrayList;
@@ -59,6 +65,8 @@ public final class DirectMarketObserveTransformer implements ClassFileTransforme
     private final AtomicInteger patchedClasses = new AtomicInteger();
     private final AtomicInteger patchedCallSites = new AtomicInteger();
     private final Set<String> warnedClasses = java.util.Collections.synchronizedSet(new HashSet<>());
+    private final Set<String> semanticRiskRows = java.util.Collections.synchronizedSet(new HashSet<>());
+    private final Object semanticRiskWriteLock = new Object();
 
     public DirectMarketObserveTransformer(PrepatcherConfig config,
                                           ClassLoader runtimeLoader,
@@ -72,7 +80,8 @@ public final class DirectMarketObserveTransformer implements ClassFileTransforme
     @Override
     public byte[] transform(ClassLoader loader, String className, Class<?> classBeingRedefined,
                             ProtectionDomain protectionDomain, byte[] classfileBuffer) {
-        if (!config.directMarketObservation
+        if (!(config.directMarketObservation || config.marketScheduler
+                || config.marketAdvanceSemanticRiskObserver)
                 || classfileBuffer == null
                 || !shouldInspect(loader, className, protectionDomain)) {
             return null;
@@ -81,6 +90,12 @@ public final class DirectMarketObserveTransformer implements ClassFileTransforme
         try {
             ClassNode node = readClass(classfileBuffer);
             String source = sourceLabel(protectionDomain, loader);
+            if (config.marketAdvanceSemanticRiskObserver) {
+                observeMarketAdvanceSemanticRisks(node, source, loader);
+            }
+            // Observer-only mode is strictly static: generate the CSV and return
+            // the original bytes without installing runtime call-site wrappers.
+            if (!(config.directMarketObservation || config.marketScheduler)) return null;
             int originalCalls = countOriginalCalls(node);
             int existingHooks = countHookCalls(node);
             if (originalCalls == 0) return null;
@@ -158,6 +173,210 @@ public final class DirectMarketObserveTransformer implements ClassFileTransforme
                     + failure.getClass().getName() + ": " + failure.getMessage());
             return null;
         }
+    }
+
+
+    private void observeMarketAdvanceSemanticRisks(ClassNode node, String source, ClassLoader loader) {
+        for (MethodNode method : node.methods) {
+            if (!"advance".equals(method.name) || !"(F)V".equals(method.desc)
+                    || (method.access & (Opcodes.ACC_ABSTRACT | Opcodes.ACC_NATIVE)) != 0) {
+                continue;
+            }
+            String componentType = componentType(node, loader);
+            if (componentType == null) continue;
+            boolean intervalAdvance = false;
+            boolean intervalElapsed = false;
+            boolean amountObserved = false;
+            boolean fieldWrite = false;
+            boolean conditional = false;
+            boolean backwardJump = false;
+            List<MethodInsnNode> intervalSites = new ArrayList<>();
+            for (AbstractInsnNode insn : method.instructions.toArray()) {
+                if (insn instanceof VarInsnNode var
+                        && var.getOpcode() == Opcodes.FLOAD && var.var == 1) {
+                    amountObserved = true;
+                }
+                if (insn instanceof FieldInsnNode field
+                        && field.getOpcode() == Opcodes.PUTFIELD) fieldWrite = true;
+                if (insn instanceof JumpInsnNode jump) {
+                    int opcode = jump.getOpcode();
+                    if (opcode != Opcodes.GOTO && opcode != Opcodes.JSR) conditional = true;
+                    if (method.instructions.indexOf(jump.label)
+                            <= method.instructions.indexOf(jump)) backwardJump = true;
+                }
+                if (!(insn instanceof MethodInsnNode call)) continue;
+                int offset = method.instructions.indexOf(call);
+                if (call.owner.equals("com/fs/starfarer/api/util/IntervalUtil")
+                        && call.name.equals("advance") && call.desc.equals("(F)V")) {
+                    intervalAdvance = true;
+                    intervalSites.add(call);
+                } else if (call.owner.equals("com/fs/starfarer/api/util/IntervalUtil")
+                        && call.name.equals("intervalElapsed") && call.desc.equals("()Z")) {
+                    intervalElapsed = true;
+                    intervalSites.add(call);
+                }
+                String category = randomRiskCategory(call);
+                if (category != null) {
+                    writeSemanticRisk(source, node.name, method, componentType,
+                            category, call.owner, call.name, offset);
+                }
+                if (isMarketStructureMutation(call)) {
+                    writeSemanticRisk(source, node.name, method, componentType,
+                            "MARKET_STRUCTURE_MUTATION", call.owner, call.name, offset);
+                }
+                if (call.name.equals("convertToDays") && call.desc.contains("F")) {
+                    amountObserved = true;
+                }
+            }
+            if (intervalAdvance && intervalElapsed) {
+                for (MethodInsnNode site : intervalSites) {
+                    writeSemanticRisk(source, node.name, method, componentType,
+                            "INTERVAL_SINGLE_ELAPSE", site.owner, site.name,
+                            method.instructions.indexOf(site));
+                }
+            }
+            if (amountObserved && fieldWrite && conditional && !backwardJump) {
+                int offset = firstConditionalOffset(method);
+                writeSemanticRisk(source, node.name, method, componentType,
+                        "SINGLE_THRESHOLD_TRANSITION", node.name,
+                        "<single-threshold-transition>", offset);
+            }
+        }
+    }
+
+    private static String componentType(ClassNode node, ClassLoader loader) {
+        if (hasHierarchyType(node, loader,
+                "com/fs/starfarer/api/campaign/econ/Industry",
+                "com/fs/starfarer/api/impl/campaign/econ/impl/BaseIndustry")) {
+            return "Industry";
+        }
+        if (hasHierarchyType(node, loader,
+                "com/fs/starfarer/api/campaign/econ/MarketConditionPlugin",
+                "com/fs/starfarer/api/impl/campaign/econ/BaseMarketConditionPlugin")) {
+            return "MarketConditionPlugin";
+        }
+        if (hasHierarchyType(node, loader,
+                "com/fs/starfarer/api/campaign/econ/SubmarketPlugin",
+                "com/fs/starfarer/api/impl/campaign/submarkets/BaseSubmarketPlugin")) {
+            return "SubmarketPlugin";
+        }
+        return null;
+    }
+
+    private static boolean hasHierarchyType(ClassNode node, ClassLoader loader,
+                                            String apiType, String vanillaBase) {
+        ArrayList<String> pending = new ArrayList<>();
+        HashSet<String> seen = new HashSet<>();
+        if (node.superName != null) pending.add(node.superName);
+        pending.addAll(node.interfaces);
+        for (int index = 0; index < pending.size(); index++) {
+            String name = pending.get(index);
+            if (name == null || !seen.add(name)) continue;
+            if (name.equals(apiType) || name.equals(vanillaBase)) return true;
+            if (loader == null || name.startsWith("java/")) continue;
+            try (InputStream input = loader.getResourceAsStream(name + ".class")) {
+                if (input == null) continue;
+                ClassNode parent = new ClassNode(Opcodes.ASM8);
+                new ClassReader(input).accept(parent,
+                        ClassReader.SKIP_CODE | ClassReader.SKIP_DEBUG | ClassReader.SKIP_FRAMES);
+                if (parent.superName != null) pending.add(parent.superName);
+                pending.addAll(parent.interfaces);
+            } catch (Throwable ignored) {
+                // Static diagnostics fail open for an unreadable hierarchy edge.
+            }
+        }
+        return false;
+    }
+
+    private static String randomRiskCategory(MethodInsnNode call) {
+        if (call.owner.equals("java/lang/Math") && call.name.equals("random")) {
+            return "RANDOM_ROLL";
+        }
+        if ((call.owner.equals("java/util/Random")
+                || call.owner.equals("java/util/concurrent/ThreadLocalRandom"))
+                && (call.name.equals("nextFloat") || call.name.equals("nextDouble")
+                || call.name.equals("nextInt") || call.name.equals("nextLong")
+                || call.name.equals("nextBoolean"))) {
+            return "RANDOM_ROLL";
+        }
+        if (call.owner.endsWith("/WeightedRandomPicker") && call.name.equals("pick")) {
+            return "RANDOM_SELECTION";
+        }
+        return null;
+    }
+
+    private static boolean isMarketStructureMutation(MethodInsnNode call) {
+        String owner = call.owner;
+        if (!(owner.equals("com/fs/starfarer/api/campaign/econ/MarketAPI")
+                || owner.equals("com/fs/starfarer/campaign/econ/Market")
+                || owner.equals("com/fs/starfarer/api/impl/campaign/econ/impl/ConstructionQueue"))) {
+            return false;
+        }
+        return switch (call.name) {
+            case "addCondition", "removeCondition", "addIndustry", "removeIndustry",
+                    "addSubmarket", "removeSubmarket", "addToEnd", "setItems",
+                    "removeItem", "moveUp", "moveDown", "moveToFront", "moveToBack" -> true;
+            default -> false;
+        };
+    }
+
+    private static int firstConditionalOffset(MethodNode method) {
+        for (AbstractInsnNode insn : method.instructions.toArray()) {
+            if (insn instanceof JumpInsnNode jump
+                    && jump.getOpcode() != Opcodes.GOTO && jump.getOpcode() != Opcodes.JSR) {
+                return method.instructions.indexOf(insn);
+            }
+        }
+        return -1;
+    }
+
+    private void writeSemanticRisk(String source, String className, MethodNode method,
+                                   String componentType, String category,
+                                   String calledOwner, String calledMethod, int offset) {
+        String modId = modId(source);
+        String key = source + '\u001f' + modId + '\u001f' + className + '\u001f'
+                + method.name + method.desc + '\u001f' + category + '\u001f'
+                + calledOwner + '\u001f' + calledMethod + '\u001f' + offset;
+        if (!semanticRiskRows.add(key)) return;
+        if (modRoot == null) return;
+        Path report = modRoot.resolve("logs").resolve("market-advance-semantic-risks.csv");
+        String row = csv(modId) + ',' + csv(className.replace('/', '.')) + ','
+                + csv(method.name) + ',' + csv(method.desc) + ',' + csv(componentType) + ','
+                + csv(category) + ',' + csv(calledOwner.replace('/', '.')) + ','
+                + csv(calledMethod) + ',' + offset + System.lineSeparator();
+        synchronized (semanticRiskWriteLock) {
+            try {
+                Files.createDirectories(report.getParent());
+                if (!Files.exists(report)) {
+                    Files.writeString(report,
+                            "modId,className,methodName,descriptor,componentType,riskCategory,calledOwner,calledMethod,bytecodeOffset"
+                                    + System.lineSeparator(),
+                            StandardCharsets.UTF_8, StandardOpenOption.CREATE,
+                            StandardOpenOption.APPEND);
+                }
+                Files.writeString(report, row, StandardCharsets.UTF_8,
+                        StandardOpenOption.CREATE, StandardOpenOption.APPEND);
+            } catch (Throwable failure) {
+                warnOnce(className, "semantic-risk report write failed: " + failure.getMessage());
+            }
+        }
+    }
+
+    private static String modId(String source) {
+        String normalized = source == null ? "" : source.replace('\\', '/');
+        int marker = normalized.indexOf("/mods/");
+        if (marker < 0 && normalized.startsWith("mods/")) marker = -1;
+        int start = marker >= 0 ? marker + 6 : (normalized.startsWith("mods/") ? 5 : -1);
+        if (start >= 0) {
+            int end = normalized.indexOf('/', start);
+            return end < 0 ? normalized.substring(start) : normalized.substring(start, end);
+        }
+        return "unknown";
+    }
+
+    private static String csv(String value) {
+        String text = value == null ? "" : value;
+        return '"' + text.replace("\"", "\"\"") + '"';
     }
 
     private static Method resolveRegisterSiteMethod(ClassLoader runtimeLoader) {

@@ -135,16 +135,33 @@ aggressive profile включает их. `fastForward.visualTime=realtime` ос
 обычном update за outer frame, а `simulation` накапливает substep time и может давать заметные
 скачки. Сама simulation продолжает выполняться на каждом substep.
 
-`patch.remoteMarketScheduler` включён в default/aggressive profile и намеренно меняет cadence
-`MarketAPI.advance()` для рынков, достигаемых через центральный цикл экономики. Текущая location,
-interaction market и player-owned рынки остаются full-rate.
+`patch.marketScheduler` включён в default/aggressive profile и направляет все известные core-вызовы
+`MarketAPI.advance(float)` через единый контракт. Периодические источники Economy loop и
+planet-condition накапливают `amount` на каждом simulation tick, но cadence проверяется один раз на
+render batch. При ускорении Starsector выполняет несколько `CampaignEngine.advance()` за один
+отрисованный кадр; финальная итерация определяется через
+`CampaignEngine.setFastForwardIteration(false)`. Поэтому обычные и hot-рынки получают не более одного
+callback на render batch, а их callback count не растёт кратно ускорению. Удалённые видимые рынки
+используют `market.scheduler.batches`, скрытые удалённые — `market.scheduler.hiddenBatches`, а рынки
+текущей location, interaction market и player-owned — один callback на batch.
 
-`patch.planetConditionMarketScheduler` независимо покрывает vanilla-путь
-`BaseCampaignEntity.advance()` для `planetConditionMarketOnly` markets. Он сохраняет точный
-накопленный `amount`, выполняет первый tick немедленно, оставляет location игрока full-rate и
-сбрасывает pending time перед сохранением. Оба scheduler'а поддерживают memory key
-`$starsectorPrepatcher_fullRateMarket=true`. Для консервативного cadence используйте
-`profiles/safe.properties` или выключите нужные переключатели.
+Явный compatibility opt-out задаётся memory key
+`$starsectorPrepatcher_perSimulationTickMarket=true`. Только такие рынки сохраняют один callback на
+каждый simulation tick. В stats выводятся и текущее число таких рынков, и стоимость их вызовов. Шесть
+редких vanilla create/remove call sites, прямые mod-вызовы, fail-open ветки и pre-save flush используют
+более дешёвый synchronous hook: он сначала поглощает существующий pending debt, затем выполняет
+исходный event callback. Scheduler активируется только после инициализации lifecycle/batch компонента
+CampaignEngine, подтверждённого batch-протокола `CampaignState`, Economy source, entity source и save
+flush; до этого вызовы синхронны и debt не создают. Подробное последовательное описание:
+[docs/architecture/MARKET_SCHEDULER.md](docs/architecture/MARKET_SCHEDULER.md).
+
+Runtime stats используют одно семейство `marketScheduler*`. Метрики
+`marketSchedulerSimulationTicks` и `marketSchedulerRenderBatches` показывают фактический коэффициент
+ускорения, а `marketSchedulerMaxTicksPerBatch` — крупнейший batch. Отдельно считаются накопленные
+input calls, выполненные callbacks, per-simulation-tick opt-outs и синхронное поглощение debt. Ошибки
+разделены по конкретным причинам. Ошибка обычного callback отключает batching только для данного
+рынка; ошибка pre-save flush восстанавливает pending debt и прерывает save. Периодические counters
+используют `sumThenReset()`.
 
 `patch.directMarketObservation` также включён в default/aggressive profile в 0.9.3. Он не
 throttling-ует прямые вызовы модов: каждый вызов остаётся синхронным и немедленным. Известный

@@ -32,6 +32,13 @@ public final class FastForwardPresentationActualAgentSmokeTest {
             "com.fs.starfarer.api.impl.campaign.world.ZigLeashAssignmentAI"
     };
 
+    private static final Set<String> OVERLAPS = Set.of(
+            "com.fs.starfarer.campaign.CampaignState",
+            "com.fs.starfarer.campaign.CampaignEngine",
+            "com.fs.starfarer.campaign.BaseLocation",
+            "com.fs.starfarer.campaign.BaseCampaignEntity",
+            "com.fs.starfarer.api.impl.campaign.terrain.HyperspaceTerrainPlugin");
+
     private FastForwardPresentationActualAgentSmokeTest() {}
 
     public static void main(String[] args) throws Exception {
@@ -42,6 +49,11 @@ public final class FastForwardPresentationActualAgentSmokeTest {
                         System.getProperty("starsector.prepatcher.status")),
                 "prepatcher transformer was not installed: "
                         + System.getProperty("starsector.prepatcher.status"));
+        require("presentation->structural".equals(System.getProperty(
+                        "starsector.prepatcher.presentationStructuralOrder")),
+                "unexpected presentation/structural transformer order: "
+                        + System.getProperty(
+                                "starsector.prepatcher.presentationStructuralOrder"));
 
         ClassLoader loader = ClassLoader.getSystemClassLoader();
         for (String name : TARGETS) {
@@ -51,6 +63,12 @@ public final class FastForwardPresentationActualAgentSmokeTest {
             String status = System.getProperty(key);
             require("APPLIED".equals(status),
                     name + " presentation status: expected APPLIED, found " + status);
+            if (OVERLAPS.contains(name)) {
+                require("PASSED".equals(System.getProperty(
+                                "starsector.prepatcher.patchStatus." + name
+                                        + ".presentationStructuralComposition")),
+                        name + " presentation/structural composition did not pass");
+            }
             System.out.println("APPLIED " + name);
         }
         System.out.println("OK fast-forward presentation actual-javaagent classes="

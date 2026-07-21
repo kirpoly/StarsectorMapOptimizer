@@ -22,32 +22,47 @@ Hyperspace-патчи проходят тот же независимый struct
 
 | Config | Target/область | Изменение | Основной compatibility-инвариант |
 |---|---|---|---|
-| `patch.retainAll` | map `A.H.renderStuff` | linear reconciliation вместо `keySet().retainAll(ArrayList)` | порядок `LinkedHashMap`, equality-aware fallback |
-| `patch.scratchCollections` | map renderer/input | reusable internal lists/sets/vectors | no escape, reentrant scratch |
+| `patch.mapRenderStuff` | map `A.H.renderStuff` | atomic linear reconciliation plus reusable entity/class collections under one scratch scope | all three semantic sites, ownership marker, non-escape contracts and scope must match together; `LinkedHashMap` order and equality-aware fallback remain |
 | `patch.labelSpatialCandidates` | map labels | spatial candidate buckets | original exact overlap checks остаются |
-| `patch.intelCallbackCache` | Intel map | short TTL для `getMapLocation/getArrowData` | miss/error вызывает callback |
+| `patch.intelCallbackCache` | Intel map locations | short TTL для `getMapLocation` | miss/error вызывает callback |
 | `patch.intelEntityIndex` | Intel synthetic entities | identity index | generation/TTL/fallback |
-| `patch.intelExistingIconLookup` | EventsPanel | direct icon lookup | full scan fallback |
-| `patch.intelFastContains` | EventsPanel | hash membership | vanilla equality |
-| `patch.hoverHitTestCache` | map hover | cell/TTL cache exact vanilla result | bounded staleness, miss runs original |
+| `patch.intelReconciliation` | `EventsPanel.addMissingIconsAndRows` | atomic missing-plugin hash membership plus direct existing-icon candidates under one scratch scope | both semantic sites, scope and ownership marker must match together; vanilla equality and full-scan fallback remain |
+| `patch.mapHitTest` | map `A.OO0000(FFF)` hit test | atomic reusable hit list/point plus bounded exact-result cache wrapper | original method, two non-escaping allocations, one scratch scope, wrapper and vanilla fallback must match together |
 | `patch.systemNebulaCache` | map construction | immutable system metadata cache | synthetic entities создаются заново |
 | `patch.sampleCacheClearThrottle` | map construction | suppress rapid repeated clear | configurable interval |
 | `patch.gridLineCap` | huge sector map | dynamic grid spacing | визуальный LOD only |
-| `patch.arrowVectorPool` | Intel arrows | internal vectors | reference не выходит наружу |
-| internal lifecycle | `CampaignEngine.set/resetInstance` | clear all campaign-bound caches | two-phase generation boundary |
+| `patch.intelArrowRendering` | `Z.o00000(FF)` Intel arrows | atomic `getArrowData` TTL cache plus two reusable internal vectors under one scratch scope | callback, both non-escaping allocations, scope and ownership marker must match together; miss/error calls plugin |
+| internal lifecycle | `CampaignEngine.set/resetInstance`, `CampaignEngine.advance`, save boundary | generation reset plus throttled UI-cache/scratch maintenance | two-phase generation boundary; maintenance runs only on campaign thread and forced save sweep still honors idle/grace thresholds |
 | `patch.campaignListenerThrottle` | campaign advance | skip unchanged internal repository listener sweep | public method untouched, periodic audit |
 | `patch.campaignSnapshotReuse` | `BaseLocation` | reusable eager snapshots | point-in-time order/mutation isolation |
 | `patch.entityScriptSnapshotReuse` | entity scripts | inline empty fast return; non-empty fresh vanilla snapshot | no scratch scope for empty lists; mutation isolation unchanged |
 | `patch.emptyMemoryAdvanceFastPath` | `Memory.advance` | inline return when expire+require are empty | restoration/pause and non-empty loops remain vanilla |
 | `patch.routeJumpPointIndex` | route widget | ordered jump/system candidates | original filter/distance/tie loop |
 | `patch.economyLocationCache` | `Economy.advance` | omit only redundant automatic dirty write | explicit mod dirty state authoritative |
-| `patch.economySnapshotReuse` | Economy/Market | reusable market/condition/industry snapshots | callback cadence/order unchanged |
-| `patch.remoteMarketScheduler` | `Economy.advance` + pre-save boundary | stable-phase full-market scheduling with exact accumulated amount | direct mod calls immediate; hot markets full-rate; callback cadence of remote markets intentionally changes |
-| `patch.planetConditionMarketScheduler` | `BaseCampaignEntity.advance` + `Economy` frame boundary + pre-save | independent stable-phase scheduling for `planetConditionMarketOnly` markets | first tick/current location immediate; exact amount; separate identity state and save flush |
+| `patch.marketScheduler` | `Economy.advance`, `BaseCampaignEntity.advance`, pre-save boundary | one stable-phase scheduler for all transformed engine-owned market updates with exact accumulated amount | one identity state and policy; direct mod calls immediate; hot markets full-rate; callback cadence intentionally changes |
 | `patch.directMarketObservation` | mod call sites + known engine origins + concrete `Market.advance` entry | synchronous wrappers, eager call-site manifest, sampled timing and interval-bounded stack attribution | direct mod calls are never delayed/merged/suppressed; known planet path is classified separately |
 | `patch.economyPersistentSnapshots` | Economy/Market | owner-local copy-on-write snapshots + structure epochs | API mutators invalidate immediately; direct live-list edits bounded by audit |
 | `patch.commodityEventModDirtyCache` | `CommodityOnMarket.reapplyEventMod` | skip repeated removal after zero quantity proved private `eMod` absent | first zero call/load and the complete nonzero remove/calculate/add path stay vanilla; direct external mutation of the private key is unsupported |
 | `patch.commodityTemporalFastPath` | `Market.advance` + `MutableStat` | ordered active set: stable commodity skips 4 temp-stat advances and event-mod reapply | API mutations wake immediately; subclasses/shared stats fall back; direct live-map edits bounded by audit |
+
+`Economy.advance(F)V` и связанное owner-local состояние имеют одного structural-владельца
+`economyAdvancePlan`. Публичные переключатели `patch.economyPersistentSnapshots`,
+`patch.economyLocationCache` и `patch.marketScheduler` образуют feature mask. Все компоненты сначала
+проверяются на одинаковых входных bytes, затем изолированный candidate строится в явном порядке
+persistent snapshots → location cache → scheduler source. Порядок обязателен: location-cache hook
+выбирает persistent-вариант только после установки snapshot state. Поля, accessors, lifecycle/mutator
+hooks, `Economy.advance`, paused path и scheduler registration коммитятся одной транзакцией. Один
+ownership marker и private static final mask подтверждаются общей postcondition; legacy split markers
+и unowned partial state не принимаются.
+
+`Market.advance(F)V` имеет одного structural-владельца `marketAdvancePlan`. Три публичных
+переключателя — `patch.economyPersistentSnapshots`, `patch.commodityTemporalFastPath` и
+`patch.directMarketObservation` — образуют feature mask. План проверяет vanilla-состояние всех трёх
+компонентов на одинаковых входных bytes, строит изолированный candidate в порядке snapshots →
+commodity loop → entry observation, затем одним commit заменяет fields/methods класса. Candidate
+получает один ownership marker и private static final mask. Несовместимость любого запрошенного
+компонента оставляет весь `Market` неизменённым; legacy split markers и unowned hook-shaped state не
+принимаются.
 | `patch.tempModExpiryScheduler` | `MutableStatWithTempMods.advance` | direct float countdown ближайшего expiry; one-pass map scan только у deadline/synchronization | sync before mutation/read/save; live-map exposure, subclasses и anomalies используют retained vanilla path |
 | `patch.marketNoOpCallbacks` | inherited `BaseIndustry.advance` | after a full dormant proof, skip disruption/build checks until wake or bounded audit | custom `advance/isDisrupted/getDisruptedKey` stay vanilla; direct disruption-memory edits may wait for audit |
 | `patch.commRelaySystemIndex` | `IntelManager` | conservative spatial system candidates + TTL position audit | original order/live relay checks; bounded coordinate staleness |
@@ -58,6 +73,53 @@ Hyperspace-патчи проходят тот же независимый struct
 | `patch.rulesLiteralParser` | rules loader | literal fixed-delimiter operations | randomized differential semantics |
 | `patch.saveLoadProgressThrottle` | progress streams | redraw ceiling | final forced updates retained |
 | `patch.saveOutputBufferDedup` | save output chain | remove one duplicate outer buffer | save bytes/format/close chain unchanged |
+
+`CampaignGameManager.o00000(CampaignEngine$o,J,Z)` имеет correctness-critical structural-владельца
+`saveMethodPlan` только для pre-save barrier. Его feature mask включает forced cache maintenance и
+scheduler debt flush; maintenance-компонент включается при наличии campaign-cache lifecycle или
+scratch/starfield trimming, а scheduler-компонент — при `patch.marketScheduler=true`. Оба компонента
+проверяются на одинаковых входных bytes, затем изолированный candidate коммитится одной транзакцией
+в порядке forced maintenance → scheduler pre-save barrier. Один ownership marker и private static
+final mask подтверждаются общей postcondition; legacy scheduler markers, unowned partial state и
+повреждённый first-instruction barrier не принимаются.
+
+`patch.saveOutputBufferDedup` теперь является отдельным ordered structural patch с собственным
+ownership marker. Он применяется после `saveMethodPlan`, а общий composition pipeline повторно
+проверяет postcondition уже установленного barrier после успешного output-chain rewrite. Если
+1 MiB allocation pattern изменён или неоднозначен, только dedup получает `SKIPPED_STRUCTURAL`:
+maintenance hook, scheduler flush, component registration и scheduler capability остаются активны.
+Таким образом, необязательная allocation-оптимизация больше не влияет на correctness/readiness
+планировщика.
+
+### Campaign cache maintenance and scratch retention
+
+`campaignCacheMaintenanceTick()` выполняется на campaign thread из `CampaignEngine.advance()` и
+внутренне ограничивается `cache.maintenanceIntervalMs`. Перед сериализацией pre-save barrier вызывает
+`runCacheMaintenance(true)` до market-debt flush; forced sweep игнорирует только throttle, но сохраняет
+owner idle TTL и scratch grace period.
+
+Только три долгоживущие UI owner-карты используют idle eviction: `LABEL_INDEXES`,
+`INTEL_ENTITY_INDEXES` и `HIT_CACHES`. Freshness TTL содержимого остаётся независимым от
+`*.ownerIdleTtlMs`. Каждое value хранит `lastAccessNanos`; insertion сначала удаляет idle entries, затем
+при жёстком лимите 32/32/64 выполняет линейный identity-preserving LRU по минимальному timestamp.
+Hover cells физически удаляются только общим sweep не чаще `hover.cellPruneIntervalMs`.
+Freshness использует единый half-open контракт: cell валиден только при `age < hover.cellTtlMs` и
+считается expired при `age >= hover.cellTtlMs`. Поэтому результат на точной TTL-границе не зависит
+от того, успел ли maintenance sweep. `lastResult` pruning не затрагивает.
+
+Reusable `ScratchFrame` и starfield `ListPool` не получают owner TTL. Scratch сохраняет exact
+concrete types `ArrayList`/`HashSet`; per-collection integer high-water обновляется allocation-free
+hooks только в ASM-доказанных `add`/`addAll` sites. Поэтому peak не теряется, даже если caller вызвал
+`clear()` до выхода из scope. Clock читается один раз при полном закрытии root scope: тогда
+фиксируется oversized timestamp, но активные и вложенные frames никогда не заменяются. После
+`scratch.trimGraceMs` oversized свободный frame заменяется, а хвост после патологической
+реентерабельности сокращается до четырёх обычных retained frames. Gauges суммируют high-water
+каждой retained list/set отдельно и сбрасываются в EMPTY snapshot при смене campaign generation.
+
+Starfield `PooledList.add/addAll` также обновляет только integer high-water без `nanoTime()`;
+единственный clock read выполняется при release lease. Oversized free lists удаляются после
+`starfield.pool.oversizedGraceMs`. Отдельного executor, daemon maintenance thread или `System.gc()`
+нет.
 
 ### Commodity temporal active set
 
@@ -151,107 +213,75 @@ audit. Safe profile выключает блок; default/aggressive включа
 их выключенными. Они не возвращаются в default/safe/aggressive до изолированного исправления и
 успешного startup/mission прогона каждого переключателя по отдельности.
 
-### Агрессивный remote-market scheduler
+### Единый market scheduler
 
-`patch.remoteMarketScheduler` меняет только один engine call site — интерфейсный вызов
-`MarketAPI.advance(amount)` внутри ordered snapshot-loop `Economy.advance()`. Прямые вызовы
-`MarketAPI.advance()` из модов и других engine paths остаются vanilla-immediate.
+`patch.marketScheduler` агрегирует periodic `Market.advance(float)` по render batch, но сохраняет
+точную RLE-историю исходных simulation-step `amount`. Полный runtime-контракт описан в
+[MARKET_SCHEDULER.md](architecture/MARKET_SCHEDULER.md).
 
-Настройки default/aggressive profile:
+Основные поверхности:
 
-```properties
-patch.remoteMarketScheduler=true
-market.remote.frames=4
-market.remote.hiddenFrames=8
-market.remote.maxDeferredFrames=8
-market.remote.maxDeferredGameDays=0.02
-market.hot.currentLocation=true
-market.hot.playerOwned=true
-market.hot.interaction=true
-market.remote.policyAuditFrames=60
-market.remote.fullRateMemoryKey=$starsectorPrepatcher_fullRateMarket
-```
-
-Для skipped frame исходный `amount` суммируется. При stable phase, safety cap, переходе в hot state
-или pre-save flush рынок получает полный накопленный interval одним вызовом. Новый рынок всегда
-получает первый вызов немедленно. Due markets по-прежнему вызываются в исходном порядке market
-snapshot; scheduler не запускает background threads и не сериализует state.
-
-Performance-first компромиссы:
-
-- frame-count callback cadence удалённых conditions/industries/submarkets уменьшается;
-- RNG sequence plugin'ов, вызывающих random один раз на callback, может измениться;
-- точное состояние, наблюдаемое одним рынком у другого между staggered phases, может отставать на
-  ограниченное окно;
-- direct mutation memory opt-out может стать видимой не позднее `policyAuditFrames`;
-- накопленный elapsed time сохраняется, но plugin, игнорирующий `amount` и считающий callbacks,
-  поведёт себя иначе.
-
-Frame-based audit-параметры считают фактически доставленные вызовы, а не глобальные engine frames.
-В частности, `commodity.temporalAuditFrames` и `market.structureAuditFrames` увеличиваются при
-`Market.advance()`, а `market.noOpIndustryAuditFrames` — при попытке вызвать inherited
-`BaseIndustry.advance()` внутри такого market tick. Поэтому для удалённого рынка с cadence `4` или
-hidden cadence `8` wall-frame окно соответствующего audit может растянуться примерно в `4×` или
-`8×` (до safety/hot/save wake). Это составной aggressive-компромисс; current/hot markets остаются
-full-rate, а safe profile отключает оба scheduler-а.
-
-Full-rate остаются текущая location, interaction market, player-owned markets и рынки с:
-
-```java
-market.getMemoryWithoutUpdate().set(
-        "$starsectorPrepatcher_fullRateMarket", true);
-```
-
-`profiles/safe.properties` отключает scheduler. Nested/reentrant `Economy.advance()` определяется
-через reentrant scope и полностью уходит в immediate fallback, не меняя frame context внешнего
-прохода.
-
-### Scheduler `planetConditionMarketOnly`
-
-`patch.planetConditionMarketScheduler` закрывает отдельный vanilla call site:
-
-```text
-BaseCampaignEntity.advance(float)
-  -> market.isPlanetConditionMarketOnly()
-  -> MarketAPI.advance(amount)
-```
-
-Этот путь не входит в ordered snapshot-loop `Economy.advance()` и поэтому не мог использовать
-`patch.remoteMarketScheduler`. Новый bridge применяется только после точной structural-проверки
-predicate, receiver `this.market`, аргумента `amount` и единственного interface-call site.
-
-Настройки default/aggressive profile:
+- `CampaignState` подтверждает fast-forward batch protocol;
+- `CampaignEngine` задаёт simulation tick/render batch и lifecycle;
+- `economyAdvancePlan` устанавливает Economy source;
+- `BaseCampaignEntity` устанавливает planet-condition source;
+- `saveMethodPlan` выполняет forced cache maintenance и market flush;
+- `marketAdvancePlan` оборачивает конкретный `Market.advance` invocation context и construction
+  mutation barriers;
+- `MilitaryBase`, `LionsGuardHQ`, `RecentUnrest` получают local single-step replay wrappers;
+- `BaseIndustry` и `ConstructionQueue` получают exact construction mutation barriers.
 
 ```properties
-patch.planetConditionMarketScheduler=true
-market.planetCondition.frames=4
-market.planetCondition.currentLocationFrames=1
-market.planetCondition.maxDeferredFrames=8
-market.planetCondition.maxDeferredGameDays=0.02
-market.planetCondition.policyAuditFrames=60
-market.planetCondition.fullRateMemoryKey=$starsectorPrepatcher_fullRateMarket
+patch.marketScheduler=true
+market.scheduler.batches=4
+market.scheduler.hiddenBatches=8
+market.scheduler.hot.currentLocation=true
+market.scheduler.hot.playerOwned=true
+market.scheduler.hot.interaction=true
+market.scheduler.policyAuditBatches=60
+market.remote.constructionAuditBatches=60
+market.scheduler.perSimulationTickMemoryKey=$starsectorPrepatcher_perSimulationTickMarket
+market.remote.maxPendingRuns=32
+market.remote.exactReplayBeforeSave=false
+observer.marketAdvanceSemanticRisks=false
 ```
 
-Scheduler имеет отдельную identity map и не объединяет debt с central remote-market scheduler. Это
-сохраняет multiplicity в патологическом случае, когда один и тот же `MarketAPI` достигается обоими
-vanilla-путями. Первый вызов нового market выполняется немедленно. В location игрока cadence по
-умолчанию равен vanilla; direct opt-out memory key, reentrant fallback, campaign-lifecycle reset и
-pre-save flush работают независимо от центрального scheduler.
+`pendingAmount`, `pendingSteps` и `pendingRuns` сохраняют сумму, число и порядок исходных float.
+Соседние raw-bit-identical значения объединяются в run. При превышении `maxPendingRuns` текущая
+история выполняется с batch context; усреднение не используется.
 
-Если `patch.remoteMarketScheduler=false`, transformer добавляет в `Economy.advance()` только точный
-frame-clock/scratch boundary, необходимый planet scheduler; обычный central market call остаётся
-vanilla. Если frame context ещё не существует, amount некорректен или helper не может безопасно
-получить policy/state, текущий planet-condition вызов выполняется немедленно.
+Обычный рынок получает один coalesced callback, а `MilitaryBase`, `LionsGuardHQ` и `RecentUnrest`
+внутри него воспроизводят исходные шаги только для собственного `advance()`. `RecentUnrest`
+останавливается после удаления condition. Наличие военной базы не переводит весь рынок в full-rate.
 
-Performance-first компромисс тот же: удалённый condition-only market получает меньше полных
-`Market.advance()` callbacks с суммарным elapsed `amount`; код, считающий callbacks вместо времени,
-может изменить поведение. `profiles/safe.properties` оставляет этот патч выключенным.
+Непустая construction queue, building или upgrading временно переводят весь рынок в full-rate.
+Старая history exact-replay’ится до текущего шага. Подтверждённые mutators `Market`, `BaseIndustry`
+и `ConstructionQueue` flush’ят pending history до изменения структуры. После завершения
+строительства рынок автоматически возвращается к coalescing. Полный detector scan выполняется
+после mutation epoch и через редкий safety audit, а не на каждом simulation input.
 
-### Level 1: observation прямых mod-вызовов Market.advance
+Direct/event/fail-open barrier сначала доставляет старую history, затем выполняет текущий amount
+отдельно. Save по умолчанию coalesced с batch context; `market.remote.exactReplayBeforeSave=true`
+включает exact replay всех рынков. Construction markets всегда exact-replay’ятся.
 
-`patch.directMarketObservation` не является scheduler-патчем. Он предназначен для диагностического
-прогона перед проектированием robust direct-call policy и **не меняет cadence или результат**
-прямых вызовов.
+`observer.marketAdvanceSemanticRisks` создаёт статический CSV-отчёт по mod component `advance(F)V`
+(`INTERVAL_SINGLE_ELAPSE`, random, single-threshold и market-structure mutation). Observer-only
+режим не меняет bytes даже у класса с прямым `Market.advance()` call site; runtime instrumentation
+требует отдельного `patch.directMarketObservation` или `patch.marketScheduler`.
+
+Scheduler readiness требует одиннадцать registration bits: пять core surfaces, semantic boundary
+`Market.advancePlan`, три local replay wrapper и две construction-barrier группы. Отсутствующий или
+повреждённый wrapper/barrier оставляет scheduler в synchronous fail-open.
+
+Локальный replay доказывает последовательность шагов внутри каждого целевого компонента, но не
+восстанавливает глобальное межкомпонентное чередование и общий RNG order. Полная vanilla-
+эквивалентность этих аспектов требует campaign-level differential tests и пока не заявляется.
+
+Дополнительные metrics: pending steps/runs и high-water, overflow flushes, coalesced amount/context,
+три local replay counters, construction mode/boundary counters и save coalesced/exact duration.
+Coverage test продолжает требовать два periodic и шесть synchronized vanilla core call sites.
+
+### Level 1: observation и синхронизация прямых mod-вызовов Market.advance
 
 Отдельный transformer рассматривает mod bytecode и заменяет только прямые вызовы:
 
@@ -260,17 +290,22 @@ invokeinterface MarketAPI.advance(F)V
 invokevirtual   Market.advance(F)V
 ```
 
-на typed wrapper. Transformer заранее регистрирует manifest call site после успешной bytecode
-verification, поэтому `call-sites.csv` содержит найденные sites даже до первого исполнения. Wrapper:
+на typed synchronous wrapper. Он устанавливается, когда включён либо
+`patch.directMarketObservation`, либо `patch.marketScheduler`:
 
-1. записывает site ID и дешёвые counters;
-2. при выбранном sampling измеряет inclusive время и снимает stack;
-3. синхронно вызывает исходный `market.advance(amount)` в том же потоке;
-4. сохраняет multiplicity, float `amount`, порядок и exception propagation.
+- при одном observer wrapper сохраняет исходный `amount`, cadence, multiplicity, thread и exception;
+- при scheduler без observer wrapper не создаёт telemetry session, но если у рынка есть pending debt,
+  один callback получает `pending + direct amount`, после чего debt обнуляется;
+- если debt отсутствует, direct call получает исходный float без изменения.
 
-Concrete vanilla `Market.advance(float)` дополнительно имеет дешёвый entry probe. Calls от
-central scheduler, planet-condition scheduler/immediate path, их fail-open/save-flush путей и
-instrumented mod sites помечаются через `ThreadLocal` origin. Поэтому массовый известный vanilla
+При активном observer transformer заранее регистрирует manifest call site после успешной bytecode
+verification, поэтому `call-sites.csv` содержит найденные sites даже до первого исполнения. Wrapper
+записывает site ID/counters, опционально измеряет inclusive время и stack, затем синхронно вызывает
+`market.advance(effectiveAmount)` в том же потоке и сохраняет exception propagation.
+
+Concrete vanilla `Market.advance(float)` дополнительно имеет дешёвый entry probe. Calls от двух
+источников единого scheduler-а, его fail-open/save-flush путей и instrumented mod sites помечаются
+через `ThreadLocal` origin. Поэтому массовый известный vanilla
 `planetConditionMarketOnly` путь больше не загрязняет `UNKNOWN_DIRECT`. Непомеченный вход получает
 ограниченное число stack samples **на каждый отчётный интервал**, что сохраняет шанс обнаружить
 поздние reflection/MethodHandle и нестандартные loader paths.
@@ -287,7 +322,7 @@ directMarket.maxSites=4096
 directMarket.unknownStackSamples=32
 ```
 
-`session.json` использует schema 2 и содержит `sessionOrigin`. Обычный запуск имеет значение
+`session.json` использует schema 3 и содержит `sessionOrigin`. Обычный запуск имеет значение
 `game`; startup/FR validation smoke получает отдельное значение и заметный префикс каталога, чтобы
 короткую тестовую JVM нельзя было принять за игровую телеметрию.
 
@@ -304,9 +339,12 @@ fail-open при любой telemetry/file ошибке. Ненулевой ди
 
 ### Persistent economy snapshots
 
-При `patch.economyPersistentSnapshots=true` старый `patch.economySnapshotReuse` остаётся
-fresh-copy fallback, но normal Economy/Market advance больше не выполняет покадровый
-`clear()+addAll()` для markets, conditions и industries.
+`patch.economyPersistentSnapshots` — единственный economy snapshot optimizer. Он заменяет горячие
+defensive copies для списка markets в `Economy` и списков conditions/industries в `Market` на
+owner-local copy-on-write snapshots. Отдельной scratch-стратегии и runtime hooks для неё больше нет.
+Внутренний condition snapshot в `Economy.advanceMarketConditionsWhenPaused()` намеренно остаётся
+vanilla fresh `ArrayList(Collection)`, поскольку его owner-local состояние принадлежит отдельным
+`Market`, а не `Economy`.
 
 Каждый transformed owner хранит private transient copy-on-write state:
 
@@ -396,6 +434,15 @@ byte-for-byte visual parity: сама цель блока — намеренно
 для vanilla и Faster Rendering сохраняется одно loader-identity правило и одна `-javaagent` запись;
 исходный отдельный FastForward Presentation Patch agent одновременно устанавливать не нужно.
 
+Порядок `presentation → structural` является частью runtime-контракта, а не только порядком строк
+регистрации. На пяти общих target-классах presentation-stage добавляет private synthetic
+`smo$presentation$fastForwardOwner` и `smo$presentation$fastForwardMask`. Structural transformer до
+анализа принимает только полностью vanilla presentation-state либо owner/mask с точным набором
+`StarsectorPrepatcherPresentationHooks`; после каждого structural commit и в финале этот набор
+перепроверяется. Marker без hooks, hooks без marker, неверная mask или повреждение одного wrapper
+дают `SKIPPED_COMPOSITION` и оставляют входные bytes активными. Presentation после structural bytes
+не запускается: exact whole-class hash намеренно делает обратный порядок несовместимым.
+
 Ранняя загрузка presentation-only target не является причиной отменять прежний structural-блок:
 этот target получает `SKIPPED_ALREADY_LOADED` и остаётся vanilla, а остальные targets продолжают
 загружаться через оба transformer'а. Если уже загружен обязательный `CampaignState` frame marker,
@@ -412,8 +459,7 @@ patches применяются своим transformer'ом.
 
 | Config | Target | Изменение | Принятое поведение/риск |
 |---|---|---|---|
-| `patch.hyperspaceCulling` | `BaseTiledTerrain.render/isTileVisible` | third width load in yEnd changed to height | affects every subclass by design |
-| `patch.hyperspaceYClamp` | same | second end clamp uses inner dimension | affects every subclass by design |
+| `patch.hyperspaceViewportBounds` | `BaseTiledTerrain.render/isTileVisible` | atomically corrects the vertical range to use viewport height and clamps it to the inner tile-array dimension | both sites in both methods must match before either is changed; affects every subclass by design |
 | `patch.skipNoOpTerrainLayer` | `HyperspaceTerrainPlugin.getActiveLayers` | removes `TERRAIN_9` from backing set | also skips that layer's `preRender` sequence by design |
 | `patch.terrainRandomReuse` | tiled/hyperspace terrain | seeded `Random` ring + batched diagnostics | same seed/draw sequence; cumulative approximate counter; no per-tile `LongAdder`/clock call |
 | `patch.automatonBufferReuse` | automaton + terrain internal reads | owner-local spare `int[][]`; confirmed exact-owner internal reads bypass public escape mark | public/mod/subclass/unconfirmed paths use virtual getter; escaped aliases are never reused; transient state, zero-init |
@@ -424,7 +470,7 @@ patches применяются своим transformer'ом.
 
 - storm/automaton update throttling;
 - dropped simulation debt;
-- неявные callback-frequency changes вне явно документированных `patch.remoteMarketScheduler`, `patch.planetConditionMarketScheduler` и exact dormant-наследников `BaseIndustry`;
+- неявные callback-frequency changes вне явно документированных `patch.marketScheduler` и exact dormant-наследников `BaseIndustry`;
 - public combat-grid reuse;
 - generic particle object pooling;
 - fleet-pair broadphase без runtime parity harness;
