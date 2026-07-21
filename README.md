@@ -2,7 +2,7 @@
 
 [English](README.md) | [Русский](README_RU.md)
 
-Current version: **0.9.5**. Supported game build: **Starsector 0.98a-RC8**.
+Current version: **0.10.0**. Supported game build: **Starsector 0.98a-RC8**.
 
 [![Unplayable without Prepatcher versus smooth with Prepatcher](media/smoothness_comparison.gif)](https://github.com/kirpoly/StarsectorPrepatcher/releases/download/v0.8.0/StarsectorPrepatcher-0.8.0-comparison.webm)
 
@@ -20,7 +20,7 @@ The project has a broader direction than map optimization alone:
 - keep version-specific bytecode knowledge inside the prepatcher instead of duplicating it across
   gameplay mods.
 
-The public API is a roadmap item, not a published compatibility surface in `0.9.5`. Its intended
+The public API is a roadmap item, not a published compatibility surface in `0.10.0`. Its intended
 namespace is `com.starsector.prepatcher.api`; API types will only become supported once they are
 documented and covered by compatibility tests.
 
@@ -100,12 +100,12 @@ The prepatcher does not modify save data, and its runtime caches are never seria
   market/condition/industry snapshots with structure epochs and bounded audits, an owner-local
   ReachEconomy fingerprint, an ordered inactive-commodity fast path combined with the direct
   expiry-aware `MutableStatWithTempMods` scheduler, a guarded dormant inherited-`BaseIndustry`
-  fast path, repeated absent commodity event-mod removal suppression, empty-script and empty-memory
-  fast paths, and comm-relay candidates;
+  fast path, repeated absent commodity event-mod removal suppression, empty-script/empty-memory
+  fast paths, a structurally matched CoreScript core-worlds extent cache, and comm-relay candidates;
 - routing: ordered jump-point and system indexes with vanilla selection and fallback semantics;
 - combat and particles: internal scratch collections and stable deferred cleanup;
 - fast-forward presentation: final-substep coalescing for guarded campaign visuals and continuous
-  audio, with broader animation/fader/particle groups available only in the aggressive profile;
+  audio, with broader animation/fader/particle groups enabled by the default/aggressive profile;
 - loading and save paths: literal parsing, progress redraw, and output-path fixes;
 - hyperspace: terrain culling, layer selection, seeded random reuse, owner-local automaton buffers,
   and moving-starfield cleanup.
@@ -125,10 +125,16 @@ enabled=false
 because they participated in confirmed mission-startup failures. They will not be re-enabled until
 their fixes pass an isolated startup and mission suite.
 
-The default and safe profiles enable the structurally matched fast-forward presentation master,
-frame marker, and narrower visual/audio groups. Global animations, sensor faders, slipstream particles, and
-particle emitters remain opt-in because they can change callback, lifetime, RNG, or emission cadence;
-the aggressive profile enables them. `fastForward.visualTime=realtime` keeps presentation at one
+The default, safe, and aggressive profiles keep expensive observers, CSV/stack sampling, verbose
+transformation output, presentation metrics, and the periodic stats worker disabled. Copy
+`profiles/debug.properties` over `prepatcher.properties` only for a bounded diagnostic session; it
+inherits every aggressive-profile setting, enables all of those facilities, and writes additional
+data below `logs/`. A repository consistency test enforces the aggressive-plus-diagnostics contract.
+
+The safe profile enables the structurally matched fast-forward presentation master, frame marker,
+and narrower visual/audio groups. The default profile exactly mirrors aggressive: global animations,
+sensor faders, slipstream particles, and particle emitters are enabled despite their broader callback,
+lifetime, RNG, and emission-cadence surface. `fastForward.visualTime=realtime` keeps presentation at one
 ordinary update per outer frame, while `simulation` accumulates substep time and may produce visible
 jumps. Simulation itself still runs on every substep.
 
@@ -161,7 +167,7 @@ pre-save callback discards the already-detached ambiguous debt, switches that ma
 execution, and aborts the save so a partially applied callback is never retried automatically.
 Periodic counters use `sumThenReset()`.
 
-`patch.directMarketObservation` is also enabled in the default/aggressive profile in 0.9.3. It does
+`patch.directMarketObservation` is enabled only by the debug profile. It does
 not throttle direct mod calls: each call remains synchronous and immediate. Known planet-condition
 engine calls are reported separately from unknown entries, transformed call sites are written to the
 manifest before first execution, and the unknown-stack budget renews every report interval. Per-run
@@ -171,8 +177,8 @@ to remove sampling overhead. `call-sites.csv` and `observations.csv` contain exp
 `mod_name`, mod-directory, and JAR columns resolved from the owning mod's `mod_info.json`; `source`
 remains available as the exact code-source path rather than being the only way to identify a mod.
 
-Construction classification always publishes aggregate reason/scan counters in the periodic stats
-line. `Industry.isUpgrading()` is diagnostic-only. For `BaseIndustry` subclasses, full-rate policy uses
+Construction classification maintains aggregate reason/scan counters; the debug profile publishes
+them in its periodic stats line. `Industry.isUpgrading()` is diagnostic-only. For `BaseIndustry` subclasses, full-rate policy uses
 the authoritative raw `building` field rather than an overridden virtual `isBuilding()` result;
 non-`BaseIndustry` implementations retain the interface-method fallback. Virtual-building reports with
 raw `building=false` are counted and sampled separately but do not enable full-rate. Optional bounded
@@ -214,6 +220,6 @@ Build details are in [`BUILDING.md`](BUILDING.md).
 - [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md) — structural matching and fail-open rules;
 - [`docs/VALIDATION.md`](docs/VALIDATION.md) — regression and performance validation playbook;
 - [`docs/ROADMAP.md`](docs/ROADMAP.md) — structural discovery, architecture, tooling, and platform plan;
-- [`docs/releases/0.9.5.md`](docs/releases/0.9.5.md) — current detailed release report.
+- [`docs/releases/0.10.0.md`](docs/releases/0.10.0.md) — current detailed release report.
 
 StarsectorPrepatcher is distributed under the terms in [`LICENSE`](LICENSE).

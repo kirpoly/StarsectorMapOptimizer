@@ -35,7 +35,7 @@ agent JAR как обычные entries `com/fs/starfarer/api/StarsectorPrepatch
 не должен иметь на них статических ссылок: `RuntimeInstaller` читает эти entries как bytes и через
 `MethodHandles.Lookup.defineClass()` определяет их в system/game loader. Build завершается ошибкой,
 если в JAR нет обязательных top-level entries или exact inventory текущего payload отличается от
-83 top-level/nested class entries:
+84 top-level/nested class entries:
 
 ```text
 com/fs/starfarer/api/StarsectorPrepatcherHooks.class
@@ -95,14 +95,15 @@ Linux/macOS:
 10. запускает собранный javaagent и сохраняет startup smoke.
 
 Structural harness создаёт внутренний `.build/structural-all-enabled.properties` из aggressive
-profile и только там включает known-disabled loading/startup patches, чтобы продолжать проверять
-их bytecode-контракты. Этот файл не поставляется игроку и не используется startup smoke; во всех
-поставляемых профилях оба проблемных переключателя остаются `false`.
+profile и только там включает known-disabled loading/startup patches, direct-market observer и
+короткий stats interval для полного structural/telemetry coverage. Этот файл не поставляется игроку и не используется startup smoke; во всех
+поставляемых профилях, включая debug, оба проблемных переключателя остаются `false`.
 
 Сырые отчёты `documentation-consistency.txt`, `structural-verification.txt`,
 `fast-forward-presentation-structural-plan.txt`,
 `fast-forward-presentation-compatibility.txt`, `fast-forward-presentation-runtime.txt`,
-`fast-forward-presentation-actual-agent.txt`, `direct-market-transformer.txt`,
+`fast-forward-presentation-actual-agent.txt`, `core-worlds-structural-matcher.txt`,
+`core-worlds-actual-agent.txt`, `direct-market-transformer.txt`,
 `runtime-regression.txt`, `temp-mod-actual-agent-smoke.txt`,
 `market-step-replay-actual-agent-smoke.txt`,
 `commodity-temporal-agent-smoke.txt`, `market-noop-actual-agent-smoke.txt`,
@@ -111,7 +112,7 @@ profile и только там включает known-disabled loading/startup p
 документацию или дистрибутив. Если `fr.jar` отсутствует, FR smoke явно получает `SKIPPED`; такой
 результат допустим для обычной разработки, но не для выпуска с заявленной FR-совместимостью.
 Краткие пользовательские изменения фиксируются в [`CHANGELOG.md`](CHANGELOG.md), а причины,
-измерения и остаточные риски — в [`docs/releases/`](docs/releases/0.9.5.md). Обязательные regression
+измерения и остаточные риски — в [`docs/releases/`](docs/releases/0.10.0.md). Обязательные regression
 gates для новых pre-load патчей описаны в [`docs/VALIDATION.md`](docs/VALIDATION.md).
 
 ## Java 17 compatibility

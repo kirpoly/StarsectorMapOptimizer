@@ -26,6 +26,10 @@ public final class PrepatcherConfig {
     public final boolean campaignSnapshotReuse;
     public final boolean entityScriptSnapshotReuse;
     public final boolean emptyMemoryAdvanceFastPath;
+    public final boolean coreWorldsExtentCache;
+    public final boolean coreWorldsSkipFastForwardIterations;
+    public final boolean coreWorldsCheckMemoryExpiry;
+    public final int coreWorldsValidationFrames;
     public final boolean economyLocationCache;
     public final boolean economyPersistentSnapshots;
     public final boolean commodityEventModDirtyCache;
@@ -140,6 +144,12 @@ public final class PrepatcherConfig {
         campaignSnapshotReuse = bool("patch.campaignSnapshotReuse", true);
         entityScriptSnapshotReuse = bool("patch.entityScriptSnapshotReuse", true);
         emptyMemoryAdvanceFastPath = bool("patch.emptyMemoryAdvanceFastPath", true);
+        coreWorldsExtentCache = bool("patch.coreWorldsExtentCache", true);
+        coreWorldsSkipFastForwardIterations = bool(
+                "coreWorlds.skipFastForwardIterations", false);
+        coreWorldsCheckMemoryExpiry = bool("coreWorlds.checkMemoryExpiry", true);
+        coreWorldsValidationFrames = integer(
+                "coreWorlds.validationFrames", 1, 1, 1_000_000);
         economyLocationCache = bool("patch.economyLocationCache", true);
         warnRemovedEconomySnapshotReuse();
         economyPersistentSnapshots = bool("patch.economyPersistentSnapshots", false);
@@ -179,7 +189,7 @@ public final class PrepatcherConfig {
         fastForwardSensorFaders = bool("patch.fastForwardSensorFaders", false);
         fastForwardSlipstreamParticles = bool("patch.fastForwardSlipstreamParticles", false);
         fastForwardParticleEmitters = bool("patch.fastForwardParticleEmitters", false);
-        fastForwardVerbose = bool("fastForward.verbose", true);
+        fastForwardVerbose = bool("fastForward.verbose", false);
         fastForwardMetrics = bool("fastForward.metrics", false);
         String fastForwardVisualTime = string("fastForward.visualTime", "realtime")
                 .toLowerCase(Locale.ROOT);
@@ -257,7 +267,7 @@ public final class PrepatcherConfig {
         marketStructureAuditFrames = integer("market.structureAuditFrames", 120, 1, 100_000);
         commodityTemporalAuditFrames = integer("commodity.temporalAuditFrames", 60, 1, 100_000);
         marketNoOpIndustryAuditFrames = integer("market.noOpIndustryAuditFrames", 120, 0, 100_000);
-        statsLogIntervalSeconds = integer("logging.statsIntervalSeconds", 30, 0, 3600);
+        statsLogIntervalSeconds = integer("logging.statsIntervalSeconds", 0, 0, 3600);
         saveLoadProgressHz = integer("saveLoad.progressHz", 15, 0, 240);
         starfieldRemoveAllThreshold = integer("starfield.removeAllThreshold", 8, 1, 4096);
         scratchTrimEnabled = bool("scratch.trim.enabled", true);

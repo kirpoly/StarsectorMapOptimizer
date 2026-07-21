@@ -86,6 +86,7 @@ foreach ($key in @('patch.loadingTextReader', 'patch.startupLogAggregation')) {
         $pattern,
         { param($match) "$key=true" + $match.Groups[1].Value })
 }
+$verificationText += "`npatch.directMarketObservation=true`nlogging.statsIntervalSeconds=1`n"
 [IO.File]::WriteAllText(
     $verificationConfig,
     "# Generated for structural coverage only; never shipped or used by startup smoke.`n" +
@@ -105,6 +106,27 @@ $structuralLines = @($structuralOutput | ForEach-Object { $_.ToString() })
 $structuralLines
 [IO.File]::WriteAllLines($structuralReport, [string[]] $structuralLines, $utf8)
 if ($structuralExitCode -ne 0) { throw 'Structural compatibility verification failed.' }
+
+$coreWorldsStructuralReport = Join-Path $reportDir 'core-worlds-structural-matcher.txt'
+$ErrorActionPreference = 'Continue'
+try {
+    $coreWorldsStructuralOutput = @(& java @exports -cp $classPath `
+        com.starsector.prepatcher.agent.CoreWorldsStructuralMatcherTest `
+        $verificationConfig (Join-Path $core 'starfarer.api.jar') 2>&1)
+    $coreWorldsStructuralExitCode = $LASTEXITCODE
+} finally {
+    $ErrorActionPreference = $savedErrorActionPreference
+}
+$coreWorldsStructuralLines = @(
+    $coreWorldsStructuralOutput | ForEach-Object { $_.ToString() })
+$coreWorldsStructuralLines
+[IO.File]::WriteAllLines(
+    $coreWorldsStructuralReport,
+    [string[]] $coreWorldsStructuralLines,
+    $utf8)
+if ($coreWorldsStructuralExitCode -ne 0) {
+    throw 'Core-worlds structural matcher verification failed.'
+}
 
 $presentationStructuralPlanReport =
     Join-Path $reportDir 'fast-forward-presentation-structural-plan.txt'
@@ -183,6 +205,7 @@ $runtimeLines = [System.Collections.Generic.List[string]]::new()
 foreach ($test in @(
     'com.starsector.prepatcher.runtime.LifecycleGcRegressionTest',
     'com.starsector.prepatcher.runtime.CacheMaintenanceRuntimeTest',
+    'com.starsector.prepatcher.runtime.CoreWorldsRuntimeRegressionTest',
     'com.starsector.prepatcher.runtime.Exp6RuntimeRegressionTest',
     'com.starsector.prepatcher.runtime.Exp8RuntimeRegressionTest',
     'com.starsector.prepatcher.runtime.MarketSchedulerRuntimeTest',
@@ -236,6 +259,25 @@ $presentationRuntimeLines
     $presentationRuntimeReport, $presentationRuntimeLines, $utf8)
 
 $mainAgentJar = Join-Path $modRoot 'agent\StarsectorPrepatcherAgent.jar'
+$coreWorldsAgentReport = Join-Path $reportDir 'core-worlds-actual-agent.txt'
+$ErrorActionPreference = 'Continue'
+try {
+    $coreWorldsAgentOutput = @(& java `
+        "-javaagent:$mainAgentJar=config=$(Join-Path $modRoot 'profiles\aggressive.properties')" `
+        -cp $runtimeCp `
+        com.starsector.prepatcher.runtime.CoreWorldsActualAgentSmokeTest 2>&1)
+    $coreWorldsAgentExitCode = $LASTEXITCODE
+} finally {
+    $ErrorActionPreference = $savedErrorActionPreference
+}
+$coreWorldsAgentLines = @($coreWorldsAgentOutput | ForEach-Object { $_.ToString() })
+$coreWorldsAgentLines
+[IO.File]::WriteAllLines(
+    $coreWorldsAgentReport, [string[]] $coreWorldsAgentLines, $utf8)
+if ($coreWorldsAgentExitCode -ne 0) {
+    throw 'Core-worlds actual-agent smoke failed.'
+}
+
 $presentationAgentReport = Join-Path $reportDir 'fast-forward-presentation-actual-agent.txt'
 $ErrorActionPreference = 'Continue'
 try {

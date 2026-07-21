@@ -6818,7 +6818,8 @@ public final class StarsectorPrepatcherHooks {
                         + STARTUP_LOG_SPEC.sumThenReset() + STARTUP_LOG_TEXTURE.sumThenReset()
                         + STARTUP_LOG_SOUND.sumThenReset() + STARTUP_LOG_OTHER.sumThenReset()));
                 PrepatcherLog.info("stats: "
-                        + StarsectorPrepatcherTempModHooks.statsAndReset());
+                        + StarsectorPrepatcherTempModHooks.statsAndReset()
+                        + StarsectorPrepatcherCoreWorldsRuntime.statsAndResetFragment());
             } catch (InterruptedException ex) {
                 Thread.currentThread().interrupt();
                 return;

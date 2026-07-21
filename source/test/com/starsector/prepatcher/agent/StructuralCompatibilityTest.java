@@ -47,6 +47,8 @@ public final class StructuralCompatibilityTest {
             "com/fs/starfarer/api/StarsectorPrepatcherHyperspaceHooks";
     private static final String TEMP_MOD_HOOKS =
             "com/fs/starfarer/api/StarsectorPrepatcherTempModHooks";
+    private static final String CORE_WORLDS_RUNTIME =
+            "com/fs/starfarer/api/StarsectorPrepatcherCoreWorldsRuntime";
 
     private StructuralCompatibilityTest() {}
 
@@ -2461,6 +2463,8 @@ public final class StructuralCompatibilityTest {
                 // Fully inline; the previous helper-based version was measurable
                 // in real campaign telemetry.
             }
+            case PrepatcherTransformer.CORE_SCRIPT ->
+                    assertHookCount(bytes, CORE_WORLDS_RUNTIME, "update", 1);
             case PrepatcherTransformer.ECONOMY -> {
                 expected.put("updateEconomyLocationMapIfNeededPersistent", 1);
                 expected.put("borrowPersistentSnapshotTimed", 1);

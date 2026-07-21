@@ -50,13 +50,22 @@ VERIFICATION_CONFIG="$BUILD/structural-all-enabled.properties"
     -e 's/^patch\.loadingTextReader[[:space:]]*=.*/patch.loadingTextReader=true/' \
     -e 's/^patch\.startupLogAggregation[[:space:]]*=.*/patch.startupLogAggregation=true/' \
     "$MOD_ROOT/profiles/aggressive.properties"
+  printf '%s\n' 'patch.directMarketObservation=true'
+  printf '%s\n' 'logging.statsIntervalSeconds=1'
 } > "$VERIFICATION_CONFIG"
 grep -qx 'patch.loadingTextReader=true' "$VERIFICATION_CONFIG"
 grep -qx 'patch.startupLogAggregation=true' "$VERIFICATION_CONFIG"
+grep -qx 'patch.directMarketObservation=true' "$VERIFICATION_CONFIG"
+grep -qx 'logging.statsIntervalSeconds=1' "$VERIFICATION_CONFIG"
 java "${EXPORTS[@]}" -cp "$CLASS_PATH" \
   com.starsector.prepatcher.agent.StructuralCompatibilityTest \
   "$VERIFICATION_CONFIG" "${CORE_JARS[@]}" \
   2>&1 | tee "$REPORT_DIR/structural-verification.txt"
+
+java "${EXPORTS[@]}" -cp "$CLASS_PATH" \
+  com.starsector.prepatcher.agent.CoreWorldsStructuralMatcherTest \
+  "$VERIFICATION_CONFIG" "$CORE/starfarer.api.jar" \
+  2>&1 | tee "$REPORT_DIR/core-worlds-structural-matcher.txt"
 
 java "${EXPORTS[@]}" -cp "$CLASS_PATH" \
   com.starsector.prepatcher.agent.FastForwardPresentationStructuralPlanTest \
@@ -77,6 +86,8 @@ RUNTIME_CP="$TEST_CLASSES:$MOD_ROOT/agent/StarsectorPrepatcherAgent.jar:$CORE/st
   java -cp "$RUNTIME_CP" com.starsector.prepatcher.runtime.LifecycleGcRegressionTest
   echo '== CacheMaintenanceRuntimeTest =='
   java -cp "$RUNTIME_CP" com.starsector.prepatcher.runtime.CacheMaintenanceRuntimeTest
+  echo '== CoreWorldsRuntimeRegressionTest =='
+  java -cp "$RUNTIME_CP" com.starsector.prepatcher.runtime.CoreWorldsRuntimeRegressionTest
   echo '== Exp6RuntimeRegressionTest =='
   java -cp "$RUNTIME_CP" com.starsector.prepatcher.runtime.Exp6RuntimeRegressionTest
   echo '== Exp8RuntimeRegressionTest =='
@@ -103,6 +114,12 @@ RUNTIME_CP="$TEST_CLASSES:$MOD_ROOT/agent/StarsectorPrepatcherAgent.jar:$CORE/st
   java -noverify -cp "$RUNTIME_CP" \
     com.starsector.prepatcher.agent.FastForwardPresentationLoadedTargetPolicyTest
 } 2>&1 | tee "$REPORT_DIR/fast-forward-presentation-runtime.txt"
+
+java \
+  "-javaagent:$MOD_ROOT/agent/StarsectorPrepatcherAgent.jar=config=$MOD_ROOT/profiles/aggressive.properties" \
+  -cp "$RUNTIME_CP" \
+  com.starsector.prepatcher.runtime.CoreWorldsActualAgentSmokeTest \
+  2>&1 | tee "$REPORT_DIR/core-worlds-actual-agent.txt"
 
 java -noverify \
   "-javaagent:$MOD_ROOT/agent/StarsectorPrepatcherAgent.jar=config=$MOD_ROOT/profiles/aggressive.properties" \

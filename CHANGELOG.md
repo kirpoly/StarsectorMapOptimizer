@@ -35,7 +35,19 @@
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-07-21
+
 ### Изменено
+
+- Дорогие direct-market/construction/semantic-risk observers, CSV/stack sampling, verbose
+  presentation logging, presentation metrics и периодический stats worker вынесены из default,
+  safe и aggressive в отдельный `profiles/debug.properties`. Debug-профиль наследует все значения
+  aggressive; repository consistency test запрещает их расхождение и посторонние debug-only ключи.
+- Интегрирован CoreScript core-worlds optimizer: terminal `Misc.computeCoreWorldsExtent()` в
+  `CoreScript.advance(F)V` заменяется helper-ом общего runtime payload. Exact class/JAR SHA-256
+  gating удалён; совместимость теперь доказывается тем же локальным structural contract,
+  ownership marker, postcondition и ASM verification, что и у остальных патчей. Sector local
+  выводится из `Global.getSector()`/`ASTORE`, поэтому matcher не зависит от номера local slot.
 
 - Direct-market call-site metadata переведены на schema 2: `call-sites.csv` и
   `observations.csv` теперь содержат отдельные `mod_id`, `mod_name`, `mod_directory` и `jar_name`,
