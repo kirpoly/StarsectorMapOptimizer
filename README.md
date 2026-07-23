@@ -223,3 +223,14 @@ Build details are in [`BUILDING.md`](BUILDING.md).
 - [`docs/releases/0.10.0.md`](docs/releases/0.10.0.md) — current detailed release report.
 
 StarsectorPrepatcher is distributed under the terms in [`LICENSE`](LICENSE).
+
+## AoTD native integration Stage 7
+
+The agent now negotiates bridge schema 4 and global-phase capability `0x80`. Hard global boundaries deliver pending market scheduler debt; soft boundaries identify immutable AoTD settlement phases. AoTD remains responsible for local generations, pure computation and committed snapshots.
+
+## AoTD production integration — Stage 8
+
+Prepatcher 0.11.0 installs a clean wrapper around the original
+`BaseIndustry.getMaxDeficit()`. The preserved vanilla implementation remains active until a
+compatible AoTD Scheduler Fork registers the complete native capability profile `0xff`.
+Do not install the obsolete modified `starfarer.api.jar`.

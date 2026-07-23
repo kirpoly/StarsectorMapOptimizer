@@ -521,3 +521,11 @@ arguments или control-flow anchor, соответствующий класс 
 - GL batching/FBO/VBO;
 - inter-frame terrain geometry cache;
 - save-format или serialized-object changes.
+
+## `aotdCleanDeficitPath`
+
+Target: clean game `BaseIndustry.getMaxDeficit(String...)`.
+
+The patch preserves the original method under a private synthetic name and installs a thin
+resolver wrapper. Without an active AoTD Stage 8 contract, the original vanilla code is called.
+With the complete `0xff` contract, the source-level AoTD priority-deficit resolver is used.

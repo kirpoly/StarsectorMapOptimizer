@@ -15,7 +15,7 @@ import java.util.Map;
 import java.util.Set;
 
 public final class PrepatcherAgent {
-    public static final String VERSION = "0.10.0";
+    public static final String VERSION = "0.11.0";
     private PrepatcherAgent() {}
 
     public static void premain(String agentArgs, Instrumentation instrumentation) {
@@ -31,6 +31,26 @@ public final class PrepatcherAgent {
         try {
             Path configPath = resolveConfigPath(agentArgs, modRoot);
             PrepatcherConfig config = PrepatcherConfig.load(configPath);
+
+            AoTDForkMarkerScanner.Result aotdMarker = AoTDForkMarkerScanner.scan(modRoot);
+            System.setProperty("starsector.prepatcher.aotdMarkerStatus",
+                    aotdMarker.status().name().toLowerCase(java.util.Locale.ROOT));
+            if (aotdMarker.markerJar() != null) {
+                System.setProperty("starsector.prepatcher.aotdMarkerJar",
+                        aotdMarker.markerJar().toString());
+            }
+            if (aotdMarker.status() == AoTDForkMarkerScanner.Status.CANDIDATE_FOUND) {
+                PrepatcherLog.info("AoTD native-contract candidate: "
+                        + aotdMarker.markerJar()
+                        + "; activation awaits runtime handshake.");
+            } else if (aotdMarker.status() == AoTDForkMarkerScanner.Status.AMBIGUOUS
+                    || aotdMarker.status() == AoTDForkMarkerScanner.Status.ERROR) {
+                PrepatcherLog.warn("AoTD native-contract discovery: "
+                        + aotdMarker.status() + "; " + aotdMarker.detail());
+            } else {
+                PrepatcherLog.info("AoTD native-contract discovery: "
+                        + aotdMarker.status() + "; " + aotdMarker.detail());
+            }
 
             System.setProperty("starsector.prepatcher.agentActive", "true");
             System.setProperty("starsector.prepatcher.version", VERSION);
@@ -73,6 +93,12 @@ public final class PrepatcherAgent {
             boolean presentationMarkerLoaded = recordLoadedPresentationTargets(
                     instrumentation, presentationPlan, runtimeLoader);
             exportInternalAsm(instrumentation);
+
+            // AoTD owns an inert bridge class. Patch only that verified class at
+            // load time so the mod never uses reflection or loader probing.
+            instrumentation.addTransformer(
+                    new AoTDSchedulerBridgeTransformer(runtimeLoader), false);
+            System.setProperty("starsector.prepatcher.aotdBridgePatch", "transformer-installed");
             if (!presentationMarkerLoaded) {
                 instrumentation.addTransformer(
                         new FastForwardPresentationTransformer(config, runtimeLoader), false);

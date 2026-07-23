@@ -37,6 +37,7 @@ public final class PrepatcherConfig {
     public final boolean directMarketObservation;
     public final boolean commodityTemporalFastPath;
     public final boolean marketNoOpCallbacks;
+    public final boolean aotdCleanDeficitPath;
     public final boolean tempModExpiryScheduler;
     public final boolean commRelaySystemIndex;
     public final boolean shipAdvanceScratch;
@@ -158,6 +159,7 @@ public final class PrepatcherConfig {
         directMarketObservation = bool("patch.directMarketObservation", false);
         commodityTemporalFastPath = bool("patch.commodityTemporalFastPath", false);
         marketNoOpCallbacks = bool("patch.marketNoOpCallbacks", false);
+        aotdCleanDeficitPath = bool("patch.aotdCleanDeficitPath", true);
         tempModExpiryScheduler = bool("patch.tempModExpiryScheduler", false);
         commRelaySystemIndex = bool("patch.commRelaySystemIndex", true);
         shipAdvanceScratch = bool("patch.shipAdvanceScratch", true);

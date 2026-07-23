@@ -219,6 +219,7 @@ public final class StarsectorPrepatcherHooks {
     private static volatile long marketSchedulerSimulationTick;
     private static volatile long marketSchedulerRenderBatch;
     private static final AtomicLong MARKET_SCHEDULER_DEBT_SEQUENCE = new AtomicLong();
+    private static final AtomicLong MARKET_DELIVERY_SEQUENCE = new AtomicLong();
     // Simulation ticks preserve engine ordering. Render batches, delimited by
     // CampaignEngine.setFastForwardIteration(false), own cadence so fast-forward
     // cannot multiply expensive Market.advance callbacks per visual frame.
@@ -374,7 +375,22 @@ public final class StarsectorPrepatcherHooks {
     private static final LongAdder COMMODITY_TEMPORAL_EXPOSURES = new LongAdder();
     private static final LongAdder COMMODITY_TEMPORAL_AUDITS = new LongAdder();
     private static final LongAdder COMMODITY_TEMPORAL_REBUILDS = new LongAdder();
+    private static final LongAdder COMMODITY_TEMPORAL_WAKEUP_ENQUEUES = new LongAdder();
+    private static final LongAdder COMMODITY_TEMPORAL_WAKEUP_DRAINS = new LongAdder();
+    private static final LongAdder COMMODITY_TEMPORAL_WAKEUP_INSERTS = new LongAdder();
     private static final LongAdder COMMODITY_TEMPORAL_FALLBACKS = new LongAdder();
+    private static final LongAdder COMMODITY_TEMPORAL_EXACT_VANILLA_ENTRIES = new LongAdder();
+    private static final LongAdder COMMODITY_TEMPORAL_AOTD_NATIVE_ENTRIES = new LongAdder();
+    private static final LongAdder COMMODITY_TEMPORAL_VANILLA_ONLY_ENTRIES = new LongAdder();
+    private static final LongAdder COMMODITY_TEMPORAL_EXACT_VANILLA_ACTIVE = new LongAdder();
+    private static final LongAdder COMMODITY_TEMPORAL_AOTD_NATIVE_ACTIVE = new LongAdder();
+    private static final LongAdder COMMODITY_TEMPORAL_VANILLA_ONLY_ACTIVE = new LongAdder();
+    private static final LongAdder COMMODITY_TEMPORAL_ACTIVE_AVAILABLE = new LongAdder();
+    private static final LongAdder COMMODITY_TEMPORAL_ACTIVE_AOTD_EXCESS = new LongAdder();
+    private static final LongAdder COMMODITY_TEMPORAL_ACTIVE_AOTD_DEFICIT = new LongAdder();
+    private static final LongAdder COMMODITY_TEMPORAL_ACTIVE_TRADE = new LongAdder();
+    private static final LongAdder COMMODITY_TEMPORAL_ACTIVE_TRADE_PLUS = new LongAdder();
+    private static final LongAdder COMMODITY_TEMPORAL_ACTIVE_TRADE_MINUS = new LongAdder();
     // The four high-volume market counters are sampled once per 64 calls. Exact
     // counters remain only on rare state transitions/fallbacks so observability
     // cannot become a new economy hot path.
@@ -1579,6 +1595,17 @@ public final class StarsectorPrepatcherHooks {
         }
     }
 
+    /**
+     * Loader-neutral exact replay barrier used by the source-level AoTD ABI.
+     * Invalid/non-market objects fail open; a valid market reuses the proven
+     * construction mutation barrier and therefore delivers old pending time
+     * before the new structure becomes visible.
+     */
+    public static void flushPendingMarketBeforeAoTDMutation(Object rawMarket) {
+        if (!(rawMarket instanceof MarketAPI market)) return;
+        flushPendingMarketBeforeMutation(market);
+    }
+
     /** Exact pending replay barrier inserted before construction-structure mutation. */
     public static void flushPendingMarketBeforeMutation(MarketAPI market) {
         if (market == null || !marketSchedulerReady) return;
@@ -1690,6 +1717,7 @@ public final class StarsectorPrepatcherHooks {
         DirectMarketObserver observer = DIRECT_MARKET_OBSERVER;
         if (observer == null) {
             market.advance(amount);
+            recordDeliveredMarketAdvance(market, amount, origin);
             return;
         }
         MarketAdvanceObservationContext context = MARKET_ADVANCE_CONTEXT.get();
@@ -1700,12 +1728,41 @@ public final class StarsectorPrepatcherHooks {
         context.depth = previousDepth + 1;
         context.siteId = origin == MARKET_ORIGIN_DIRECT_CALL_SITE
                 ? previousSiteId : 0L;
+        boolean success = false;
         try {
             market.advance(amount);
+            success = true;
         } finally {
             context.origin = previousOrigin;
             context.depth = previousDepth;
             context.siteId = previousSiteId;
+            if (success) recordDeliveredMarketAdvance(market, amount, origin);
+        }
+    }
+
+    /** Records only callbacks that actually returned successfully. */
+    private static void recordDeliveredMarketAdvance(
+            MarketAPI market, float amount, int origin) {
+        // Publish only from this post-success path. The runtime owns a separate
+        // weak identity generation table, so immediate/fallback callbacks are
+        // visible even before a scheduler state exists for the market.
+        StarsectorPrepatcherRuntimeBridge.publishAoTDMarketTimeDelivered(
+                market, amount, origin);
+        if (market == null) return;
+        MarketScheduleState state;
+        try {
+            state = MARKET_SCHEDULER_STATES.get(market);
+        } catch (Throwable ignored) {
+            MARKET_SCHEDULER_STATE_FAILURES.increment();
+            return;
+        }
+        if (state == null) return;
+        synchronized (state) {
+            state.deliveredCallbacks++;
+            if (Float.isFinite(amount)) state.deliveredAmount += amount;
+            state.lastDeliveredSequence = MARKET_DELIVERY_SEQUENCE.incrementAndGet();
+            state.lastDeliveredOrigin = origin;
+            state.lastDeliveredNanos = NANO_CLOCK.getAsLong();
         }
     }
 
@@ -2641,6 +2698,11 @@ public final class StarsectorPrepatcherHooks {
     }
 
     /** Flushes the one shared scheduler debt map before save serialization. */
+    /** Hard global boundary requested by the native AoTD fork. */
+    public static void flushMarketSchedulerBeforeAoTDGlobalBoundary() {
+        flushMarketSchedulerBeforeSave();
+    }
+
     public static void flushMarketSchedulerBeforeSave() {
         if (!marketSchedulerReady) return;
         PrepatcherConfig c = config;
@@ -2648,6 +2710,7 @@ public final class StarsectorPrepatcherHooks {
         if (c == null || !c.marketScheduler || !campaignCachesReady(generation)) return;
 
         long started = System.nanoTime();
+        dumpMarketSchedulerBaseline("before-save-flush");
         try {
             List<WeakIdentityEntry<MarketAPI, MarketScheduleState>> entries;
             try {
@@ -2669,6 +2732,7 @@ public final class StarsectorPrepatcherHooks {
                 deliverPendingForSave(market, state, exact);
             }
         } finally {
+            dumpMarketSchedulerBaseline("after-save-flush");
             long elapsed = System.nanoTime() - started;
             if (elapsed > 0L) SAVE_FLUSH_DURATION_NANOS.add(elapsed);
         }
@@ -2697,6 +2761,161 @@ public final class StarsectorPrepatcherHooks {
             MARKET_SCHEDULER_STATE_FAILURES.increment();
         }
         return count;
+    }
+
+    /**
+     * Writes a source-of-truth baseline of pending scheduler debt and callbacks
+     * already delivered to live Market objects. This is diagnostic only and
+     * intentionally does not flush pending debt.
+     *
+     * @return absolute CSV path, or an empty string when no mod root is configured
+     */
+    public static String dumpMarketSchedulerBaseline(String reason) {
+        Path root = modRoot;
+        if (root == null) return "";
+        String safeReason = reason == null || reason.isBlank()
+                ? "manual" : reason.replaceAll("[^A-Za-z0-9._-]+", "_");
+        String stamp = DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss-SSS")
+                .withZone(ZoneOffset.UTC).format(Instant.now());
+        Path directory = root.resolve("logs").resolve("market-scheduler-baseline");
+        Path csvPath = directory.resolve("baseline-" + stamp + '-' + safeReason + ".csv");
+        Path jsonPath = directory.resolve("baseline-" + stamp + '-' + safeReason + ".json");
+
+        ArrayList<String[]> rows = new ArrayList<>();
+        long pendingStepsTotal = 0L;
+        long pendingRunsTotal = 0L;
+        long deliveredCallbacksTotal = 0L;
+        double deliveredAmountTotal = 0d;
+        try {
+            for (WeakIdentityEntry<MarketAPI, MarketScheduleState> entry
+                    : MARKET_SCHEDULER_STATES.entriesSnapshot()) {
+                MarketAPI market = entry.key;
+                MarketScheduleState state = entry.value;
+                if (market == null || state == null) continue;
+                String marketId;
+                String marketName;
+                try { marketId = Objects.toString(market.getId(), ""); }
+                catch (Throwable ignored) { marketId = ""; }
+                try { marketName = Objects.toString(market.getName(), ""); }
+                catch (Throwable ignored) { marketName = ""; }
+                String pendingHistory;
+                int pendingSteps;
+                int pendingRuns;
+                float pendingAmount;
+                long deliveredCallbacks;
+                double deliveredAmount;
+                long lastDeliveredSequence;
+                int lastDeliveredOrigin;
+                long lastDeliveredNanos;
+                long debtSequence;
+                int lastSource;
+                int sourceMask;
+                boolean perSimulationTick;
+                boolean constructionFullRate;
+                int constructionReasonMask;
+                boolean inAdvance;
+                boolean disabled;
+                long nextDueBatch;
+                long lastTouchedBatch;
+                synchronized (state) {
+                    pendingSteps = state.pendingSteps;
+                    pendingRuns = state.pendingRuns == null ? 0 : state.pendingRuns.size();
+                    pendingAmount = state.pendingAmount;
+                    StringBuilder history = new StringBuilder();
+                    if (state.pendingRuns != null) {
+                        for (PendingStepRun run : state.pendingRuns) {
+                            if (history.length() > 0) history.append(';');
+                            history.append(Float.toString(run.amount)).append('x').append(run.count);
+                        }
+                    }
+                    pendingHistory = history.toString();
+                    deliveredCallbacks = state.deliveredCallbacks;
+                    deliveredAmount = state.deliveredAmount;
+                    lastDeliveredSequence = state.lastDeliveredSequence;
+                    lastDeliveredOrigin = state.lastDeliveredOrigin;
+                    lastDeliveredNanos = state.lastDeliveredNanos;
+                    debtSequence = state.debtSequence;
+                    lastSource = state.lastSource;
+                    sourceMask = state.sourceMask;
+                    perSimulationTick = state.perSimulationTick;
+                    constructionFullRate = state.constructionFullRate;
+                    constructionReasonMask = state.constructionReasonMask;
+                    inAdvance = state.inAdvance;
+                    disabled = state.disabled;
+                    nextDueBatch = state.nextDueBatch;
+                    lastTouchedBatch = state.lastTouchedBatch;
+                }
+                pendingStepsTotal += pendingSteps;
+                pendingRunsTotal += pendingRuns;
+                deliveredCallbacksTotal += deliveredCallbacks;
+                deliveredAmountTotal += deliveredAmount;
+                rows.add(new String[] {
+                        marketId, marketName, Integer.toString(System.identityHashCode(market)),
+                        Integer.toString(pendingSteps), Float.toString(pendingAmount),
+                        Integer.toString(pendingRuns), pendingHistory,
+                        Long.toString(deliveredCallbacks), Double.toString(deliveredAmount),
+                        Long.toString(lastDeliveredSequence), Integer.toString(lastDeliveredOrigin),
+                        Long.toString(lastDeliveredNanos), Long.toString(debtSequence),
+                        Integer.toString(lastSource), Integer.toString(sourceMask),
+                        Boolean.toString(perSimulationTick), Boolean.toString(constructionFullRate),
+                        Integer.toString(constructionReasonMask), Boolean.toString(inAdvance),
+                        Boolean.toString(disabled), Long.toString(nextDueBatch),
+                        Long.toString(lastTouchedBatch)
+                });
+            }
+        } catch (Throwable failure) {
+            MARKET_SCHEDULER_STATE_FAILURES.increment();
+            PrepatcherLog.warn("Could not capture market scheduler baseline: " + failure);
+        }
+        rows.sort((left, right) -> {
+            int byId = left[0].compareTo(right[0]);
+            return byId != 0 ? byId : left[2].compareTo(right[2]);
+        });
+
+        StringBuilder csv = new StringBuilder(
+                "market_id,market_name,identity_hash,pending_steps,pending_amount,pending_runs,pending_history,delivered_callbacks,delivered_amount,last_delivered_sequence,last_delivered_origin,last_delivered_nanos,debt_sequence,last_source,source_mask,per_simulation_tick,construction_full_rate,construction_reason_mask,in_advance,disabled,next_due_batch,last_touched_batch\n");
+        for (String[] row : rows) {
+            for (int i = 0; i < row.length; i++) {
+                if (i > 0) csv.append(',');
+                csv.append(baselineCsv(row[i]));
+            }
+            csv.append('\n');
+        }
+        String json = "{\n"
+                + "  \"schemaVersion\": 1,\n"
+                + "  \"capturedUtc\": \"" + baselineJson(Instant.now().toString()) + "\",\n"
+                + "  \"reason\": \"" + baselineJson(reason == null ? "" : reason) + "\",\n"
+                + "  \"schedulerReady\": " + marketSchedulerReady + ",\n"
+                + "  \"markets\": " + rows.size() + ",\n"
+                + "  \"pendingSteps\": " + pendingStepsTotal + ",\n"
+                + "  \"pendingRuns\": " + pendingRunsTotal + ",\n"
+                + "  \"deliveredCallbacks\": " + deliveredCallbacksTotal + ",\n"
+                + "  \"deliveredAmount\": " + deliveredAmountTotal + "\n"
+                + "}\n";
+        try {
+            Files.createDirectories(directory);
+            Files.writeString(csvPath, csv, StandardCharsets.UTF_8,
+                    StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING,
+                    StandardOpenOption.WRITE);
+            Files.writeString(jsonPath, json, StandardCharsets.UTF_8,
+                    StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING,
+                    StandardOpenOption.WRITE);
+            return csvPath.toAbsolutePath().normalize().toString();
+        } catch (Throwable failure) {
+            PrepatcherLog.warn("Could not write market scheduler baseline: " + failure);
+            return "";
+        }
+    }
+
+    private static String baselineCsv(String value) {
+        String text = value == null ? "" : value;
+        return '"' + text.replace("\"", "\"\"") + '"';
+    }
+
+    private static String baselineJson(String value) {
+        if (value == null) return "";
+        return value.replace("\\", "\\\\").replace("\"", "\\\"")
+                .replace("\r", "\\r").replace("\n", "\\n");
     }
 
     private static MarketSchedulerGaugeSnapshot marketSchedulerGaugeSnapshot() {
@@ -2839,10 +3058,35 @@ public final class StarsectorPrepatcherHooks {
     // Aggressive economy: ordered commodity active set
     // ---------------------------------------------------------------------
 
-    private static final int COMMODITY_DIRTY_AVAILABLE = 1;
-    private static final int COMMODITY_DIRTY_TRADE = 2;
-    private static final int COMMODITY_DIRTY_ALL =
-            COMMODITY_DIRTY_AVAILABLE | COMMODITY_DIRTY_TRADE;
+    private static final int COMMODITY_STAT_AVAILABLE = 1;
+    private static final int COMMODITY_STAT_AOTD_EXCESS = 1 << 1;
+    private static final int COMMODITY_STAT_AOTD_DEFICIT = 1 << 2;
+    private static final int COMMODITY_STAT_TRADE = 1 << 3;
+    private static final int COMMODITY_STAT_TRADE_PLUS = 1 << 4;
+    private static final int COMMODITY_STAT_TRADE_MINUS = 1 << 5;
+    private static final int COMMODITY_MASK_AVAILABILITY =
+            COMMODITY_STAT_AVAILABLE
+                    | COMMODITY_STAT_AOTD_EXCESS
+                    | COMMODITY_STAT_AOTD_DEFICIT;
+    private static final int COMMODITY_MASK_TRADE =
+            COMMODITY_STAT_TRADE
+                    | COMMODITY_STAT_TRADE_PLUS
+                    | COMMODITY_STAT_TRADE_MINUS;
+    private static final int COMMODITY_MASK_EXACT_VANILLA =
+            COMMODITY_STAT_AVAILABLE | COMMODITY_MASK_TRADE;
+    private static final int COMMODITY_MASK_AOTD_NATIVE =
+            COMMODITY_MASK_AVAILABILITY | COMMODITY_MASK_TRADE;
+    private static final int COMMODITY_MODE_VANILLA_ONLY = 0;
+    private static final int COMMODITY_MODE_EXACT_VANILLA = 1;
+    private static final int COMMODITY_MODE_AOTD_NATIVE = 2;
+    private static final String AOTD_COMMODITY_CLASS =
+            "data.kaysaar.aotd.tot.scripts.commoditydata.AoTDCommodityOnMarket";
+    private static final String AOTD_AVAILABLE_STAT_CLASS =
+            "data.kaysaar.aotd.tot.scripts.commoditydata.AoTDAvailableStat";
+    private static final MethodHandle[] AOTD_TEMPORAL_ACCESS_UNSUPPORTED =
+            new MethodHandle[0];
+    private static final ConcurrentHashMap<Class<?>, MethodHandle[]>
+            AOTD_TEMPORAL_ACCESS = new ConcurrentHashMap<>();
 
     /**
      * Called only after transformed MutableStat bytecode observed a non-null
@@ -2855,7 +3099,7 @@ public final class StarsectorPrepatcherHooks {
                 || !(rawOwner instanceof CommodityTemporalEntry entry)) return;
         // CommodityOnMarket.reapplyEventMod() owns this internal availability key.
         // Waking the entry for its own remove/add cycle would keep it permanently hot.
-        if (role == COMMODITY_DIRTY_AVAILABLE && "eMod".equals(source)) return;
+        if (role == COMMODITY_STAT_AVAILABLE && "eMod".equals(source)) return;
         entry.markDirty(role);
         COMMODITY_TEMPORAL_DIRTY_SIGNALS.increment();
     }
@@ -2864,10 +3108,11 @@ public final class StarsectorPrepatcherHooks {
     public static void markCommodityTemporalStatExposed(Object rawStat) {
         PrepatcherConfig c = config;
         if (c == null || !c.commodityTemporalFastPath
-                || !(rawStat instanceof MutableStatWithTempMods stat)
-                || stat.getClass() != MutableStatWithTempMods.class) return;
-        CommodityTemporalStatAccess access =
-                COMMODITY_TEMPORAL_STAT_ACCESS.get(stat.getClass());
+                || !(rawStat instanceof MutableStatWithTempMods stat)) return;
+        // The transformed binding fields are declared in MutableStatWithTempMods
+        // itself and therefore also exist on AoTDAvailableStat instances. Unknown
+        // subclasses remain harmless because they never receive an owner binding.
+        CommodityTemporalStatAccess access = commodityTemporalBaseStatAccess();
         if (!access.supported) return;
         access.markExposure(stat);
     }
@@ -2924,21 +3169,65 @@ public final class StarsectorPrepatcherHooks {
 
         // Once an original stat/commodity method has executed, replaying the whole
         // vanilla loop on failure would double-advance earlier entries. Propagate.
-        int activeBefore = state.active.size();
+        sampleCommodityTemporalMarketMetrics(state);
         state.advancePrepared(days);
-        sampleCommodityTemporalMarketMetrics(state.entries.size(), activeBefore);
         return state;
     }
 
-    private static void sampleCommodityTemporalMarketMetrics(int entries, int active) {
+    private static void sampleCommodityTemporalMarketMetrics(
+            CommodityTemporalMarketState state) {
         int tick = ++commodityTemporalMetricsTick;
         if ((tick & COMMODITY_TEMPORAL_METRIC_SAMPLE_MASK) != 0) return;
         long scale = 1L << COMMODITY_TEMPORAL_METRIC_SAMPLE_SHIFT;
+        int active = state.active.size();
+        int exactVanillaActive = 0;
+        int aotdNativeActive = 0;
+        int vanillaOnlyActive = 0;
+        int availableActive = 0;
+        int excessActive = 0;
+        int deficitActive = 0;
+        int tradeActive = 0;
+        int tradePlusActive = 0;
+        int tradeMinusActive = 0;
+        for (int i = 0; i < active; i++) {
+            CommodityTemporalEntry entry = state.active.get(i);
+            if (entry.vanillaOnly) {
+                vanillaOnlyActive++;
+                continue;
+            }
+            if (entry.mode == COMMODITY_MODE_AOTD_NATIVE) aotdNativeActive++;
+            else exactVanillaActive++;
+            int mask = entry.activeMask;
+            if ((mask & COMMODITY_STAT_AVAILABLE) != 0) availableActive++;
+            if ((mask & COMMODITY_STAT_AOTD_EXCESS) != 0) excessActive++;
+            if ((mask & COMMODITY_STAT_AOTD_DEFICIT) != 0) deficitActive++;
+            if ((mask & COMMODITY_STAT_TRADE) != 0) tradeActive++;
+            if ((mask & COMMODITY_STAT_TRADE_PLUS) != 0) tradePlusActive++;
+            if ((mask & COMMODITY_STAT_TRADE_MINUS) != 0) tradeMinusActive++;
+        }
         COMMODITY_TEMPORAL_MARKET_CALLS.add(scale);
-        COMMODITY_TEMPORAL_ENTRIES.add((long) entries * scale);
+        COMMODITY_TEMPORAL_ENTRIES.add((long) state.entries.size() * scale);
         COMMODITY_TEMPORAL_ACTIVE_ADVANCES.add((long) active * scale);
         COMMODITY_TEMPORAL_INACTIVE_SKIPS.add(
-                (long) Math.max(0, entries - active) * scale);
+                (long) Math.max(0, state.entries.size() - active) * scale);
+        COMMODITY_TEMPORAL_EXACT_VANILLA_ENTRIES.add(
+                (long) state.exactVanillaEntries * scale);
+        COMMODITY_TEMPORAL_AOTD_NATIVE_ENTRIES.add(
+                (long) state.aotdNativeEntries * scale);
+        COMMODITY_TEMPORAL_VANILLA_ONLY_ENTRIES.add(
+                (long) state.vanillaOnlyEntries * scale);
+        COMMODITY_TEMPORAL_EXACT_VANILLA_ACTIVE.add(
+                (long) exactVanillaActive * scale);
+        COMMODITY_TEMPORAL_AOTD_NATIVE_ACTIVE.add(
+                (long) aotdNativeActive * scale);
+        COMMODITY_TEMPORAL_VANILLA_ONLY_ACTIVE.add(
+                (long) vanillaOnlyActive * scale);
+        COMMODITY_TEMPORAL_ACTIVE_AVAILABLE.add((long) availableActive * scale);
+        COMMODITY_TEMPORAL_ACTIVE_AOTD_EXCESS.add((long) excessActive * scale);
+        COMMODITY_TEMPORAL_ACTIVE_AOTD_DEFICIT.add((long) deficitActive * scale);
+        COMMODITY_TEMPORAL_ACTIVE_TRADE.add((long) tradeActive * scale);
+        COMMODITY_TEMPORAL_ACTIVE_TRADE_PLUS.add((long) tradePlusActive * scale);
+        COMMODITY_TEMPORAL_ACTIVE_TRADE_MINUS.add((long) tradeMinusActive * scale);
     }
 
     private static void vanillaAdvanceMarketCommodities(Market market, float days) {
@@ -2955,6 +3244,59 @@ public final class StarsectorPrepatcherHooks {
         commodity.getTradeModPlus().advance(days);
         commodity.getTradeModMinus().advance(days);
         commodity.reapplyEventMod();
+    }
+
+    private static CommodityTemporalStatAccess commodityTemporalBaseStatAccess() {
+        return COMMODITY_TEMPORAL_STAT_ACCESS.get(MutableStatWithTempMods.class);
+    }
+
+    private static MethodHandle[] aotdTemporalAccess(Class<?> commodityType) {
+        if (commodityType == null
+                || !AOTD_COMMODITY_CLASS.equals(commodityType.getName())) {
+            return AOTD_TEMPORAL_ACCESS_UNSUPPORTED;
+        }
+        return AOTD_TEMPORAL_ACCESS.computeIfAbsent(
+                commodityType, StarsectorPrepatcherHooks::createAoTDTemporalAccess);
+    }
+
+    private static MethodHandle[] createAoTDTemporalAccess(Class<?> commodityType) {
+        try {
+            Method getDataMethod = commodityType.getMethod("getExcDefData");
+            Class<?> dataType = getDataMethod.getReturnType();
+            Field excessField = dataType.getField("excess");
+            Field deficitField = dataType.getField("deficit");
+            if (!MutableStatWithTempMods.class.isAssignableFrom(excessField.getType())
+                    || !MutableStatWithTempMods.class.isAssignableFrom(
+                    deficitField.getType())) {
+                return AOTD_TEMPORAL_ACCESS_UNSUPPORTED;
+            }
+            MethodHandles.Lookup lookup = MethodHandles.publicLookup();
+            return new MethodHandle[] {
+                    lookup.unreflect(getDataMethod),
+                    lookup.unreflectGetter(excessField),
+                    lookup.unreflectGetter(deficitField)
+            };
+        } catch (Throwable ignored) {
+            return AOTD_TEMPORAL_ACCESS_UNSUPPORTED;
+        }
+    }
+
+    private static MutableStatWithTempMods[] captureAoTDExtraStats(
+            CommodityOnMarket commodity) {
+        MethodHandle[] access = aotdTemporalAccess(commodity.getClass());
+        if (access.length != 3) return null;
+        try {
+            Object data = access[0].invoke(commodity);
+            Object excess = access[1].invoke(data);
+            Object deficit = access[2].invoke(data);
+            if (!(excess instanceof MutableStatWithTempMods excessStat)
+                    || !(deficit instanceof MutableStatWithTempMods deficitStat)) {
+                return null;
+            }
+            return new MutableStatWithTempMods[] {excessStat, deficitStat};
+        } catch (Throwable ignored) {
+            return null;
+        }
     }
 
     private static final ClassValue<CommodityTemporalStatAccess>
@@ -3021,10 +3363,7 @@ public final class StarsectorPrepatcherHooks {
             Object existing = owner.get(stat);
             if (existing != null && existing != entry) {
                 if (existing instanceof CommodityTemporalEntry other) {
-                    other.vanillaOnly = true;
-                    other.active = true;
-                    other.owner.dirtyPending = true;
-                    other.unbind();
+                    other.promoteToVanillaOnly();
                 }
                 return false;
             }
@@ -3071,54 +3410,138 @@ public final class StarsectorPrepatcherHooks {
         final CommodityTemporalMarketState owner;
         final CommodityOnMarket commodity;
         final MutableStatWithTempMods available;
+        final MutableStatWithTempMods excess;
+        final MutableStatWithTempMods deficit;
         final MutableStatWithTempMods trade;
         final MutableStatWithTempMods tradePlus;
         final MutableStatWithTempMods tradeMinus;
-        int dirtyMask = COMMODITY_DIRTY_ALL;
+        final int mode;
+        final int supportedMask;
+        int ordinal;
+        int activeMask;
+        int dirtyMask;
         boolean active = true;
         boolean forceAudit = true;
         boolean vanillaOnly;
+        boolean listedActive;
+        boolean queuedWakeup;
 
         CommodityTemporalEntry(CommodityTemporalMarketState owner,
                                CommodityOnMarket commodity) {
             this.owner = owner;
             this.commodity = commodity;
-            if (commodity == null || commodity.getClass() != CommodityOnMarket.class) {
-                available = trade = tradePlus = tradeMinus = null;
-                vanillaOnly = true;
-                return;
+
+            MutableStatWithTempMods a = null;
+            MutableStatWithTempMods x = null;
+            MutableStatWithTempMods d = null;
+            MutableStatWithTempMods t = null;
+            MutableStatWithTempMods p = null;
+            MutableStatWithTempMods m = null;
+            int selectedMode = COMMODITY_MODE_VANILLA_ONLY;
+            boolean unsupported = commodity == null;
+
+            if (!unsupported) {
+                Class<?> commodityType = commodity.getClass();
+                if (commodityType == CommodityOnMarket.class) {
+                    selectedMode = COMMODITY_MODE_EXACT_VANILLA;
+                } else if (AOTD_COMMODITY_CLASS.equals(commodityType.getName())) {
+                    selectedMode = COMMODITY_MODE_AOTD_NATIVE;
+                } else {
+                    unsupported = true;
+                }
             }
-            MutableStatWithTempMods a;
-            MutableStatWithTempMods t;
-            MutableStatWithTempMods p;
-            MutableStatWithTempMods m;
-            try {
-                a = commodity.getAvailableStat();
-                t = commodity.getTradeMod();
-                p = commodity.getTradeModPlus();
-                m = commodity.getTradeModMinus();
-            } catch (Throwable ex) {
-                available = trade = tradePlus = tradeMinus = null;
-                vanillaOnly = true;
-                return;
+
+            if (!unsupported) {
+                try {
+                    a = commodity.getAvailableStat();
+                    t = commodity.getTradeMod();
+                    p = commodity.getTradeModPlus();
+                    m = commodity.getTradeModMinus();
+                    if (selectedMode == COMMODITY_MODE_AOTD_NATIVE) {
+                        MutableStatWithTempMods[] extra =
+                                captureAoTDExtraStats(commodity);
+                        if (extra == null) {
+                            unsupported = true;
+                        } else {
+                            x = extra[0];
+                            d = extra[1];
+                        }
+                    }
+                } catch (Throwable ex) {
+                    unsupported = true;
+                }
             }
+
+            if (!unsupported) {
+                if (selectedMode == COMMODITY_MODE_EXACT_VANILLA) {
+                    unsupported = !isSupportedBaseStat(a)
+                            || !isSupportedBaseStat(t)
+                            || !isSupportedBaseStat(p)
+                            || !isSupportedBaseStat(m);
+                } else {
+                    unsupported = !isSupportedAoTDAvailableStat(a)
+                            || !isSupportedBaseStat(x)
+                            || !isSupportedBaseStat(d)
+                            || !isSupportedBaseStat(t)
+                            || !isSupportedBaseStat(p)
+                            || !isSupportedBaseStat(m);
+                }
+            }
+
             available = a;
+            excess = x;
+            deficit = d;
             trade = t;
             tradePlus = p;
             tradeMinus = m;
-            vanillaOnly = !isSupportedStat(a) || !isSupportedStat(t)
-                    || !isSupportedStat(p) || !isSupportedStat(m);
+            mode = unsupported ? COMMODITY_MODE_VANILLA_ONLY : selectedMode;
+            supportedMask = mode == COMMODITY_MODE_AOTD_NATIVE
+                    ? COMMODITY_MASK_AOTD_NATIVE
+                    : mode == COMMODITY_MODE_EXACT_VANILLA
+                    ? COMMODITY_MASK_EXACT_VANILLA : 0;
+            activeMask = supportedMask;
+            dirtyMask = supportedMask;
+            vanillaOnly = unsupported;
         }
 
-        private static boolean isSupportedStat(MutableStatWithTempMods stat) {
+        private static boolean isSupportedBaseStat(MutableStatWithTempMods stat) {
             return stat != null && stat.getClass() == MutableStatWithTempMods.class
-                    && COMMODITY_TEMPORAL_STAT_ACCESS.get(stat.getClass()).supported;
+                    && commodityTemporalBaseStatAccess().supported;
+        }
+
+        private static boolean isSupportedAoTDAvailableStat(
+                MutableStatWithTempMods stat) {
+            return stat != null
+                    && AOTD_AVAILABLE_STAT_CLASS.equals(stat.getClass().getName())
+                    && commodityTemporalBaseStatAccess().supported;
         }
 
         void markDirty(int role) {
-            dirtyMask |= role;
+            int maskedRole = role & supportedMask;
+            if (maskedRole == 0) return;
+            dirtyMask |= maskedRole;
+            activeMask |= maskedRole;
             active = true;
-            owner.dirtyPending = true;
+            owner.enqueueWakeup(this);
+        }
+
+        void requestFullAudit() {
+            if (!vanillaOnly) {
+                dirtyMask |= supportedMask;
+                activeMask |= supportedMask;
+                forceAudit = true;
+            }
+            active = true;
+            owner.enqueueWakeup(this);
+        }
+
+        void promoteToVanillaOnly() {
+            if (!vanillaOnly) {
+                vanillaOnly = true;
+                unbind();
+            }
+            active = true;
+            owner.enqueueWakeup(this);
         }
 
         void markExposed(int role) {
@@ -3129,26 +3552,68 @@ public final class StarsectorPrepatcherHooks {
 
         void bind() {
             if (vanillaOnly) return;
-            CommodityTemporalStatAccess access =
-                    COMMODITY_TEMPORAL_STAT_ACCESS.get(MutableStatWithTempMods.class);
-            boolean ok = access.bind(available, this, COMMODITY_DIRTY_AVAILABLE)
-                    && access.bind(trade, this, COMMODITY_DIRTY_TRADE)
-                    && access.bind(tradePlus, this, COMMODITY_DIRTY_TRADE)
-                    && access.bind(tradeMinus, this, COMMODITY_DIRTY_TRADE);
+            CommodityTemporalStatAccess access = commodityTemporalBaseStatAccess();
+            boolean ok = access.bind(available, this, COMMODITY_STAT_AVAILABLE)
+                    && (mode != COMMODITY_MODE_AOTD_NATIVE
+                    || (access.bind(excess, this, COMMODITY_STAT_AOTD_EXCESS)
+                    && access.bind(deficit, this, COMMODITY_STAT_AOTD_DEFICIT)))
+                    && access.bind(trade, this, COMMODITY_STAT_TRADE)
+                    && access.bind(tradePlus, this, COMMODITY_STAT_TRADE_PLUS)
+                    && access.bind(tradeMinus, this, COMMODITY_STAT_TRADE_MINUS);
             if (!ok) {
-                unbind();
-                vanillaOnly = true;
-                active = true;
+                promoteToVanillaOnly();
             }
         }
 
         void unbind() {
-            CommodityTemporalStatAccess access =
-                    COMMODITY_TEMPORAL_STAT_ACCESS.get(MutableStatWithTempMods.class);
+            CommodityTemporalStatAccess access = commodityTemporalBaseStatAccess();
             access.unbind(available, this);
+            access.unbind(excess, this);
+            access.unbind(deficit, this);
             access.unbind(trade, this);
             access.unbind(tradePlus, this);
             access.unbind(tradeMinus, this);
+        }
+
+        private boolean auditAll(CommodityTemporalStatAccess access) {
+            return access.audit(available)
+                    && (mode != COMMODITY_MODE_AOTD_NATIVE
+                    || (access.audit(excess) && access.audit(deficit)))
+                    && access.audit(trade)
+                    && access.audit(tradePlus)
+                    && access.audit(tradeMinus);
+        }
+
+        private int liveMask(CommodityTemporalStatAccess access, int mask) {
+            int result = 0;
+            if ((mask & COMMODITY_STAT_AVAILABLE) != 0 && access.hasMods(available)) {
+                result |= COMMODITY_STAT_AVAILABLE;
+            }
+            if ((mask & COMMODITY_STAT_AOTD_EXCESS) != 0
+                    && access.hasMods(excess)) {
+                result |= COMMODITY_STAT_AOTD_EXCESS;
+            }
+            if ((mask & COMMODITY_STAT_AOTD_DEFICIT) != 0
+                    && access.hasMods(deficit)) {
+                result |= COMMODITY_STAT_AOTD_DEFICIT;
+            }
+            if ((mask & COMMODITY_STAT_TRADE) != 0 && access.hasMods(trade)) {
+                result |= COMMODITY_STAT_TRADE;
+            }
+            if ((mask & COMMODITY_STAT_TRADE_PLUS) != 0
+                    && access.hasMods(tradePlus)) {
+                result |= COMMODITY_STAT_TRADE_PLUS;
+            }
+            if ((mask & COMMODITY_STAT_TRADE_MINUS) != 0
+                    && access.hasMods(tradeMinus)) {
+                result |= COMMODITY_STAT_TRADE_MINUS;
+            }
+            return result;
+        }
+
+        private void refreshMask(CommodityTemporalStatAccess access, int mask) {
+            int supported = mask & supportedMask;
+            activeMask = (activeMask & ~supported) | liveMask(access, supported);
         }
 
         boolean process(float days) {
@@ -3157,59 +3622,64 @@ public final class StarsectorPrepatcherHooks {
                 active = true;
                 return true;
             }
-            CommodityTemporalStatAccess access =
-                    COMMODITY_TEMPORAL_STAT_ACCESS.get(MutableStatWithTempMods.class);
+            CommodityTemporalStatAccess access = commodityTemporalBaseStatAccess();
 
             int changed = dirtyMask;
+            int candidates = (activeMask | dirtyMask) & supportedMask;
             dirtyMask = 0;
             if (forceAudit) {
                 forceAudit = false;
-                boolean audited = access.audit(available)
-                        && access.audit(trade)
-                        && access.audit(tradePlus)
-                        && access.audit(tradeMinus);
-                if (!audited) {
+                if (!auditAll(access)) {
                     unbind();
                     vanillaOnly = true;
                     vanillaAdvanceCommodity(commodity, days);
                     active = true;
                     return true;
                 }
-                // The audit also covers direct changes through MutableStat's live
-                // modifier maps, for which no mutator notification exists.
-                changed |= COMMODITY_DIRTY_ALL;
+                // Preserve the existing conservative audit semantics: direct live-map
+                // mutation is treated as potentially affecting every supported stat.
+                changed |= supportedMask;
+                activeMask = liveMask(access, supportedMask);
+            } else {
+                refreshMask(access, candidates);
             }
 
-            // Read each map once on the common path. Only stats that were active
-            // before advance can need a post-expiry emptiness check; the exact
-            // CommodityOnMarket.reapplyEventMod() path never creates temp mods.
-            boolean availableActive = access.hasMods(available);
-            boolean tradeActive = access.hasMods(trade);
-            boolean tradePlusActive = access.hasMods(tradePlus);
-            boolean tradeMinusActive = access.hasMods(tradeMinus);
-            if (availableActive) available.advance(days);
-            if (tradeActive) trade.advance(days);
-            if (tradePlusActive) tradePlus.advance(days);
-            if (tradeMinusActive) tradeMinus.advance(days);
+            int workMask = activeMask;
+            int availabilityWork = workMask & COMMODITY_MASK_AVAILABILITY;
+            if (availabilityWork != 0) {
+                // AoTDAvailableStat advances available/excess/deficit in one ordered
+                // group. Exact vanilla has only the AVAILABLE bit in this group.
+                available.advance(days);
+            }
+            if ((workMask & COMMODITY_STAT_TRADE) != 0) trade.advance(days);
+            if ((workMask & COMMODITY_STAT_TRADE_PLUS) != 0) tradePlus.advance(days);
+            if ((workMask & COMMODITY_STAT_TRADE_MINUS) != 0) tradeMinus.advance(days);
 
-            // Expiry invokes MutableStat.unmodify(), whose bound prologue may have
-            // marked this entry dirty while the four stats advanced.
-            changed |= dirtyMask;
+            // Expiry invokes MutableStat.unmodify(), whose transformed prologue
+            // marks the exact stat bit dirty. Refresh only processed/changed bits.
+            int duringAdvanceDirty = dirtyMask;
             dirtyMask = 0;
+            changed |= duringAdvanceDirty;
+            int refresh = workMask | duringAdvanceDirty;
+            if ((refresh & COMMODITY_MASK_AVAILABILITY) != 0) {
+                refresh |= supportedMask & COMMODITY_MASK_AVAILABILITY;
+            }
+            refreshMask(access, refresh);
 
-            if ((changed & COMMODITY_DIRTY_ALL) != 0) {
+            if (mode == COMMODITY_MODE_EXACT_VANILLA
+                    && (changed & supportedMask) != 0) {
                 commodity.reapplyEventMod();
                 COMMODITY_TEMPORAL_REAPPLIES.increment();
-                if ((changed & COMMODITY_DIRTY_AVAILABLE) != 0) {
+                if ((changed & COMMODITY_STAT_AVAILABLE) != 0) {
                     COMMODITY_TEMPORAL_AVAILABLE_REAPPLIES.increment();
                 }
             }
+            // AoTDCommodityOnMarket.reapplyEventMod() is explicitly a no-op.
 
-            active = (availableActive && access.hasMods(available))
-                    || (tradeActive && access.hasMods(trade))
-                    || (tradePlusActive && access.hasMods(tradePlus))
-                    || (tradeMinusActive && access.hasMods(tradeMinus))
-                    || dirtyMask != 0 || forceAudit;
+            // A reapply callback may have mutated another bound stat. markDirty()
+            // already added its exact role to activeMask and retained dirtyMask for
+            // changed-semantics on the next delivery.
+            active = activeMask != 0 || dirtyMask != 0 || forceAudit;
             return active;
         }
     }
@@ -3219,12 +3689,15 @@ public final class StarsectorPrepatcherHooks {
         final long generation;
         final ArrayList<CommodityTemporalEntry> entries = new ArrayList<>(32);
         final ArrayList<CommodityTemporalEntry> active = new ArrayList<>(8);
+        final ArrayList<CommodityTemporalEntry> pendingWakeups = new ArrayList<>(8);
         List<?> source;
         int sourceSize = -1;
         Object first;
         Object last;
         int auditCountdown;
-        boolean dirtyPending;
+        int exactVanillaEntries;
+        int aotdNativeEntries;
+        int vanillaOnlyEntries;
 
         CommodityTemporalMarketState(Market owner, long generation) {
             this.owner = owner;
@@ -3245,15 +3718,15 @@ public final class StarsectorPrepatcherHooks {
                         if (!rebuild(live, auditFrames)) return false;
                     } else {
                         auditCountdown = normalizedCommodityAuditFrames(auditFrames);
+                        // The audit already walks every entry. Queue only entries that
+                        // are currently sleeping; do not perform a second full-market
+                        // entries scan after setting their audit state.
                         for (CommodityTemporalEntry entry : entries) {
-                            entry.dirtyMask |= COMMODITY_DIRTY_ALL;
-                            entry.forceAudit = true;
-                            entry.active = true;
+                            entry.requestFullAudit();
                         }
-                        dirtyPending = true;
                     }
                 }
-                if (dirtyPending) rebuildActive();
+                drainWakeups();
                 return true;
             } catch (Throwable ignored) {
                 return false;
@@ -3271,24 +3744,39 @@ public final class StarsectorPrepatcherHooks {
         private boolean rebuild(List<CommodityOnMarket> live, int auditFrames) {
             unbindAll();
             entries.clear();
-            active.clear();
+            exactVanillaEntries = 0;
+            aotdNativeEntries = 0;
+            vanillaOnlyEntries = 0;
             IdentityHashMap<MutableStatWithTempMods, CommodityTemporalEntry> owners =
                     new IdentityHashMap<>();
             for (int i = 0; i < live.size(); i++) {
                 CommodityOnMarket commodity = live.get(i);
                 CommodityTemporalEntry entry = new CommodityTemporalEntry(this, commodity);
+                entry.ordinal = i;
                 entries.add(entry);
+                if (entry.mode == COMMODITY_MODE_AOTD_NATIVE) aotdNativeEntries++;
+                else if (entry.mode == COMMODITY_MODE_EXACT_VANILLA) exactVanillaEntries++;
+                else vanillaOnlyEntries++;
                 if (!entry.vanillaOnly) registerStats(entry, owners);
             }
             for (CommodityTemporalEntry entry : entries) entry.bind();
+            // A shared-stat bind failure may have converted an otherwise native
+            // entry to vanilla-only. Recount the final operational modes.
+            exactVanillaEntries = 0;
+            aotdNativeEntries = 0;
+            vanillaOnlyEntries = 0;
+            for (CommodityTemporalEntry entry : entries) {
+                if (entry.vanillaOnly) vanillaOnlyEntries++;
+                else if (entry.mode == COMMODITY_MODE_AOTD_NATIVE) aotdNativeEntries++;
+                else exactVanillaEntries++;
+            }
             source = live;
             sourceSize = live.size();
             first = sourceSize == 0 ? null : live.get(0);
             last = sourceSize == 0 ? null : live.get(sourceSize - 1);
             auditCountdown = initialCommodityAuditCountdown(
                     owner, generation, auditFrames);
-            dirtyPending = true;
-            rebuildActive();
+            initializeActive();
             COMMODITY_TEMPORAL_REBUILDS.increment();
             return true;
         }
@@ -3297,6 +3785,10 @@ public final class StarsectorPrepatcherHooks {
                 CommodityTemporalEntry entry,
                 IdentityHashMap<MutableStatWithTempMods, CommodityTemporalEntry> owners) {
             registerStat(entry.available, entry, owners);
+            if (entry.mode == COMMODITY_MODE_AOTD_NATIVE) {
+                registerStat(entry.excess, entry, owners);
+                registerStat(entry.deficit, entry, owners);
+            }
             registerStat(entry.trade, entry, owners);
             registerStat(entry.tradePlus, entry, owners);
             registerStat(entry.tradeMinus, entry, owners);
@@ -3305,6 +3797,10 @@ public final class StarsectorPrepatcherHooks {
         private static void registerStat(
                 MutableStatWithTempMods stat, CommodityTemporalEntry entry,
                 IdentityHashMap<MutableStatWithTempMods, CommodityTemporalEntry> owners) {
+            if (stat == null) {
+                entry.vanillaOnly = true;
+                return;
+            }
             CommodityTemporalEntry previous = owners.put(stat, entry);
             if (previous != null && previous != entry) {
                 previous.vanillaOnly = true;
@@ -3314,15 +3810,73 @@ public final class StarsectorPrepatcherHooks {
             }
         }
 
-        private void rebuildActive() {
+        void enqueueWakeup(CommodityTemporalEntry entry) {
+            if (entry == null || entry.owner != this || entry.listedActive
+                    || entry.queuedWakeup) return;
+            entry.queuedWakeup = true;
+            pendingWakeups.add(entry);
+            COMMODITY_TEMPORAL_WAKEUP_ENQUEUES.increment();
+        }
+
+        private void initializeActive() {
             active.clear();
+            pendingWakeups.clear();
             for (CommodityTemporalEntry entry : entries) {
-                if (entry.vanillaOnly || entry.active || entry.dirtyMask != 0
-                        || entry.forceAudit) {
+                entry.queuedWakeup = false;
+                entry.listedActive = false;
+                if (entry.vanillaOnly || entry.active || entry.activeMask != 0
+                        || entry.dirtyMask != 0 || entry.forceAudit) {
+                    entry.listedActive = true;
                     active.add(entry);
                 }
             }
-            dirtyPending = false;
+        }
+
+        private void drainWakeups() {
+            int count = pendingWakeups.size();
+            if (count == 0) return;
+            COMMODITY_TEMPORAL_WAKEUP_DRAINS.add(count);
+
+            // Mutations may arrive in callback order, but commodity maintenance is
+            // order-sensitive. Sort the usually tiny queue by source ordinal before
+            // merging it into the already ordered active list.
+            for (int i = 1; i < count; i++) {
+                CommodityTemporalEntry value = pendingWakeups.get(i);
+                int j = i - 1;
+                while (j >= 0 && pendingWakeups.get(j).ordinal > value.ordinal) {
+                    pendingWakeups.set(j + 1, pendingWakeups.get(j));
+                    j--;
+                }
+                pendingWakeups.set(j + 1, value);
+            }
+
+            for (int i = 0; i < count; i++) {
+                CommodityTemporalEntry entry = pendingWakeups.get(i);
+                entry.queuedWakeup = false;
+                if (!entry.listedActive
+                        && (entry.vanillaOnly || entry.active || entry.activeMask != 0
+                        || entry.dirtyMask != 0 || entry.forceAudit)) {
+                    insertActiveOrdered(entry);
+                    COMMODITY_TEMPORAL_WAKEUP_INSERTS.increment();
+                }
+            }
+            pendingWakeups.clear();
+        }
+
+        private void insertActiveOrdered(CommodityTemporalEntry entry) {
+            int low = 0;
+            int high = active.size();
+            while (low < high) {
+                int mid = (low + high) >>> 1;
+                if (active.get(mid).ordinal < entry.ordinal) low = mid + 1;
+                else high = mid;
+            }
+            if (low < active.size() && active.get(low) == entry) {
+                entry.listedActive = true;
+                return;
+            }
+            active.add(low, entry);
+            entry.listedActive = true;
         }
 
         void advancePrepared(float days) {
@@ -3331,15 +3885,27 @@ public final class StarsectorPrepatcherHooks {
             for (int read = 0; read < size; read++) {
                 CommodityTemporalEntry entry = active.get(read);
                 if (entry.process(days)) {
+                    entry.listedActive = true;
                     if (write != read) active.set(write, entry);
                     write++;
+                } else {
+                    // Clear membership immediately. A later callback in this same
+                    // delivery can now enqueue the already-processed sleeping entry
+                    // for the next prepare() without requiring a full entries scan.
+                    entry.listedActive = false;
                 }
             }
             while (active.size() > write) active.remove(active.size() - 1);
         }
 
         void unbindAll() {
-            for (CommodityTemporalEntry entry : entries) entry.unbind();
+            pendingWakeups.clear();
+            for (CommodityTemporalEntry entry : entries) {
+                entry.queuedWakeup = false;
+                entry.listedActive = false;
+                entry.unbind();
+            }
+            active.clear();
         }
     }
 
@@ -5003,6 +5569,11 @@ public final class StarsectorPrepatcherHooks {
         long lastPolicyAuditBatch = Long.MIN_VALUE;
         long lastSourceSimulationTick = Long.MIN_VALUE;
         long debtSequence;
+        long deliveredCallbacks;
+        double deliveredAmount;
+        long lastDeliveredSequence;
+        int lastDeliveredOrigin = MARKET_ORIGIN_NONE;
+        long lastDeliveredNanos;
         int lastSource = -1;
         int sourceMask;
         boolean perSimulationTick;
@@ -6791,7 +7362,37 @@ public final class StarsectorPrepatcherHooks {
                         + ", commodityTemporalExposures=" + COMMODITY_TEMPORAL_EXPOSURES.sumThenReset()
                         + ", commodityTemporalAudits=" + COMMODITY_TEMPORAL_AUDITS.sumThenReset()
                         + ", commodityTemporalRebuilds=" + COMMODITY_TEMPORAL_REBUILDS.sumThenReset()
+                        + ", commodityTemporalWakeupEnqueues="
+                        + COMMODITY_TEMPORAL_WAKEUP_ENQUEUES.sumThenReset()
+                        + ", commodityTemporalWakeupDrains="
+                        + COMMODITY_TEMPORAL_WAKEUP_DRAINS.sumThenReset()
+                        + ", commodityTemporalWakeupInserts="
+                        + COMMODITY_TEMPORAL_WAKEUP_INSERTS.sumThenReset()
                         + ", commodityTemporalFallbacks=" + COMMODITY_TEMPORAL_FALLBACKS.sumThenReset()
+                        + ", commodityTemporalExactVanillaEntries="
+                        + COMMODITY_TEMPORAL_EXACT_VANILLA_ENTRIES.sumThenReset()
+                        + ", commodityTemporalAoTDNativeEntries="
+                        + COMMODITY_TEMPORAL_AOTD_NATIVE_ENTRIES.sumThenReset()
+                        + ", commodityTemporalVanillaOnlyEntries="
+                        + COMMODITY_TEMPORAL_VANILLA_ONLY_ENTRIES.sumThenReset()
+                        + ", commodityTemporalExactVanillaActive="
+                        + COMMODITY_TEMPORAL_EXACT_VANILLA_ACTIVE.sumThenReset()
+                        + ", commodityTemporalAoTDNativeActive="
+                        + COMMODITY_TEMPORAL_AOTD_NATIVE_ACTIVE.sumThenReset()
+                        + ", commodityTemporalVanillaOnlyActive="
+                        + COMMODITY_TEMPORAL_VANILLA_ONLY_ACTIVE.sumThenReset()
+                        + ", commodityTemporalActiveAvailable="
+                        + COMMODITY_TEMPORAL_ACTIVE_AVAILABLE.sumThenReset()
+                        + ", commodityTemporalActiveAoTDExcess="
+                        + COMMODITY_TEMPORAL_ACTIVE_AOTD_EXCESS.sumThenReset()
+                        + ", commodityTemporalActiveAoTDDeficit="
+                        + COMMODITY_TEMPORAL_ACTIVE_AOTD_DEFICIT.sumThenReset()
+                        + ", commodityTemporalActiveTrade="
+                        + COMMODITY_TEMPORAL_ACTIVE_TRADE.sumThenReset()
+                        + ", commodityTemporalActiveTradePlus="
+                        + COMMODITY_TEMPORAL_ACTIVE_TRADE_PLUS.sumThenReset()
+                        + ", commodityTemporalActiveTradeMinus="
+                        + COMMODITY_TEMPORAL_ACTIVE_TRADE_MINUS.sumThenReset()
                         + ", persistentStructureEpochs=" + PERSISTENT_STRUCTURE_EPOCHS.sumThenReset()
                         + ", economyLocationEpochHits=" + ECONOMY_LOCATION_EPOCH_HITS.sumThenReset()
                         + ", economyLocationAudits=" + ECONOMY_LOCATION_AUDITS.sumThenReset()

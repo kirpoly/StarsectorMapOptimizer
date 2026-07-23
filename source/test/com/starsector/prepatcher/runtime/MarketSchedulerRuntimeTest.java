@@ -73,6 +73,7 @@ public final class MarketSchedulerRuntimeTest {
             assertConstructionReasonCounters(sector, remoteLocation);
             assertConstructionDiagnosticsCsv(sector, remoteLocation);
             assertSaveExactReplayMode(sector, remoteLocation);
+            assertSchedulerBaselineDump(remoteLocation);
             assertWeakStateDoesNotRetainMarket(sector, remoteLocation);
             assertDisabledFallback(sector, remoteLocation);
         } finally {
@@ -92,6 +93,7 @@ public final class MarketSchedulerRuntimeTest {
                 + " advance-failure/save-abort/direct-sync/finite-overflow-split"
                 + " exact-RLE/batch-context/differential-sequences/run-overflow"
                 + " construction-full-rate/mutation-boundary/reason-counters/diagnostic-csv/save-exact"
+                + " pending-vs-delivered-baseline-dump"
                 + " weak-key/disabled metrics");
     }
 
@@ -1411,6 +1413,54 @@ public final class MarketSchedulerRuntimeTest {
 
     private static boolean rawEquals(float left, float right) {
         return Float.floatToRawIntBits(left) == Float.floatToRawIntBits(right);
+    }
+
+    private static void assertSchedulerBaselineDump(MutableLocation remote) throws Exception {
+        resetSchedulerGeneration();
+        Path root = Files.createTempDirectory("prepatcher-market-baseline-");
+        Field modRootField = StarsectorPrepatcherHooks.class.getDeclaredField("modRoot");
+        modRootField.setAccessible(true);
+        Object previousRoot = modRootField.get(null);
+        modRootField.set(null, root);
+        try {
+            MutableMarket market = new MutableMarket("baseline-dump-market", remote.proxy,
+                    false, false);
+
+            beginSyntheticSchedulerTick();
+            try {
+                StarsectorPrepatcherHooks.advanceMarketScheduled(market.proxy, 0.5f, 0);
+            } finally {
+                endSyntheticSchedulerTick();
+            }
+            require(market.calls == 1, "baseline setup did not deliver initial callback");
+
+            beginNonDueTick(market.proxy, 4);
+            try {
+                StarsectorPrepatcherHooks.advanceMarketScheduled(market.proxy, 0.25f, 0);
+            } finally {
+                endSyntheticSchedulerTick();
+            }
+            require(pendingAmount(market.proxy) > 0f,
+                    "baseline setup did not retain pending scheduler debt");
+
+            String output = StarsectorPrepatcherRuntimeBridge
+                    .dumpMarketSchedulerBaseline("runtime-test");
+            require(output != null && !output.isBlank(),
+                    "scheduler baseline dump returned no output path");
+            Path csv = Path.of(output);
+            require(Files.isRegularFile(csv), "scheduler baseline CSV was not written");
+            String content = Files.readString(csv, StandardCharsets.UTF_8);
+            require(content.contains("baseline-dump-market"),
+                    "scheduler baseline omitted test market");
+            require(content.contains("delivered_callbacks"),
+                    "scheduler baseline omitted delivered callback column");
+            require(content.contains("pending_steps"),
+                    "scheduler baseline omitted pending debt column");
+            Path json = csv.resolveSibling(csv.getFileName().toString().replace(".csv", ".json"));
+            require(Files.isRegularFile(json), "scheduler baseline summary JSON was not written");
+        } finally {
+            modRootField.set(null, previousRoot);
+        }
     }
 
     private static void assertWeakStateDoesNotRetainMarket(

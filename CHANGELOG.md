@@ -35,6 +35,38 @@
 
 ## [Unreleased]
 
+### Оптимизировано
+
+- Добавлен explicit `AOTD_NATIVE` mode для commodity temporal fast path.
+  `AoTDCommodityOnMarket` теперь связывает availability, excess, deficit и три trade stats,
+  засыпает при пустых temporal maps и просыпается от существующих mutation hooks.
+- Lookup `getExcDefData/excess/deficit` кэшируется при построении market state и не
+  выполняется в `advancePrepared()`.
+- Добавлена sampled телеметрия exact-vanilla/AoTD-native/vanilla-only inventories и active sets.
+
+
+## [0.11.0] - 2026-07-22
+
+### Добавлено
+
+- Чистая обёртка `BaseIndustry.getMaxDeficit()` сохраняет vanilla-реализацию и
+  включает AoTD priority-deficit semantics только после полного native handshake.
+- Capability `CLEAN_DEFICIT_SEMANTICS` и production mask `0xff`.
+- Structural/runtime validation для raw fallback, resolver path и повторной трансформации.
+
+### Изменено
+
+- AoTD Scheduler Fork больше не требует и не допускает старую замену `starfarer.api.jar`.
+
+
+### Исправлено
+
+- AoTD native mutation boundaries больше не выполняют повторный exact replay при
+  вложенном вызове: вложенная граница объединяет reason mask и использует token
+  внешней границы. После внешнего replay runtime повторно читает market state,
+  поскольку replay может вызвать campaign callbacks.
+
+
 ## [0.10.0] - 2026-07-21
 
 ### Изменено
@@ -579,3 +611,26 @@
   callbacks, nebula sampling и grid rendering.
 - Campaign listener throttling, ordered route indexes, installer/uninstaller, профили, build scripts
   и первичные отчёты проверки.
+
+## Stage 2 AoTD native contract
+
+- Added diagnostic early discovery of the AoTD scheduler-fork marker.
+- Added a verified transformer for the fork-owned no-op SchedulerBridge.
+- Added a direct target-loader capability handshake with no reflection in mod code.
+- Added loader-ancestry, ABI, marker, idempotency and conflict checks.
+- Negotiates only capability `0x1`; later scheduler capabilities remain disabled.
+
+## Stage 3 AoTD delivered-time contract
+
+- Extended the verified no-reflection bridge to capability mask `0x0f`.
+- Added post-success `Market.advance()` delivery events and weak per-market generations.
+- Added exact local mutation barriers that replay old pending market time before covered AoTD structural changes.
+- Added nested mutation tokens, structural generations and a loader-neutral JDK callback.
+- Kept ordinary AoTD reads/calculations off the exact replay path.
+
+## Stage 6 AoTD pure price offload
+
+- Added negotiation for AoTD capability `0x40` (`PURE_PRICE_OFFLOAD`).
+- Full Stage 6 fork capability mask is now `0x6f`.
+- Kept delivered-time, exact structural mutation replay and loader policy
+  unchanged.

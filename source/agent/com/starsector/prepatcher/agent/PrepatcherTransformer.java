@@ -72,6 +72,17 @@ public final class PrepatcherTransformer implements ClassFileTransformer {
     private static final int MARKET_SCHEDULER_COMPONENT_RECENT_UNREST = 256;
     private static final int MARKET_SCHEDULER_COMPONENT_BASE_INDUSTRY = 512;
     private static final int MARKET_SCHEDULER_COMPONENT_CONSTRUCTION_QUEUE = 1024;
+    private static final String AOTD_DEFICIT_PATCH_ID = "aotdCleanDeficitPath";
+    private static final String AOTD_DEFICIT_RAW_METHOD =
+            "spp$baseIndustryRawGetMaxDeficit";
+    private static final String AOTD_DEFICIT_DESC =
+            "([Ljava/lang/String;)Lcom/fs/starfarer/api/util/Pair;";
+    private static final String AOTD_DEFICIT_TEMPLATE_OWNER =
+            "com/starsector/prepatcher/agent/templates/BaseIndustryDeficitTemplate";
+    private static final String AOTD_DEFICIT_TEMPLATE_RESOURCE =
+            "/" + AOTD_DEFICIT_TEMPLATE_OWNER + ".class";
+    private static final String RUNTIME_BRIDGE =
+            "com/fs/starfarer/api/StarsectorPrepatcherRuntimeBridge";
     static final String H = "com/fs/starfarer/coreui/A/H";
     static final String A = "com/fs/starfarer/coreui/A/A";
     static final String Z = "com/fs/starfarer/coreui/A/Z";
@@ -296,6 +307,8 @@ public final class PrepatcherTransformer implements ClassFileTransformer {
             case MARKET -> apply(state, MARKET_ADVANCE_PLAN_PATCH_ID,
                     marketAdvancePlanEnabled(), this::patchMarketAdvancePlan);
             case BASE_INDUSTRY -> {
+                apply(state, AOTD_DEFICIT_PATCH_ID, config.aotdCleanDeficitPath,
+                        this::patchAoTDCleanDeficitPath);
                 apply(state, "marketNoOpCallbacks",
                         config.marketNoOpCallbacks && config.marketNoOpIndustryAuditFrames > 0,
                         this::patchBaseIndustryDormantFastPath);
@@ -662,7 +675,7 @@ public final class PrepatcherTransformer implements ClassFileTransformer {
             case MARKET -> config.economyPersistentSnapshots
                     || config.commodityTemporalFastPath || config.directMarketObservation
                     || config.marketScheduler;
-            case BASE_INDUSTRY -> (config.marketNoOpCallbacks
+            case BASE_INDUSTRY -> config.aotdCleanDeficitPath || (config.marketNoOpCallbacks
                     && config.marketNoOpIndustryAuditFrames > 0) || config.marketScheduler;
             case MILITARY_BASE, LIONS_GUARD_HQ, RECENT_UNREST, CONSTRUCTION_QUEUE ->
                     config.marketScheduler;
@@ -5791,6 +5804,186 @@ public final class PrepatcherTransformer implements ClassFileTransformer {
 
 
     // ---------------------------------------------------------------------
+    // ---------------------------------------------------------------------
+    // Clean AoTD BaseIndustry deficit wrapper
+    // ---------------------------------------------------------------------
+
+    private PatchReport patchAoTDCleanDeficitPath(ClassNode node) {
+        List<MethodNode> rawMethods = methods(node, AOTD_DEFICIT_RAW_METHOD,
+                AOTD_DEFICIT_DESC);
+        MethodNode wrapper = requireMethod(node, "getMaxDeficit", AOTD_DEFICIT_DESC);
+        int resolverCalls = countCalls(wrapper, Opcodes.INVOKESTATIC, RUNTIME_BRIDGE,
+                "resolveAoTDMaxDeficit",
+                "(Ljava/lang/Object;[Ljava/lang/String;)Ljava/lang/Object;");
+        if (!rawMethods.isEmpty()) {
+            requireCount("AoTD clean deficit raw method", rawMethods.size(), 1);
+            MethodNode raw = rawMethods.get(0);
+            if ((raw.access & Opcodes.ACC_PRIVATE) == 0
+                    || (raw.access & Opcodes.ACC_SYNTHETIC) == 0) {
+                throw mismatch("AoTD clean deficit raw method metadata changed");
+            }
+            requireCount("AoTD clean deficit resolver call", resolverCalls, 1);
+            requireCount("AoTD clean deficit raw fallback call",
+                    countCalls(wrapper, -1, node.name,
+                            AOTD_DEFICIT_RAW_METHOD, AOTD_DEFICIT_DESC), 1);
+            requireNoAoTDDeficitTemplateReferences(node);
+            throw already("clean BaseIndustry deficit wrapper postcondition matches");
+        }
+
+        requireCount("AoTD clean deficit raw method", rawMethods.size(), 0);
+        requireCount("AoTD clean deficit resolver call", resolverCalls, 0);
+        if ((wrapper.access & (Opcodes.ACC_ABSTRACT | Opcodes.ACC_NATIVE)) != 0
+                || wrapper.instructions == null || wrapper.instructions.size() == 0) {
+            throw mismatch("BaseIndustry.getMaxDeficit has no concrete code");
+        }
+
+        int originalAccess = wrapper.access;
+        String originalSignature = wrapper.signature;
+        String[] originalExceptions = exceptions(wrapper);
+        wrapper.name = AOTD_DEFICIT_RAW_METHOD;
+        wrapper.access = (wrapper.access
+                & ~(Opcodes.ACC_PUBLIC | Opcodes.ACC_PROTECTED))
+                | Opcodes.ACC_PRIVATE | Opcodes.ACC_SYNTHETIC;
+
+        ClassNode template = loadAoTDDeficitTemplate();
+        MethodNode templateWrapper = requireMethod(template, "getMaxDeficit",
+                AOTD_DEFICIT_DESC);
+        MethodNode installed = cloneAndRemapAoTDDeficitTemplateMethod(
+                templateWrapper, node.name);
+        installed.access = originalAccess;
+        installed.signature = originalSignature;
+        installed.exceptions = originalExceptions == null
+                ? null : new ArrayList<>(List.of(originalExceptions));
+        node.methods.add(installed);
+
+        requireCount("AoTD clean deficit resolver call",
+                countCalls(installed, Opcodes.INVOKESTATIC, RUNTIME_BRIDGE,
+                        "resolveAoTDMaxDeficit",
+                        "(Ljava/lang/Object;[Ljava/lang/String;)Ljava/lang/Object;"), 1);
+        requireCount("AoTD clean deficit raw fallback call",
+                countCalls(installed, -1, node.name,
+                        AOTD_DEFICIT_RAW_METHOD, AOTD_DEFICIT_DESC), 1);
+        requireNoAoTDDeficitTemplateReferences(node);
+
+        PatchReport report = new PatchReport();
+        report.add("clean BaseIndustry deficit wrapper", 1);
+        report.add("preserved vanilla deficit method", 1);
+        return report;
+    }
+
+    private static ClassNode loadAoTDDeficitTemplate() {
+        try (InputStream input = PrepatcherTransformer.class
+                .getResourceAsStream(AOTD_DEFICIT_TEMPLATE_RESOURCE)) {
+            if (input == null) throw mismatch("missing BaseIndustry deficit template resource");
+            ClassNode template = readClass(input.readAllBytes());
+            if (!AOTD_DEFICIT_TEMPLATE_OWNER.equals(template.name)) {
+                throw mismatch("BaseIndustry deficit template owner changed: " + template.name);
+            }
+            return template;
+        } catch (IOException ex) {
+            throw mismatch("unable to read BaseIndustry deficit template: " + ex.getMessage());
+        }
+    }
+
+    private static MethodNode cloneAndRemapAoTDDeficitTemplateMethod(
+            MethodNode source, String targetOwner) {
+        MethodNode copy = new MethodNode(Opcodes.ASM8, source.access, source.name,
+                source.desc, source.signature, exceptions(source));
+        source.accept(copy);
+        remapAoTDDeficitTemplateMethod(copy, targetOwner);
+        return copy;
+    }
+
+    private static void remapAoTDDeficitTemplateMethod(
+            MethodNode method, String targetOwner) {
+        method.desc = remapAoTDDeficitTemplateText(method.desc, targetOwner);
+        method.signature = remapAoTDDeficitTemplateText(method.signature, targetOwner);
+        if (method.exceptions != null) {
+            for (int i = 0; i < method.exceptions.size(); i++) {
+                method.exceptions.set(i,
+                        remapAoTDDeficitTemplateText(method.exceptions.get(i), targetOwner));
+            }
+        }
+        for (AbstractInsnNode insn : method.instructions.toArray()) {
+            if (insn instanceof FieldInsnNode field) {
+                field.owner = remapAoTDDeficitTemplateText(field.owner, targetOwner);
+                field.desc = remapAoTDDeficitTemplateText(field.desc, targetOwner);
+            } else if (insn instanceof MethodInsnNode call) {
+                call.owner = remapAoTDDeficitTemplateText(call.owner, targetOwner);
+                call.desc = remapAoTDDeficitTemplateText(call.desc, targetOwner);
+            } else if (insn instanceof TypeInsnNode type) {
+                type.desc = remapAoTDDeficitTemplateText(type.desc, targetOwner);
+            } else if (insn instanceof LdcInsnNode ldc && ldc.cst instanceof Type type) {
+                ldc.cst = Type.getType(remapAoTDDeficitTemplateText(
+                        type.getDescriptor(), targetOwner));
+            } else if (insn instanceof MultiANewArrayInsnNode array) {
+                array.desc = remapAoTDDeficitTemplateText(array.desc, targetOwner);
+            } else if (insn instanceof FrameNode frame) {
+                remapAoTDDeficitTemplateFrameValues(frame.local, targetOwner);
+                remapAoTDDeficitTemplateFrameValues(frame.stack, targetOwner);
+            } else if (insn instanceof InvokeDynamicInsnNode) {
+                throw mismatch("unexpected invokedynamic in BaseIndustry deficit template");
+            }
+        }
+        for (TryCatchBlockNode block : method.tryCatchBlocks) {
+            block.type = remapAoTDDeficitTemplateText(block.type, targetOwner);
+        }
+        if (method.localVariables != null) {
+            for (LocalVariableNode local : method.localVariables) {
+                local.desc = remapAoTDDeficitTemplateText(local.desc, targetOwner);
+                local.signature = remapAoTDDeficitTemplateText(local.signature, targetOwner);
+            }
+        }
+    }
+
+    private static void remapAoTDDeficitTemplateFrameValues(
+            List<Object> values, String targetOwner) {
+        if (values == null) return;
+        for (int i = 0; i < values.size(); i++) {
+            Object value = values.get(i);
+            if (value instanceof String text) {
+                values.set(i, remapAoTDDeficitTemplateText(text, targetOwner));
+            }
+        }
+    }
+
+    private static String remapAoTDDeficitTemplateText(
+            String value, String targetOwner) {
+        return value == null ? null
+                : value.replace(AOTD_DEFICIT_TEMPLATE_OWNER, targetOwner);
+    }
+
+    private static void requireNoAoTDDeficitTemplateReferences(ClassNode node) {
+        for (FieldNode field : node.fields) {
+            if ((field.desc != null && field.desc.contains(AOTD_DEFICIT_TEMPLATE_OWNER))
+                    || (field.signature != null
+                    && field.signature.contains(AOTD_DEFICIT_TEMPLATE_OWNER))) {
+                throw mismatch("BaseIndustry deficit template field reference leaked");
+            }
+        }
+        for (MethodNode method : node.methods) {
+            if ((method.desc != null && method.desc.contains(AOTD_DEFICIT_TEMPLATE_OWNER))
+                    || (method.signature != null
+                    && method.signature.contains(AOTD_DEFICIT_TEMPLATE_OWNER))) {
+                throw mismatch("BaseIndustry deficit template method signature leaked");
+            }
+            for (AbstractInsnNode insn : method.instructions.toArray()) {
+                if (insn instanceof FieldInsnNode field
+                        && field.owner.equals(AOTD_DEFICIT_TEMPLATE_OWNER)) {
+                    throw mismatch("BaseIndustry deficit template field instruction leaked");
+                }
+                if (insn instanceof MethodInsnNode call
+                        && call.owner.equals(AOTD_DEFICIT_TEMPLATE_OWNER)) {
+                    throw mismatch("BaseIndustry deficit template method instruction leaked");
+                }
+                if (insn instanceof TypeInsnNode type
+                        && type.desc.equals(AOTD_DEFICIT_TEMPLATE_OWNER)) {
+                    throw mismatch("BaseIndustry deficit template type instruction leaked");
+                }
+            }
+        }
+    }
+
     // Dormant inherited BaseIndustry.advance() fast path
     // ---------------------------------------------------------------------
 

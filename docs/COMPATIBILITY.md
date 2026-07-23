@@ -406,3 +406,9 @@ compatibility decision. Presentation stage публикует owner, global feat
 inventory. Structural stage проверяет их до анализа и после каждого commit. При локальном
 `SKIPPED_STRUCTURAL` presentation-класс остаётся входным, а независимые structural patches могут
 продолжить работу на своих surfaces.
+
+## AoTD Scheduler Fork Stage 8
+
+The Stage 8 fork requires Prepatcher 0.11.0 and the original game `starfarer.api.jar`.
+A partial capability profile is intentionally rejected. The legacy AoTD core-JAR replacement is
+not compatible with this profile.

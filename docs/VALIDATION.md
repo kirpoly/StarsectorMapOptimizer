@@ -279,3 +279,15 @@ Safe baseline остаётся `20` классов/`59` wrapper sites, aggressiv
 - отказ structural-stage при ownerless hooks, partial owner/mask и повреждённом wrapper;
 - reverse-order offline test: локально доказанная surface применяется, несовместимая получает `SKIPPED_STRUCTURAL`;
 - actual-javaagent status `presentationStructuralComposition=PASSED`.
+
+## Stage 8 AoTD production profile
+
+Required gates:
+
+- clean-wrapper structural matcher and postcondition;
+- raw fallback and resolver-path runtime test;
+- repeat-transform idempotence;
+- bridge schema 5 / capability mask `0xff`;
+- AoTD deficit semantic fixture;
+- Stage 6 pure-price and Stage 7 global-phase regressions;
+- ASM verification and runtime payload inventory.

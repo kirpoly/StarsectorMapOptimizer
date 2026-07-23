@@ -226,3 +226,15 @@ classloader Faster Rendering. Сборка описана в [`BUILDING.md`](BUI
 - [`docs/releases/0.10.0.md`](docs/releases/0.10.0.md) — подробный отчёт текущего выпуска.
 
 Условия распространения находятся в [`LICENSE`](LICENSE).
+
+## Нативная интеграция AoTD — этап 7
+
+Добавлены schema 4 и глобальные временные границы. Prepatcher доставляет накопленное время рынков перед жёсткой границей, а AoTD самостоятельно выполняет локальный пересчёт и публикует неизменяемый settlement cut.
+
+## Нативная интеграция AoTD — production Stage 8
+
+Prepatcher 0.11.0 устанавливает clean wrapper на оригинальный `BaseIndustry.getMaxDeficit()`.
+Vanilla-реализация сохраняется и используется, пока совместимый AoTD Scheduler Fork не зарегистрирует
+полный native-профиль `0xff`. Старый изменённый `starfarer.api.jar` устанавливать нельзя.
+
+Патч управляется ключом `patch.aotdCleanDeficitPath=true` и включён во всех поставляемых профилях.
